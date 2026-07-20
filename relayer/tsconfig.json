@@ -14,6 +14,7 @@
     "dist",
     "src/events/**/*",
     "src/services/recovery-service.ts",
+    "src/routes/recovery.ts",
     "src/utils/rpc-methods.ts",
     "src/utils/event-history.ts"
   ]
