@@ -1,558 +1,499 @@
 /**
- * @fileoverview Recovery Service for Ethereum-Stellar Bridge
- * @description Handles timelock monitoring, auto-refund, and emergency recovery
+ * @fileoverview Recovery Service for Ethereum–Stellar Bridge
+ *
+ * Handles settlement failure recovery through:
+ *
+ *  1. **Retry scanning** — a background loop that runs every `scanIntervalMs`
+ *     and picks up all settlement entries in the `retrying` phase whose
+ *     back-off window has expired, then re-executes them via the caller-
+ *     supplied retry callback.
+ *
+ *  2. **Manual recovery** — operator-triggered recovery for a specific order
+ *     (used through the admin REST API).
+ *
+ *  3. **Timelock monitoring** — watches orders approaching their deadline and
+ *     initiates timeout refunds.
+ *
+ *  4. **Metrics** — every outcome is recorded in Prometheus so operators can
+ *     alert on stalled recovery and build dashboards.
+ *
+ * ## Key design decisions
+ *
+ *  - The service owns the retry loop but delegates the actual on-chain calls
+ *    to injected callbacks (`RetryExecutors`). This keeps the service
+ *    testable without network mocks at the service level.
+ *
+ *  - All state is kept in a `SettlementFailureLedger` that can be swapped for
+ *    a durable store. The recovery service does not maintain its own state.
+ *
+ *  - Failures never crash the scan loop — per-order errors are caught and
+ *    recorded; subsequent orders continue processing.
+ *
+ *  - The `KeyedMutex` ensures at most one recovery attempt runs per order at
+ *    a time, even if the scan loop fires while a prior retry is still pending.
  */
 
 import { EventEmitter } from 'events';
-import { OrdersService } from './orders.js';
-import FusionEventManager, { EventType } from '../events/event-handlers.js';
-import { ActiveOrder } from './types.js';
+import { KeyedMutex, Deduplicator } from '../utils/concurrency.js';
 import { getCurrentTimestamp } from './utils.js';
-import { KeyedMutex } from '../utils/concurrency.js';
+import {
+  SettlementFailureLedger,
+  SettlementFailureEntry,
+  SettlementAction,
+  SettlementFailureCategory,
+  classifySettlementError,
+  globalSettlementLedger,
+} from './settlement-failure-ledger.js';
+import { sanitizeForLog } from '../utils/sanitize-for-log.js';
+import {
+  settlementRetriesTotal,
+  settlementRecoverySuccessTotal,
+  settlementTerminalFailuresTotal,
+  settlementAmbiguousTotal,
+  settlementLedgerPhaseGauge,
+  settlementDueForRetryGauge,
+  settlementNeedsInterventionGauge,
+  settlementRetryTickDurationSeconds,
+  settlementRetryLastRunTimestamp,
+} from '../metrics.js';
 
-// Recovery status types
-export enum RecoveryStatus {
-  Pending = 'pending',
-  InProgress = 'in_progress',
-  Completed = 'completed',
-  Failed = 'failed',
-  Cancelled = 'cancelled'
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/**
+ * Callback the recovery service invokes when it retries a settlement action.
+ * Must return the winning transaction hash on success, or throw on failure.
+ *
+ * The callback is responsible for the actual on-chain call. The recovery
+ * service handles state tracking, retries, and metrics around it.
+ */
+export type RetryExecutor = (entry: SettlementFailureEntry) => Promise<string>;
+
+/**
+ * Map of executors by settlement action. The recovery service will use
+ * the matching executor for each entry.
+ */
+export type RetryExecutors = Partial<Record<SettlementAction, RetryExecutor>>;
+
+export interface RecoveryServiceConfig {
+  /**
+   * How often to scan for entries due for retry, in ms.
+   * Default: 30_000 (30 seconds).
+   */
+  scanIntervalMs?: number;
+  /**
+   * How often to check timelocks, in ms.
+   * Default: 60_000 (1 minute).
+   */
+  timelockIntervalMs?: number;
+  /**
+   * Seconds after timelock expiry before initiating a timeout refund.
+   * Default: 120 (2 minutes grace period).
+   */
+  gracePeriodSeconds?: number;
+  /**
+   * Settlement failure ledger to read entries from.
+   * Default: the process-wide singleton.
+   */
+  ledger?: SettlementFailureLedger;
+  /**
+   * Callback map for retrying different settlement actions.
+   * If not provided for an action, the recovery service will log a
+   * warning but will not throw.
+   */
+  executors?: RetryExecutors;
 }
 
-export enum RecoveryType {
-  TimeoutRefund = 'timeout_refund',
-  EmergencyRefund = 'emergency_refund',
-  PublicWithdrawal = 'public_withdrawal',
-  ForceRecovery = 'force_recovery'
-}
-
-// Recovery request interface
-export interface RecoveryRequest {
-  id: string;
-  orderHash: string;
-  type: RecoveryType;
-  status: RecoveryStatus;
-  initiator: string;
-  reason: string;
-  createdAt: number;
-  updatedAt: number;
-  metadata: {
-    srcChainId?: number;
-    dstChainId?: number;
-    amount?: string;
-    token?: string;
-    timelock?: number;
-    expired?: boolean;
-    emergencyReason?: string;
-    test?: boolean;
-  };
-}
-
-// Recovery statistics
 export interface RecoveryStats {
-  totalRecoveries: number;
+  totalRetries: number;
   successfulRecoveries: number;
-  failedRecoveries: number;
-  pendingRecoveries: number;
-  totalValueRecovered: string;
-  averageRecoveryTime: number;
-  lastRecoveryAt: number;
+  terminalFailures: number;
+  ambiguousEntries: number;
+  lastScanAt: number;
 }
 
-// Recovery configuration
-export interface RecoveryConfig {
-  monitoringInterval: number; // ms
-  autoRefundEnabled: boolean;
-  emergencyEnabled: boolean;
-  maxRetries: number;
-  retryDelay: number;
-  gracePeriod: number; // seconds after timelock
-}
+// ---------------------------------------------------------------------------
+// RecoveryService
+// ---------------------------------------------------------------------------
 
 export class RecoveryService extends EventEmitter {
-  private ordersService: OrdersService;
-  private eventManager: FusionEventManager;
-  private config: RecoveryConfig;
-  private recoveryRequests: Map<string, RecoveryRequest> = new Map();
-  private monitoringInterval: NodeJS.Timeout | null = null;
-  private stats: RecoveryStats;
-  private recoveryMutex = new KeyedMutex();
+  private readonly ledger: SettlementFailureLedger;
+  private readonly executors: RetryExecutors;
+  private readonly config: Required<Omit<RecoveryServiceConfig, 'ledger' | 'executors'>>;
 
-  constructor(
-    ordersService: OrdersService,
-    eventManager: FusionEventManager,
-    config: RecoveryConfig
-  ) {
+  private scanInterval: NodeJS.Timeout | null = null;
+  private timelockInterval: NodeJS.Timeout | null = null;
+  private readonly mutex = new KeyedMutex();
+  private readonly deduplicator = new Deduplicator();
+
+  private stats: RecoveryStats = {
+    totalRetries: 0,
+    successfulRecoveries: 0,
+    terminalFailures: 0,
+    ambiguousEntries: 0,
+    lastScanAt: 0,
+  };
+
+  constructor(config: RecoveryServiceConfig = {}) {
     super();
-    this.ordersService = ordersService;
-    this.eventManager = eventManager;
-    this.config = config;
-    this.stats = {
-      totalRecoveries: 0,
-      successfulRecoveries: 0,
-      failedRecoveries: 0,
-      pendingRecoveries: 0,
-      totalValueRecovered: '0',
-      averageRecoveryTime: 0,
-      lastRecoveryAt: 0
+    this.ledger = config.ledger ?? globalSettlementLedger;
+    this.executors = config.executors ?? {};
+    this.config = {
+      scanIntervalMs: config.scanIntervalMs ?? 30_000,
+      timelockIntervalMs: config.timelockIntervalMs ?? 60_000,
+      gracePeriodSeconds: config.gracePeriodSeconds ?? 120,
     };
-
-    this.startMonitoring();
-    this.setupEventListeners();
   }
 
-  /**
-   * Start timelock monitoring
-   */
-  private startMonitoring(): void {
-    if (this.monitoringInterval) {
-      clearInterval(this.monitoringInterval);
-    }
-
-    this.monitoringInterval = setInterval(() => {
-      this.monitorTimelocksAndRecover();
-    }, this.config.monitoringInterval);
-
-    console.log('✅ Recovery Service: Timelock monitoring started');
-  }
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   /**
-   * Setup event listeners
+   * Start the background scan loop and timelock monitor.
+   * Idempotent — calling start() when already running is a no-op.
    */
-  private setupEventListeners(): void {
-    // Listen to order events
-    this.eventManager.on('order_created', (data) => {
-      this.trackNewOrder(data.orderHash);
-    });
+  start(): void {
+    if (this.scanInterval) return; // already running
 
-    this.eventManager.on('order_cancelled', (data) => {
-      this.handleOrderCancellation(data.orderHash);
-    });
+    console.log(
+      `[recovery-service] starting ` +
+      `· retry scan every ${this.config.scanIntervalMs / 1000}s ` +
+      `· timelock check every ${this.config.timelockIntervalMs / 1000}s`
+    );
 
-    this.eventManager.on('order_filled', (data) => {
-      this.handleOrderCompletion(data.orderHash);
-    });
-  }
+    // Warm-up: first scan after 5s so the relayer is fully booted
+    const warmup = setTimeout(() => void this.runRetryScan(), 5_000);
+    // Prevent the warmup timer from blocking process exit
+    if (warmup.unref) warmup.unref();
 
-  /**
-   * Monitor timelocks and initiate recovery
-   */
-  private async monitorTimelocksAndRecover(): Promise<void> {
-    try {
-      const activeOrders = this.ordersService.getActiveOrders();
-      const currentTime = getCurrentTimestamp();
+    this.scanInterval = setInterval(
+      () => void this.runRetryScan(),
+      this.config.scanIntervalMs,
+    );
 
-      for (const order of activeOrders.items) {
-        await this.recoveryMutex.runExclusive(order.orderHash, async () => {
-          if (this.shouldInitiateRecovery(order, currentTime)) {
-            await this.initiateTimeoutRecovery(order);
-          }
-        });
-      }
-    } catch (error) {
-      console.error('❌ Recovery monitoring error:', error);
-    }
-  }
-
-  /**
-   * Check if recovery should be initiated
-   */
-  private shouldInitiateRecovery(order: ActiveOrder, currentTime: number): boolean {
-    // Check if timelock has expired
-    const timelock = order.deadline;
-    const gracePeriod = this.config.gracePeriod;
-    
-    return (
-      currentTime > timelock + gracePeriod &&
-      !this.isRecoveryInProgress(order.orderHash) &&
-      this.config.autoRefundEnabled
+    this.timelockInterval = setInterval(
+      () => void this.checkTimelocks(),
+      this.config.timelockIntervalMs,
     );
   }
 
-  /**
-   * Initiate timeout recovery
-   */
-  private async initiateTimeoutRecovery(order: ActiveOrder): Promise<void> {
-    const recoveryId = `recovery_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const recoveryRequest: RecoveryRequest = {
-      id: recoveryId,
-      orderHash: order.orderHash,
-      type: RecoveryType.TimeoutRefund,
-      status: RecoveryStatus.Pending,
-      initiator: 'system',
-      reason: 'Timelock expired',
-      createdAt: getCurrentTimestamp(),
-      updatedAt: getCurrentTimestamp(),
-      metadata: {
-        srcChainId: order.srcChainId,
-        dstChainId: order.dstChainId,
-        amount: order.order.makingAmount,
-        token: order.order.makerAsset,
-        timelock: order.deadline,
-        expired: true
-      }
-    };
-
-    this.recoveryRequests.set(recoveryId, recoveryRequest);
-    this.stats.pendingRecoveries++;
-
-    console.log(`🔄 orderHash=${order.orderHash} Recovery initiated for order ${order.orderHash} (${recoveryId})`);
-    
-    // Emit recovery event
-    this.eventManager.emitEvent(EventType.Recovery, order.orderHash, {
-      recoveryId,
-      type: RecoveryType.TimeoutRefund,
-      status: RecoveryStatus.Pending,
-      orderHash: order.orderHash,
-      timestamp: getCurrentTimestamp()
-    });
-
-    // Execute recovery
-    await this.executeRecovery(recoveryId);
+  /** Stop background loops and release resources. */
+  stop(): void {
+    if (this.scanInterval) {
+      clearInterval(this.scanInterval);
+      this.scanInterval = null;
+    }
+    if (this.timelockInterval) {
+      clearInterval(this.timelockInterval);
+      this.timelockInterval = null;
+    }
+    this.removeAllListeners();
+    console.log('[recovery-service] stopped');
   }
 
+  // ── Retry scan ────────────────────────────────────────────────────────────
+
   /**
-   * Execute recovery process
+   * Scan for entries due for retry and attempt recovery.
+   * Exported for direct invocation in tests.
    */
-  private async executeRecovery(recoveryId: string): Promise<void> {
-    const recovery = this.recoveryRequests.get(recoveryId);
-    if (!recovery) {
-      console.error(`❌ Recovery ${recoveryId} not found`);
+  async runRetryScan(): Promise<void> {
+    const tickEnd = settlementRetryTickDurationSeconds.startTimer();
+    const now = getCurrentTimestamp();
+
+    try {
+      const due = this.ledger.dueForRetry();
+      const needs = this.ledger.needsManualIntervention();
+
+      // Update gauges before processing so they reflect current state
+      this.refreshGauges();
+
+      settlementDueForRetryGauge.set(due.length);
+      settlementNeedsInterventionGauge.set(needs.length);
+
+      for (const entry of due) {
+        // Deduplicator: if a prior retry is still running for this
+        // order+action, skip — don't stack up concurrent attempts.
+        const mutexKey = `${entry.orderId}::${entry.action}`;
+        void this.deduplicator.run(mutexKey, () => this.retryEntry(entry));
+      }
+
+      // Emit terminal failures as events so callers can alert
+      for (const entry of needs) {
+        this.emit('intervention_needed', entry);
+      }
+
+      this.stats.lastScanAt = now;
+    } catch (err: unknown) {
+      const safe = sanitizeForLog(err);
+      console.error(
+        '[recovery-service] scan error:',
+        safe instanceof Error ? safe.message : safe
+      );
+    } finally {
+      tickEnd();
+      settlementRetryLastRunTimestamp.set(Math.floor(Date.now() / 1000));
+    }
+  }
+
+  // ── Individual entry retry ────────────────────────────────────────────────
+
+  private async retryEntry(entry: SettlementFailureEntry): Promise<void> {
+    const { orderId, action } = entry;
+    const executor = this.executors[action];
+
+    if (!executor) {
+      console.warn(
+        `[recovery-service] orderId=${orderId} action=${action} ` +
+        `no executor registered — cannot retry automatically`
+      );
+      this.emit('no_executor', entry);
       return;
     }
 
-    recovery.status = RecoveryStatus.InProgress;
-    recovery.updatedAt = getCurrentTimestamp();
+    settlementRetriesTotal.inc({ action, category: this.lastCategory(entry) });
+    this.stats.totalRetries++;
+
+    this.ledger.recordAttemptStart(orderId, action);
+    console.log(
+      `[recovery-service] 🔄 orderId=${orderId} action=${action} ` +
+      `retry #${entry.retryCount + 1}`
+    );
 
     try {
-      const order = this.ordersService.getActiveOrders().items.find(
-        o => o.orderHash === recovery.orderHash
+      const txHash = await executor(entry);
+
+      this.ledger.recordSuccess(orderId, action, txHash);
+      settlementRecoverySuccessTotal.inc({ action });
+      this.stats.successfulRecoveries++;
+
+      console.log(
+        `[recovery-service] ✅ orderId=${orderId} action=${action} ` +
+        `recovered (tx=${txHash})`
+      );
+      this.emit('recovered', { entry, txHash });
+    } catch (err: unknown) {
+      const category = classifySettlementError(err);
+      const updated = this.ledger.recordFailure(orderId, action, err, category);
+      const safe = sanitizeForLog(err);
+
+      if (updated.phase === 'failed_terminal') {
+        settlementTerminalFailuresTotal.inc({ action, category });
+        this.stats.terminalFailures++;
+        console.error(
+          `[recovery-service] ❌ orderId=${orderId} action=${action} ` +
+          `terminal failure (category=${category}): ` +
+          (safe instanceof Error ? safe.message : String(safe))
+        );
+        this.emit('terminal_failure', { entry: updated, category, error: safe });
+      } else if (updated.phase === 'failed_ambiguous') {
+        settlementAmbiguousTotal.inc({ action });
+        this.stats.ambiguousEntries++;
+        console.warn(
+          `[recovery-service] ⚠️  orderId=${orderId} action=${action} ` +
+          `ambiguous outcome — will re-check next scan`
+        );
+        this.emit('ambiguous', { entry: updated, category, error: safe });
+      } else {
+        // Still retrying — will be picked up on next scan
+        console.warn(
+          `[recovery-service] ⚠️  orderId=${orderId} action=${action} ` +
+          `retry #${updated.retryCount} failed (category=${category}), ` +
+          `next retry after ${new Date(updated.retryAfter * 1000).toISOString()}: ` +
+          (safe instanceof Error ? safe.message : String(safe))
+        );
+        this.emit('retry_failed', { entry: updated, category, error: safe });
+      }
+    }
+  }
+
+  // ── Timelock monitoring ───────────────────────────────────────────────────
+
+  /**
+   * Scan for orders whose timelock has expired and initiate timeout refunds.
+   * Orders are supplied via the `getExpiringOrders` callback (injected at
+   * call sites so the service does not depend on the in-memory order map
+   * directly — keeping it testable).
+   */
+  async checkTimelocks(
+    getExpiringOrders?: () => Array<{ orderId: string; deadline: number; metadata?: Record<string, unknown> }>,
+  ): Promise<void> {
+    if (!getExpiringOrders) return;
+
+    const now = getCurrentTimestamp();
+    const grace = this.config.gracePeriodSeconds;
+
+    let expiredCount = 0;
+    for (const order of getExpiringOrders()) {
+      if (now <= order.deadline + grace) continue;
+
+      expiredCount++;
+      const mutexKey = `${order.orderId}::timelock`;
+
+      void this.deduplicator.run(mutexKey, async () => {
+        const executor = this.executors['xlm_refund'];
+        if (!executor) {
+          console.warn(
+            `[recovery-service] orderId=${order.orderId} ` +
+            `timelock expired but no xlm_refund executor registered`
+          );
+          return;
+        }
+
+        const entry = this.ledger.register(
+          order.orderId,
+          'xlm_refund',
+          { reason: 'timelock_expired', deadline: order.deadline, ...order.metadata },
+        );
+
+        console.log(
+          `[recovery-service] ⏰ orderId=${order.orderId} ` +
+          `timelock expired at ${order.deadline} (grace=${grace}s) — initiating refund`
+        );
+
+        this.ledger.recordAttemptStart(order.orderId, 'xlm_refund');
+        try {
+          const txHash = await executor(entry);
+          this.ledger.recordSuccess(order.orderId, 'xlm_refund', txHash);
+          settlementRecoverySuccessTotal.inc({ action: 'xlm_refund' });
+          console.log(`[recovery-service] ✅ orderId=${order.orderId} timeout refund (tx=${txHash})`);
+          this.emit('timeout_refund_success', { orderId: order.orderId, txHash });
+        } catch (err: unknown) {
+          const updated = this.ledger.recordFailure(order.orderId, 'xlm_refund', err);
+          const safe = sanitizeForLog(err);
+          console.error(
+            `[recovery-service] ❌ orderId=${order.orderId} timeout refund failed:`,
+            safe instanceof Error ? safe.message : safe
+          );
+          this.emit('timeout_refund_failed', { orderId: order.orderId, entry: updated, error: safe });
+        }
+      });
+    }
+
+    if (expiredCount > 0) {
+      console.log(`[recovery-service] ⏰ ${expiredCount} expired orders processed`);
+    }
+  }
+
+  // ── Manual recovery ───────────────────────────────────────────────────────
+
+  /**
+   * Trigger an immediate recovery for a specific order + action.
+   * Useful for operator-driven retries via the admin API.
+   *
+   * Returns the winning txHash on success, or throws on failure.
+   */
+  async manualRecover(
+    orderId: string,
+    action: SettlementAction,
+    metadata: Record<string, unknown> = {},
+  ): Promise<string> {
+    const mutexKey = `${orderId}::${action}`;
+
+    return this.mutex.runExclusive(mutexKey, async () => {
+      const executor = this.executors[action];
+      if (!executor) {
+        throw new Error(
+          `[recovery-service] No executor registered for action=${action}. ` +
+          `Register one via RecoveryServiceConfig.executors.`
+        );
+      }
+
+      let entry = this.ledger.getEntry(orderId, action);
+      if (!entry) {
+        entry = this.ledger.register(orderId, action, { ...metadata, manualRecovery: true });
+      }
+
+      settlementRetriesTotal.inc({ action, category: this.lastCategory(entry) });
+      this.stats.totalRetries++;
+      this.ledger.recordAttemptStart(orderId, action);
+
+      console.log(
+        `[recovery-service] 🔧 manual recovery orderId=${orderId} action=${action}`
       );
 
-      if (!order) {
-        throw new Error('Order not found');
+      try {
+        const txHash = await executor(entry);
+        this.ledger.recordSuccess(orderId, action, txHash);
+        settlementRecoverySuccessTotal.inc({ action });
+        this.stats.successfulRecoveries++;
+
+        console.log(
+          `[recovery-service] ✅ manual recovery succeeded orderId=${orderId} action=${action} tx=${txHash}`
+        );
+        this.emit('recovered', { entry, txHash });
+        return txHash;
+      } catch (err: unknown) {
+        const category = classifySettlementError(err);
+        const updated = this.ledger.recordFailure(orderId, action, err, category);
+        const safe = sanitizeForLog(err);
+
+        console.error(
+          `[recovery-service] ❌ manual recovery failed orderId=${orderId} action=${action}:`,
+          safe instanceof Error ? safe.message : safe
+        );
+        this.emit('retry_failed', { entry: updated, category, error: safe });
+        throw err;
       }
-
-      // Execute recovery based on type
-      switch (recovery.type) {
-        case RecoveryType.TimeoutRefund:
-          await this.executeTimeoutRefund(recovery, order);
-          break;
-        case RecoveryType.EmergencyRefund:
-          await this.executeEmergencyRefund(recovery, order);
-          break;
-        case RecoveryType.PublicWithdrawal:
-          await this.executePublicWithdrawal(recovery, order);
-          break;
-        case RecoveryType.ForceRecovery:
-          await this.executeForceRecovery(recovery, order);
-          break;
-      }
-
-      // Mark as completed
-      recovery.status = RecoveryStatus.Completed;
-      recovery.updatedAt = getCurrentTimestamp();
-      
-      this.stats.successfulRecoveries++;
-      this.stats.pendingRecoveries--;
-      this.stats.totalValueRecovered = (
-        BigInt(this.stats.totalValueRecovered) + BigInt(order.order.makingAmount)
-      ).toString();
-      this.stats.lastRecoveryAt = getCurrentTimestamp();
-
-      console.log(`✅ orderHash=${recovery.orderHash} Recovery completed: ${recoveryId}`);
-      
-      // Emit success event
-      this.eventManager.emitEvent(EventType.Recovery, recovery.orderHash, {
-        recoveryId,
-        type: recovery.type,
-        status: RecoveryStatus.Completed,
-        orderHash: recovery.orderHash,
-        timestamp: getCurrentTimestamp()
-      });
-
-    } catch (error) {
-      console.error(`❌ orderHash=${recovery.orderHash} Recovery failed: ${recoveryId}`, error);
-      
-      recovery.status = RecoveryStatus.Failed;
-      recovery.updatedAt = getCurrentTimestamp();
-      
-      this.stats.failedRecoveries++;
-      this.stats.pendingRecoveries--;
-
-      // Emit failure event
-      this.eventManager.emitEvent(EventType.Recovery, recovery.orderHash, {
-        recoveryId,
-        type: recovery.type,
-        status: RecoveryStatus.Failed,
-        orderHash: recovery.orderHash,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        timestamp: getCurrentTimestamp()
-      });
-
-      // Retry if configured
-      if (this.config.maxRetries > 0) {
-        setTimeout(() => {
-          this.retryRecovery(recoveryId);
-        }, this.config.retryDelay);
-      }
-    }
-  }
-
-  /**
-   * Execute timeout refund
-   */
-  private async executeTimeoutRefund(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🔄 orderHash=${order.orderHash} Executing timeout refund for order ${order.orderHash}`);
-    
-    // 1. Ethereum refund
-    if (order.srcChainId === 1) { // Ethereum
-      await this.executeEthereumRefund(order);
-    }
-
-    // 2. Stellar refund
-    if (order.dstChainId === 999) { // Stellar
-      await this.executeStellarRefund(order);
-    }
-
-    // 3. Update order status
-    // This would normally update the order in the database
-    console.log(`✅ orderHash=${order.orderHash} Timeout refund completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute emergency refund
-   */
-  private async executeEmergencyRefund(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🚨 orderHash=${order.orderHash} Executing emergency refund for order ${order.orderHash}`);
-    console.log(`orderHash=${order.orderHash} Emergency reason: ${recovery.metadata.emergencyReason}`);
-    
-    // Emergency refund logic - more aggressive, bypasses normal checks
-    await this.executeEthereumEmergencyRefund(order);
-    await this.executeStellarEmergencyRefund(order);
-    
-    console.log(`✅ orderHash=${order.orderHash} Emergency refund completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute public withdrawal
-   */
-  private async executePublicWithdrawal(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🔓 orderHash=${order.orderHash} Executing public withdrawal for order ${order.orderHash}`);
-    
-    // Public withdrawal - anyone can trigger after timelock + grace period
-    await this.executePublicEthereumWithdrawal(order);
-    await this.executePublicStellarWithdrawal(order);
-    
-    console.log(`✅ orderHash=${order.orderHash} Public withdrawal completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute force recovery (admin only)
-   */
-  private async executeForceRecovery(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`⚡ orderHash=${order.orderHash} Executing force recovery for order ${order.orderHash}`);
-    
-    // Force recovery - admin override
-    await this.executeForceEthereumRecovery(order);
-    await this.executeForceeStellarRecovery(order);
-    
-    console.log(`✅ orderHash=${order.orderHash} Force recovery completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Ethereum refund operations
-   */
-  private async executeEthereumRefund(order: ActiveOrder): Promise<void> {
-    // Mock implementation - would call actual Ethereum contract
-    console.log(`🔄 orderHash=${order.orderHash} Ethereum refund: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    
-    // Simulate contract call
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    console.log(`✅ orderHash=${order.orderHash} Ethereum refund successful`);
-  }
-
-  private async executeEthereumEmergencyRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🚨 orderHash=${order.orderHash} Ethereum emergency refund: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 500));
-    console.log(`✅ orderHash=${order.orderHash} Ethereum emergency refund successful`);
-  }
-
-  private async executePublicEthereumWithdrawal(order: ActiveOrder): Promise<void> {
-    console.log(`🔓 orderHash=${order.orderHash} Ethereum public withdrawal: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    console.log(`✅ orderHash=${order.orderHash} Ethereum public withdrawal successful`);
-  }
-
-  private async executeForceEthereumRecovery(order: ActiveOrder): Promise<void> {
-    console.log(`⚡ orderHash=${order.orderHash} Ethereum force recovery: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 800));
-    console.log(`✅ orderHash=${order.orderHash} Ethereum force recovery successful`);
-  }
-
-  /**
-   * Stellar refund operations
-   */
-  private async executeStellarRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🔄 orderHash=${order.orderHash} Stellar refund: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    console.log(`✅ orderHash=${order.orderHash} Stellar refund successful`);
-  }
-
-  private async executeStellarEmergencyRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🚨 orderHash=${order.orderHash} Stellar emergency refund: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 600));
-    console.log(`✅ orderHash=${order.orderHash} Stellar emergency refund successful`);
-  }
-
-  private async executePublicStellarWithdrawal(order: ActiveOrder): Promise<void> {
-    console.log(`🔓 orderHash=${order.orderHash} Stellar public withdrawal: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    console.log(`✅ orderHash=${order.orderHash} Stellar public withdrawal successful`);
-  }
-
-  private async executeForceeStellarRecovery(order: ActiveOrder): Promise<void> {
-    console.log(`⚡ orderHash=${order.orderHash} Stellar force recovery: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 900));
-    console.log(`✅ orderHash=${order.orderHash} Stellar force recovery successful`);
-  }
-
-  /**
-   * Retry recovery
-   */
-  private async retryRecovery(recoveryId: string): Promise<void> {
-    const recovery = this.recoveryRequests.get(recoveryId);
-    if (!recovery || recovery.status === RecoveryStatus.Completed) {
-      return;
-    }
-
-    console.log(`🔄 orderHash=${recovery.orderHash} Retrying recovery: ${recoveryId}`);
-    recovery.status = RecoveryStatus.Pending;
-    recovery.updatedAt = getCurrentTimestamp();
-
-    await this.recoveryMutex.runExclusive(recovery.orderHash, async () => {
-      await this.executeRecovery(recoveryId);
     });
   }
 
-  /**
-   * Manual recovery initiation
-   */
-  public async initiateManualRecovery(
-    orderHash: string,
-    type: RecoveryType,
-    initiator: string,
-    reason: string,
-    metadata: Partial<RecoveryRequest['metadata']> = {}
-  ): Promise<string> {
-    const recoveryId = `manual_recovery_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const recoveryRequest: RecoveryRequest = {
-      id: recoveryId,
-      orderHash,
-      type,
-      status: RecoveryStatus.Pending,
-      initiator,
-      reason,
-      createdAt: getCurrentTimestamp(),
-      updatedAt: getCurrentTimestamp(),
-      metadata
-    };
+  // ── Status queries ────────────────────────────────────────────────────────
 
-    this.recoveryRequests.set(recoveryId, recoveryRequest);
-    this.stats.pendingRecoveries++;
-
-    console.log(`🔄 orderHash=${orderHash} Manual recovery initiated: ${recoveryId} by ${initiator}`);
-    
-    // Execute recovery
-    await this.recoveryMutex.runExclusive(orderHash, async () => {
-      await this.executeRecovery(recoveryId);
-    });
-    
-    return recoveryId;
-  }
-
-  /**
-   * Emergency recovery
-   */
-  public async emergencyRecovery(
-    orderHash: string,
-    reason: string,
-    initiator: string
-  ): Promise<string> {
-    return this.initiateManualRecovery(
-      orderHash,
-      RecoveryType.EmergencyRefund,
-      initiator,
-      reason,
-      { emergencyReason: reason }
-    );
-  }
-
-  /**
-   * Utility methods
-   */
-  private isRecoveryInProgress(orderHash: string): boolean {
-    return Array.from(this.recoveryRequests.values()).some(
-      recovery => recovery.orderHash === orderHash && 
-      recovery.status === RecoveryStatus.InProgress
-    );
-  }
-
-  private trackNewOrder(orderHash: string): void {
-    console.log(`📊 orderHash=${orderHash} Recovery tracking: New order ${orderHash}`);
-  }
-
-  private handleOrderCancellation(orderHash: string): void {
-    console.log(`📊 orderHash=${orderHash} Recovery tracking: Order cancelled ${orderHash}`);
-  }
-
-  private handleOrderCompletion(orderHash: string): void {
-    console.log(`📊 orderHash=${orderHash} Recovery tracking: Order completed ${orderHash}`);
-  }
-
-  /**
-   * Get recovery statistics
-   */
-  public getRecoveryStats(): RecoveryStats {
+  getStats(): RecoveryStats {
     return { ...this.stats };
   }
 
-  /**
-   * Get recovery requests
-   */
-  public getRecoveryRequests(): RecoveryRequest[] {
-    return Array.from(this.recoveryRequests.values());
+  getLedgerStats() {
+    return this.ledger.stats();
+  }
+
+  getFailedEntries(): SettlementFailureEntry[] {
+    return this.ledger.needsManualIntervention();
+  }
+
+  getDueForRetry(): SettlementFailureEntry[] {
+    return this.ledger.dueForRetry();
+  }
+
+  getEntry(orderId: string, action: SettlementAction): SettlementFailureEntry | undefined {
+    return this.ledger.getEntry(orderId, action);
   }
 
   /**
-   * Get specific recovery request
+   * Full snapshot of all settlement ledger entries. Used by the
+   * /api/recovery/status admin endpoint.
    */
-  public getRecoveryRequest(recoveryId: string): RecoveryRequest | undefined {
-    return this.recoveryRequests.get(recoveryId);
+  snapshot(): SettlementFailureEntry[] {
+    return this.ledger.snapshot();
   }
 
-  /**
-   * Stop monitoring
-   */
-  public stopMonitoring(): void {
-    if (this.monitoringInterval) {
-      clearInterval(this.monitoringInterval);
-      this.monitoringInterval = null;
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  private refreshGauges(): void {
+    const counts = this.ledger.stats();
+    for (const [phase, count] of Object.entries(counts)) {
+      settlementLedgerPhaseGauge.labels(phase).set(count);
     }
-    console.log('🛑 Recovery Service: Monitoring stopped');
   }
 
-  /**
-   * Cleanup
-   */
-  public cleanup(): void {
-    this.stopMonitoring();
-    this.removeAllListeners();
-    console.log('🧹 Recovery Service: Cleanup completed');
+  private lastCategory(entry: SettlementFailureEntry): SettlementFailureCategory | string {
+    for (let i = entry.attempts.length - 1; i >= 0; i--) {
+      const c = entry.attempts[i].failureCategory;
+      if (c) return c;
+    }
+    return 'unknown';
   }
 }
 
-export default RecoveryService; 
+// ---------------------------------------------------------------------------
+// Process-wide singleton
+// ---------------------------------------------------------------------------
+
+/**
+ * Default singleton. Callers that need a custom ledger or executor set
+ * should construct a new RecoveryService instead.
+ */
+export const globalRecoveryService = new RecoveryService();
+
+export default RecoveryService;

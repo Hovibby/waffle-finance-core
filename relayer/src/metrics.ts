@@ -207,6 +207,115 @@ export const refundHorizonRetries = new Counter({
 });
 
 // ---------------------------------------------------------------------------
+// Settlement failure and recovery metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Total number of settlement attempts that failed, labeled by:
+ *   - `action`    : eth_send | xlm_refund | xlm_release | eth_escrow_claim
+ *   - `category`  : transient_rpc | rate_limit | insufficient_funds |
+ *                   nonce_conflict | gas_error | horizon_timeout | terminal | unknown
+ */
+export const settlementFailuresTotal = new Counter({
+  name: 'relayer_settlement_failures_total',
+  help: 'Total settlement attempts that failed, by action and failure category',
+  labelNames: ['action', 'category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total number of settlement retries attempted after a recoverable failure.
+ */
+export const settlementRetriesTotal = new Counter({
+  name: 'relayer_settlement_retries_total',
+  help: 'Total settlement retry attempts triggered by the recovery service',
+  labelNames: ['action', 'category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total number of settlement retries that succeeded after at least one failure.
+ */
+export const settlementRecoverySuccessTotal = new Counter({
+  name: 'relayer_settlement_recovery_success_total',
+  help: 'Total settlements recovered successfully after one or more failures',
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total number of settlement failures that became terminal (no more retries).
+ * These require manual operator intervention.
+ */
+export const settlementTerminalFailuresTotal = new Counter({
+  name: 'relayer_settlement_terminal_failures_total',
+  help: 'Total settlements that reached a terminal failed state requiring manual intervention',
+  labelNames: ['action', 'category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total number of settlement outcomes that are ambiguous (Horizon/RPC
+ * timeout — the tx may have landed). The watchdog will resolve these.
+ */
+export const settlementAmbiguousTotal = new Counter({
+  name: 'relayer_settlement_ambiguous_total',
+  help: 'Total settlement attempts with ambiguous outcomes (timeouts — tx may have landed)',
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+// ---------------------------------------------------------------------------
+// Settlement failure ledger gauges (sampled by the recovery service)
+// ---------------------------------------------------------------------------
+
+/** Current number of settlement entries in each phase. */
+export const settlementLedgerPhaseGauge = new Gauge({
+  name: 'relayer_settlement_ledger_entries',
+  help: 'Current number of settlement ledger entries by phase',
+  labelNames: ['phase'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current number of settlement entries awaiting a retry and due now
+ * (back-off window expired).
+ */
+export const settlementDueForRetryGauge = new Gauge({
+  name: 'relayer_settlement_due_for_retry',
+  help: 'Number of failed settlements currently eligible for retry',
+  registers: [registry],
+});
+
+/**
+ * Current number of settlement entries that need manual intervention.
+ */
+export const settlementNeedsInterventionGauge = new Gauge({
+  name: 'relayer_settlement_needs_intervention',
+  help: 'Number of failed settlements requiring manual operator intervention',
+  registers: [registry],
+});
+
+/**
+ * Duration of settlement retry scan ticks (recovery service).
+ */
+export const settlementRetryTickDurationSeconds = new Histogram({
+  name: 'relayer_settlement_retry_tick_duration_seconds',
+  help: 'Duration of a full settlement retry scan tick in seconds',
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10],
+  registers: [registry],
+});
+
+/**
+ * Unix timestamp of the last recovery service tick.
+ */
+export const settlementRetryLastRunTimestamp = new Gauge({
+  name: 'relayer_settlement_retry_last_run_timestamp_seconds',
+  help: 'Unix timestamp of the last settlement retry scan tick',
+  registers: [registry],
+});
+
+// ---------------------------------------------------------------------------
 // Convenience re-export
 // ---------------------------------------------------------------------------
 
@@ -228,4 +337,18 @@ export const refundMetrics = {
   duplicatesSuppressed: refundDuplicatesSuppressed,
   horizonTimeouts: refundHorizonTimeouts,
   horizonRetries: refundHorizonRetries,
+} as const;
+
+/** All settlement failure / recovery metrics in one object — useful for test assertions. */
+export const settlementMetrics = {
+  failuresTotal: settlementFailuresTotal,
+  retriesTotal: settlementRetriesTotal,
+  recoverySuccessTotal: settlementRecoverySuccessTotal,
+  terminalFailuresTotal: settlementTerminalFailuresTotal,
+  ambiguousTotal: settlementAmbiguousTotal,
+  ledgerPhaseGauge: settlementLedgerPhaseGauge,
+  dueForRetryGauge: settlementDueForRetryGauge,
+  needsInterventionGauge: settlementNeedsInterventionGauge,
+  retryTickDuration: settlementRetryTickDurationSeconds,
+  retryLastRunTimestamp: settlementRetryLastRunTimestamp,
 } as const;
