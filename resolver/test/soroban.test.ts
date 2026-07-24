@@ -3,18 +3,6 @@
  *  - lifecycle (timer leak prevention)
  *  - cursor persistence (resume from disk, no advance on RPC failure)
  *  - typed event dispatch (onOrderCreated / onOrderClaimed / onOrderRefunded)
- *
- * @stellar/stellar-sdk rpc.Server is mocked here so no real RPC is needed.
- * XDR decoding is tested separately in soroban-events.test.ts, which runs
- * without any SDK mock so it can use real xdr / nativeToScVal / Address.
- *
- * The SorobanListener's internal `fetchAndProcess` calls
- * `decodeSorobanHtlcEvent` from soroban-events.ts.  In the dispatch tests we
- * inject pre-built base64 XDR payloads via the fake rpc event objects — these
- * are built with the REAL sdk (imported before the mock hoists), which works
- * because nativeToScVal / xdr / Address are only called in helper functions
- * that execute at test runtime, after the mock is already in place, using the
- * real module via the `actual` spread in the factory.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -24,9 +12,7 @@ import pino from "pino";
 import { SorobanCursorStore } from "../src/utils/cursor-store.js";
 import { SorobanListener } from "../src/listeners/soroban.js";
 
-// ── Stellar SDK mock ─────────────────────────────────────────────────────────
-// We mock rpc.Server but keep every other export (xdr, nativeToScVal, Address)
-// real via `...actual` so the decoder can work correctly.
+// ── Stellar SDK mock ──────────────────────────────────────────────────────────
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
   return {
@@ -42,10 +28,9 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   };
 });
 
-// ── Fixtures — built AFTER mock is hoisted, so actual sdk exports are live ───
 import { xdr, nativeToScVal, StrKey } from "@stellar/stellar-sdk";
 
-// Fixed raw 32-byte buffers — no Keypair.fromSecret, no StrKey round-trip.
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 const SENDER_BYTES = Buffer.from("aabbccdd".repeat(8), "hex");
 const BENE_BYTES   = Buffer.from("11223344".repeat(8), "hex");
 const ASSET_BYTES  = Buffer.from("deadbeef".repeat(8), "hex");
@@ -60,7 +45,7 @@ const HASHLOCK_HEX = HASHLOCK_BUF.toString("hex");
 const PREIMAGE_HEX = PREIMAGE_BUF.toString("hex");
 
 function b64(v: xdr.ScVal) { return v.toXDR("base64"); }
-function sym(s: string)  { return nativeToScVal(s, { type: "symbol" }); }
+function sym(s: string)    { return nativeToScVal(s, { type: "symbol" }); }
 function addrAccount(raw: Buffer) {
   return xdr.ScVal.scvAddress(
     xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.publicKeyTypeEd25519(raw)),
@@ -102,7 +87,7 @@ function adminValue() {
   return b64(vec(addrSender(), addrBene()));
 }
 
-// ── Test config ──────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 const BASE_CFG = {
   network: "testnet" as const,
   pollIntervalMs: 1000,
@@ -126,7 +111,7 @@ const BASE_CFG = {
   rpc: { maxRetries: 3, baseDelayMs: 100, maxDelayMs: 2000 },
 };
 const SILENT_LOG = pino({ level: "silent" });
-const TEST_DIR = join(process.cwd(), ".soroban-test-listener");
+const TEST_DIR   = join(process.cwd(), ".soroban-test-listener");
 
 const noopHandlers = {
   onOrderCreated:  vi.fn(),
@@ -134,9 +119,6 @@ const noopHandlers = {
   onOrderRefunded: vi.fn(),
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Build a fake RPC-style event object (topic ScVals as objects with toXDR). */
 function fakeRpcEvent(
   topicB64s: string[],
   valueB64: string,
@@ -145,15 +127,14 @@ function fakeRpcEvent(
   contractId = "CCONTRACT",
 ) {
   return {
-    topic: topicB64s.map((b) => ({ toXDR: (_enc: string) => b })),
-    value: { toXDR: (_enc: string) => valueB64 },
+    topic:      topicB64s.map((b) => ({ toXDR: (_enc: string) => b })),
+    value:      { toXDR: (_enc: string) => valueB64 },
     ledger,
     txHash,
     contractId: { toString: () => contractId },
   };
 }
 
-/** Build a mock rpc.Server-like object. */
 function makeMockServer(opts: {
   sequence?: number;
   events?: unknown[];
@@ -168,16 +149,12 @@ function makeMockServer(opts: {
   };
 }
 
-/** Inject a mock server into the listener's private field. */
-function injectServer(
-  listener: SorobanListener,
-  mock: ReturnType<typeof makeMockServer>,
-) {
+function injectServer(listener: SorobanListener, mock: ReturnType<typeof makeMockServer>) {
   (listener as any).server = mock;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 1.  Lifecycle
+// 1. Lifecycle
 // ═══════════════════════════════════════════════════════════════════════════
 describe("SorobanListener lifecycle", () => {
   beforeEach(() => {
@@ -209,7 +186,7 @@ describe("SorobanListener lifecycle", () => {
   });
 
   it("does not start when htlc contract id is not configured", async () => {
-    const cfg = { ...BASE_CFG, soroban: { ...BASE_CFG.soroban, htlc: null } };
+    const cfg      = { ...BASE_CFG, soroban: { ...BASE_CFG.soroban, htlc: null } };
     const store    = new SorobanCursorStore({ storageDir: TEST_DIR });
     const listener = new SorobanListener(cfg, 1000, SILENT_LOG, { cursorStore: store });
     await listener.start(noopHandlers);
@@ -218,7 +195,7 @@ describe("SorobanListener lifecycle", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 2.  Cursor persistence
+// 2. Cursor persistence
 // ═══════════════════════════════════════════════════════════════════════════
 describe("SorobanListener cursor persistence", () => {
   beforeEach(() => {
@@ -230,10 +207,10 @@ describe("SorobanListener cursor persistence", () => {
   });
 
   it("persists the cursor returned by RPC after the first poll", async () => {
-    const store  = new SorobanCursorStore({ storageDir: TEST_DIR });
-    const server = makeMockServer({ cursor: "0000000000000050" });
+    const store    = new SorobanCursorStore({ storageDir: TEST_DIR });
+    const server   = makeMockServer({ cursor: "0000000000000050" });
     const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
-      cursorStore: store,
+      cursorStore:  store,
       cursorLabel: "test-persist",
     });
     injectServer(listener, server);
@@ -250,9 +227,9 @@ describe("SorobanListener cursor persistence", () => {
     const store = new SorobanCursorStore({ storageDir: TEST_DIR });
     store.save("test-resume", "0000000000000025");
 
-    const server = makeMockServer({ cursor: "0000000000000030" });
+    const server   = makeMockServer({ cursor: "0000000000000030" });
     const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
-      cursorStore: store,
+      cursorStore:  store,
       cursorLabel: "test-resume",
     });
     injectServer(listener, server);
@@ -276,7 +253,7 @@ describe("SorobanListener cursor persistence", () => {
       getEvents: vi.fn().mockRejectedValue(new Error("RPC connection refused")),
     };
     const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
-      cursorStore: store,
+      cursorStore:  store,
       cursorLabel: "test-rpc-fail",
     });
     injectServer(listener, failingServer);
@@ -290,10 +267,10 @@ describe("SorobanListener cursor persistence", () => {
   });
 
   it("uses startLedger on the very first poll when no cursor is persisted", async () => {
-    const store  = new SorobanCursorStore({ storageDir: TEST_DIR });
-    const server = makeMockServer({ sequence: 500, cursor: "0000000000000499" });
+    const store    = new SorobanCursorStore({ storageDir: TEST_DIR });
+    const server   = makeMockServer({ sequence: 500, cursor: "0000000000000499" });
     const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
-      cursorStore: store,
+      cursorStore:  store,
       cursorLabel: "test-fresh-start",
     });
     injectServer(listener, server);
@@ -302,14 +279,14 @@ describe("SorobanListener cursor persistence", () => {
     await new Promise((r) => setTimeout(r, 20));
 
     const callArg = (server.getEvents as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
-    expect(callArg?.startLedger).toBe(499); // sequence - 1
+    expect(callArg?.startLedger).toBe(499);
     expect(callArg?.cursor).toBeUndefined();
     listener.stop();
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3.  Typed event dispatch
+// 3. Typed event dispatch
 // ═══════════════════════════════════════════════════════════════════════════
 describe("SorobanListener typed event dispatch", () => {
   beforeEach(() => {
@@ -409,17 +386,15 @@ describe("SorobanListener typed event dispatch", () => {
     expect(handlers.onOrderCreated).not.toHaveBeenCalled();
     expect(handlers.onOrderClaimed).not.toHaveBeenCalled();
     expect(handlers.onOrderRefunded).not.toHaveBeenCalled();
-    // Cursor still advances even when all events were skipped
     expect(listener.getCursor()).toBe("0000000000000004");
     listener.stop();
   });
 
   it("skips a malformed known event and still dispatches later events in the same batch", async () => {
-    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
-    // bad: scalar value where a vector is expected
-    const badEvent  = fakeRpcEvent(createdTopics(), b64(u64(42n)));
+    const store     = new SorobanCursorStore({ storageDir: TEST_DIR });
+    const badEvent  = fakeRpcEvent(createdTopics(), b64(u64(42n))); // scalar instead of vec
     const goodEvent = fakeRpcEvent(claimedTopics(), claimedValue(), 201, "txyyyy");
-    const server = makeMockServer({
+    const server    = makeMockServer({
       events: [badEvent, goodEvent],
       cursor: "0000000000000005",
     });

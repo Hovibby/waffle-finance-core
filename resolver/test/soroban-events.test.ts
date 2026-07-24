@@ -1,9 +1,9 @@
 /**
  * Unit tests for decodeSorobanHtlcEvent and SorobanEventDecodeError.
  *
- * This file does NOT mock @stellar/stellar-sdk — the real xdr / nativeToScVal
- * / Address implementations are needed to build valid XDR fixture bytes and
- * to exercise the decoder end-to-end.
+ * Does NOT mock @stellar/stellar-sdk — the real xdr / nativeToScVal /
+ * Address implementations are needed to build valid XDR fixtures and to
+ * exercise the decoder end-to-end.
  */
 import { describe, it, expect } from "vitest";
 import { xdr, nativeToScVal, StrKey } from "@stellar/stellar-sdk";
@@ -13,13 +13,9 @@ import {
 } from "../src/listeners/soroban-events.js";
 
 // ── Fixture addresses ────────────────────────────────────────────────────────
-// Use fixed raw 32-byte buffers so we don't depend on Keypair.fromSecret
-// (which requires a valid checksum-encoded secret) or Address constructor
-// (which can fail under Vitest's module transform).  We derive the expected
-// strkeys directly from the raw bytes using StrKey encoders.
-const SENDER_BYTES = Buffer.from("aabbccdd".repeat(8), "hex"); // 32 bytes
-const BENE_BYTES   = Buffer.from("11223344".repeat(8), "hex"); // 32 bytes
-const ASSET_BYTES  = Buffer.from("deadbeef".repeat(8), "hex"); // 32 bytes
+const SENDER_BYTES = Buffer.from("aabbccdd".repeat(8), "hex");
+const BENE_BYTES   = Buffer.from("11223344".repeat(8), "hex");
+const ASSET_BYTES  = Buffer.from("deadbeef".repeat(8), "hex");
 
 const SENDER = StrKey.encodeEd25519PublicKey(SENDER_BYTES);
 const BENE   = StrKey.encodeEd25519PublicKey(BENE_BYTES);
@@ -32,11 +28,10 @@ const PREIMAGE_HEX = PREIMAGE_BUF.toString("hex");
 
 const META = { ledger: 200, txHash: "txabc", contractId: "CCONTRACT" };
 
-// ── XDR encoding helpers ─────────────────────────────────────────────────────
+// ── XDR helpers ──────────────────────────────────────────────────────────────
 function b64(v: xdr.ScVal): string { return v.toXDR("base64"); }
 function sym(s: string)  { return nativeToScVal(s, { type: "symbol" }); }
 
-/** Build an scvAddress ScVal directly from raw key bytes — no StrKey round-trip. */
 function addrAccount(raw: Buffer) {
   return xdr.ScVal.scvAddress(
     xdr.ScAddress.scAddressTypeAccount(xdr.AccountId.publicKeyTypeEd25519(raw)),
@@ -46,16 +41,16 @@ function addrContract(raw: Buffer) {
   return xdr.ScVal.scvAddress(xdr.ScAddress.scAddressTypeContract(raw));
 }
 
-function addrSender()  { return addrAccount(SENDER_BYTES); }
-function addrBene()    { return addrAccount(BENE_BYTES); }
-function addrAsset()   { return addrContract(ASSET_BYTES); }
+function addrSender() { return addrAccount(SENDER_BYTES); }
+function addrBene()   { return addrAccount(BENE_BYTES); }
+function addrAsset()  { return addrContract(ASSET_BYTES); }
 
 function u64(n: bigint)  { return nativeToScVal(n, { type: "u64" }); }
 function i128(n: bigint) { return nativeToScVal(n, { type: "i128" }); }
 function byts(b: Buffer) { return nativeToScVal(b, { type: "bytes" }); }
 function vec(...els: xdr.ScVal[]) { return xdr.ScVal.scvVec(els); }
 
-// ── Canonical fixture builders ───────────────────────────────────────────────
+// ── Canonical fixture builders ────────────────────────────────────────────────
 function createdTopics() {
   return [sym("created"), addrSender(), addrBene(), byts(HASHLOCK_BUF)].map(b64);
 }
@@ -96,14 +91,14 @@ describe("decodeSorobanHtlcEvent — created", () => {
   });
 
   it("throws SorobanEventDecodeError when value tuple is too short", () => {
-    const badValue = b64(vec(u64(1n), addrAsset())); // only 2 elements
+    const badValue = b64(vec(u64(1n), addrAsset()));
     expect(() =>
       decodeSorobanHtlcEvent(createdTopics(), badValue, META),
     ).toThrow(SorobanEventDecodeError);
   });
 
   it("throws SorobanEventDecodeError when topics array is too short", () => {
-    const shortTopics = [b64(sym("created"))]; // missing sender/bene/hashlock
+    const shortTopics = [b64(sym("created"))];
     expect(() =>
       decodeSorobanHtlcEvent(shortTopics, createdValue(), META),
     ).toThrow(SorobanEventDecodeError);
@@ -141,7 +136,7 @@ describe("decodeSorobanHtlcEvent — claimed", () => {
   });
 
   it("throws SorobanEventDecodeError when value tuple is too short", () => {
-    const badValue = b64(vec(u64(1n), addrSender())); // only 2 elements
+    const badValue = b64(vec(u64(1n), addrSender()));
     expect(() =>
       decodeSorobanHtlcEvent(claimedTopics(), badValue, META),
     ).toThrow(SorobanEventDecodeError);
@@ -181,10 +176,8 @@ describe("decodeSorobanHtlcEvent — refunded", () => {
 // ── Unknown / non-HTLC events ─────────────────────────────────────────────────
 describe("decodeSorobanHtlcEvent — unknown events", () => {
   it("returns null for an admin-transfer event (adm_xfer symbol)", () => {
-    const topics = [
-      sym("adm_xfer"), sym("proposed"), addrSender(), addrBene(),
-    ].map(b64);
-    const value = b64(vec(addrSender(), addrBene()));
+    const topics = [sym("adm_xfer"), sym("proposed"), addrSender(), addrBene()].map(b64);
+    const value  = b64(vec(addrSender(), addrBene()));
     expect(decodeSorobanHtlcEvent(topics, value, META)).toBeNull();
   });
 
@@ -213,7 +206,7 @@ describe("decodeSorobanHtlcEvent — unknown events", () => {
 // ── SorobanEventDecodeError identity ─────────────────────────────────────────
 describe("SorobanEventDecodeError", () => {
   it("carries eventName, reason, and correct .name on the thrown error", () => {
-    const scalarValue = b64(u64(42n)); // scalar instead of vec
+    const scalarValue = b64(u64(42n));
     let caught: SorobanEventDecodeError | undefined;
     try {
       decodeSorobanHtlcEvent(createdTopics(), scalarValue, META);

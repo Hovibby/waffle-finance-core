@@ -176,9 +176,6 @@ export class SorobanListener {
         Math.floor(Date.now() / 1000),
       );
 
-      // Serialise topics and value to base64 XDR so the decoder can
-      // call xdr.ScVal.fromXDR() on them without needing the raw SDK
-      // objects here.
       const topics: string[] = ev.topic.map((t: any) =>
         t.toXDR ? t.toXDR("base64") : String(t),
       );
@@ -187,8 +184,8 @@ export class SorobanListener {
         : String(ev.value);
 
       const meta = {
-        ledger: Number(ev.ledger),
-        txHash: ev.txHash,
+        ledger:     Number(ev.ledger),
+        txHash:     ev.txHash,
         contractId: ev.contractId?.toString() ?? contractId,
       };
 
@@ -209,15 +206,9 @@ export class SorobanListener {
         }
 
         switch (typed.type) {
-          case "created":
-            handlers.onOrderCreated(typed);
-            break;
-          case "claimed":
-            handlers.onOrderClaimed(typed);
-            break;
-          case "refunded":
-            handlers.onOrderRefunded(typed);
-            break;
+          case "created":  handlers.onOrderCreated(typed);  break;
+          case "claimed":  handlers.onOrderClaimed(typed);  break;
+          case "refunded": handlers.onOrderRefunded(typed); break;
         }
       } catch (err) {
         if (err instanceof SorobanEventDecodeError) {
@@ -231,9 +222,9 @@ export class SorobanListener {
           this.log.warn(
             {
               eventName: err.eventName,
-              reason: err.reason,
-              ledger: meta.ledger,
-              txHash: meta.txHash,
+              reason:    err.reason,
+              ledger:    meta.ledger,
+              txHash:    meta.txHash,
             },
             "Soroban event decode error — skipping event",
           );

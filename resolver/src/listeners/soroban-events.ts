@@ -37,7 +37,6 @@ import { scValToNative, xdr } from "@stellar/stellar-sdk";
 
 /** Emitted when a new HTLC order is funded on Soroban. */
 export interface SorobanOrderCreatedEvent {
-  /** Discriminant for exhaustive handler switches. */
   type: "created";
   ledger: number;
   txHash: string;
@@ -122,19 +121,11 @@ export class SorobanEventDecodeError extends Error {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Deserialise a base64-encoded XDR ScVal and convert it to a native
- * JS value via `scValToNative`.
- */
 function decodeScVal(base64: string): unknown {
   const val = xdr.ScVal.fromXDR(base64, "base64");
   return scValToNative(val);
 }
 
-/**
- * Convert a raw value (Buffer, Uint8Array, or already a string) to a
- * lower-case hex string.  Used for hashlock and preimage bytes.
- */
 function toHex(raw: unknown): string {
   if (typeof raw === "string") return raw;
   if (raw instanceof Uint8Array || Buffer.isBuffer(raw)) {
@@ -143,17 +134,12 @@ function toHex(raw: unknown): string {
   throw new TypeError(`expected bytes, got ${typeof raw}`);
 }
 
-/**
- * Ensure a native value is BigInt; coerce from number for robustness.
- * Soroban u64 / i128 both decode to BigInt with scValToNative.
- */
 function toBigInt(v: unknown, field: string): bigint {
   if (typeof v === "bigint") return v;
   if (typeof v === "number") return BigInt(v);
   throw new TypeError(`${field}: expected bigint, got ${typeof v}`);
 }
 
-/** Assert the value is a non-empty string (Address / Symbol). */
 function toStr(v: unknown, field: string): string {
   if (typeof v !== "string" || v === "") {
     throw new TypeError(`${field}: expected non-empty string, got ${typeof v}`);
@@ -161,7 +147,6 @@ function toStr(v: unknown, field: string): string {
   return v;
 }
 
-/** Assert the value is an array of a given minimum length. */
 function toArray(v: unknown, minLen: number, ctx: string): unknown[] {
   if (!Array.isArray(v) || v.length < minLen) {
     throw new TypeError(
@@ -175,16 +160,6 @@ function toArray(v: unknown, minLen: number, ctx: string): unknown[] {
 // Per-event decoders
 // ---------------------------------------------------------------------------
 
-/**
- * Decode a raw "created" event.
- *
- * topics[0] = Symbol("created")  (consumed by the caller's dispatch)
- * topics[1] = Address sender
- * topics[2] = Address beneficiary
- * topics[3] = BytesN<32> hashlock
- *
- * value = Vec(u64 order_id, Address asset, i128 amount, i128 safety_deposit, u64 timelock)
- */
 function decodeCreated(
   topics: string[],
   valueB64: string,
@@ -201,9 +176,9 @@ function decodeCreated(
   let beneficiary: string;
   let hashlock: string;
   try {
-    sender = toStr(decodeScVal(topics[1]!), "sender");
+    sender      = toStr(decodeScVal(topics[1]!), "sender");
     beneficiary = toStr(decodeScVal(topics[2]!), "beneficiary");
-    hashlock = toHex(decodeScVal(topics[3]!));
+    hashlock    = toHex(decodeScVal(topics[3]!));
   } catch (e: unknown) {
     throw new SorobanEventDecodeError(
       "created",
@@ -227,11 +202,11 @@ function decodeCreated(
     return {
       type: "created",
       ...meta,
-      orderId: toBigInt(val[0], "order_id"),
-      asset: toStr(val[1], "asset"),
-      amount: toBigInt(val[2], "amount"),
+      orderId:       toBigInt(val[0], "order_id"),
+      asset:         toStr(val[1], "asset"),
+      amount:        toBigInt(val[2], "amount"),
       safetyDeposit: toBigInt(val[3], "safety_deposit"),
-      timelock: toBigInt(val[4], "timelock"),
+      timelock:      toBigInt(val[4], "timelock"),
       sender,
       beneficiary,
       hashlock,
@@ -245,15 +220,6 @@ function decodeCreated(
   }
 }
 
-/**
- * Decode a raw "claimed" event.
- *
- * topics[0] = Symbol("claimed")
- * topics[1] = Address beneficiary
- * topics[2] = BytesN<32> hashlock
- *
- * value = Vec(u64 order_id, Address caller, Bytes preimage, i128 amount, i128 safety_deposit)
- */
 function decodeClaimed(
   topics: string[],
   valueB64: string,
@@ -270,7 +236,7 @@ function decodeClaimed(
   let hashlock: string;
   try {
     beneficiary = toStr(decodeScVal(topics[1]!), "beneficiary");
-    hashlock = toHex(decodeScVal(topics[2]!));
+    hashlock    = toHex(decodeScVal(topics[2]!));
   } catch (e: unknown) {
     throw new SorobanEventDecodeError(
       "claimed",
@@ -294,10 +260,10 @@ function decodeClaimed(
     return {
       type: "claimed",
       ...meta,
-      orderId: toBigInt(val[0], "order_id"),
-      caller: toStr(val[1], "caller"),
-      preimage: toHex(val[2]),
-      amount: toBigInt(val[3], "amount"),
+      orderId:       toBigInt(val[0], "order_id"),
+      caller:        toStr(val[1], "caller"),
+      preimage:      toHex(val[2]),
+      amount:        toBigInt(val[3], "amount"),
       safetyDeposit: toBigInt(val[4], "safety_deposit"),
       beneficiary,
       hashlock,
@@ -311,15 +277,6 @@ function decodeClaimed(
   }
 }
 
-/**
- * Decode a raw "refunded" event.
- *
- * topics[0] = Symbol("refunded")
- * topics[1] = Address refund_address
- * topics[2] = BytesN<32> hashlock
- *
- * value = Vec(u64 order_id, Address caller, i128 amount, i128 safety_deposit)
- */
 function decodeRefunded(
   topics: string[],
   valueB64: string,
@@ -336,7 +293,7 @@ function decodeRefunded(
   let hashlock: string;
   try {
     refundAddress = toStr(decodeScVal(topics[1]!), "refund_address");
-    hashlock = toHex(decodeScVal(topics[2]!));
+    hashlock      = toHex(decodeScVal(topics[2]!));
   } catch (e: unknown) {
     throw new SorobanEventDecodeError(
       "refunded",
@@ -360,9 +317,9 @@ function decodeRefunded(
     return {
       type: "refunded",
       ...meta,
-      orderId: toBigInt(val[0], "order_id"),
-      caller: toStr(val[1], "caller"),
-      amount: toBigInt(val[2], "amount"),
+      orderId:       toBigInt(val[0], "order_id"),
+      caller:        toStr(val[1], "caller"),
+      amount:        toBigInt(val[2], "amount"),
       safetyDeposit: toBigInt(val[3], "safety_deposit"),
       refundAddress,
       hashlock,
@@ -383,19 +340,12 @@ function decodeRefunded(
 /**
  * Decode a raw Soroban contract event into a typed `SorobanHtlcEvent`.
  *
- * @param topics  Array of base64-encoded XDR ScVal strings — as
- *                returned by `ev.topic.map(t => t.toXDR("base64"))`.
- * @param value   Base64-encoded XDR ScVal for the event value.
- * @param meta    Ledger, tx hash and contract id for the event.
+ * @returns The typed event, or `null` when the first topic symbol is not
+ *          one of the three HTLC event names (admin/config events etc.).
  *
- * @returns The typed event, or `null` when the first topic is a
- *          symbol that does not belong to the HTLC contract (e.g.
- *          admin / config events that the resolver doesn't handle).
- *
- * @throws  `SorobanEventDecodeError` when the event name is known
- *          (created / claimed / refunded) but the payload doesn't
- *          match the expected shape — so callers can distinguish a
- *          "skip unknown" case from a "schema mismatch" alert.
+ * @throws  `SorobanEventDecodeError` when the event name is recognised
+ *          (created/claimed/refunded) but the payload shape is wrong —
+ *          so callers can distinguish a silent skip from a schema alert.
  */
 export function decodeSorobanHtlcEvent(
   topics: string[],
@@ -404,25 +354,19 @@ export function decodeSorobanHtlcEvent(
 ): SorobanHtlcEvent | null {
   if (topics.length === 0) return null;
 
-  // The first topic is always the event name symbol.
   let eventName: unknown;
   try {
     eventName = decodeScVal(topics[0]!);
   } catch {
-    return null; // unparseable topic — skip silently
+    return null;
   }
 
   if (typeof eventName !== "string") return null;
 
   switch (eventName) {
-    case "created":
-      return decodeCreated(topics, value, meta);
-    case "claimed":
-      return decodeClaimed(topics, value, meta);
-    case "refunded":
-      return decodeRefunded(topics, value, meta);
-    default:
-      // e.g. "adm_xfer" or "cfg" — not HTLC order events, skip.
-      return null;
+    case "created":  return decodeCreated(topics, value, meta);
+    case "claimed":  return decodeClaimed(topics, value, meta);
+    case "refunded": return decodeRefunded(topics, value, meta);
+    default:         return null; // admin/config events — skip quietly
   }
 }

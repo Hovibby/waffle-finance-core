@@ -54,8 +54,6 @@ describe("SorobanCursorStore", () => {
   it("persists to disk so a new instance reads the same cursor", () => {
     store.save("disk-test", "0000000123456789");
 
-    // Simulate a restart: create a brand-new instance pointing at the
-    // same directory (no in-memory cache).
     const store2 = new SorobanCursorStore({ storageDir: TEST_DIR });
     expect(store2.load("disk-test")).toBe("0000000123456789");
   });
@@ -80,8 +78,6 @@ describe("SorobanCursorStore", () => {
 
   it("serves subsequent loads from cache (no extra disk reads)", () => {
     store.save("cached", "0000000000000042");
-    // Second call should hit the cache, not re-read the file — the
-    // observable invariant is that the same value comes back.
     expect(store.load("cached")).toBe("0000000000000042");
     expect(store.load("cached")).toBe("0000000000000042");
   });
@@ -91,7 +87,6 @@ describe("SorobanCursorStore", () => {
     expect(store.load("cache-clear")).toBe("0000000000001111");
 
     store.clearCache();
-    // Should still be readable from disk after clearing the cache.
     expect(store.load("cache-clear")).toBe("0000000000001111");
   });
 
@@ -100,7 +95,6 @@ describe("SorobanCursorStore", () => {
   // -------------------------------------------------------------------------
 
   it("sanitises labels containing special characters to safe filenames", () => {
-    // Colons, spaces, slashes are all replaced internally.
     store.save("soroban:mainnet/htlc contract!", "0000000000009999");
 
     const store2 = new SorobanCursorStore({ storageDir: TEST_DIR });
@@ -145,8 +139,6 @@ describe("SorobanCursorStore", () => {
     );
 
     const store2 = new SorobanCursorStore({ storageDir: TEST_DIR });
-    // Should fall back to null (caller starts from head) rather than
-    // crashing with a SyntaxError.
     expect(store2.load("corrupted")).toBeNull();
   });
 
