@@ -17,6 +17,12 @@ import {
 /** Maximum ledger gap before we treat it as a node inconsistency and re-scan. */
 const MAX_LEDGER_GAP = 100;
 
+/**
+ * Maximum number of processed event keys retained in the in-process
+ * deduplication cache (same sizing rationale as the Ethereum listener).
+ */
+const DEDUP_CACHE_MAX = 10_000;
+
 // ─── Typed RPC event shape ────────────────────────────────────────────────────
 
 /**
@@ -68,6 +74,13 @@ export class SorobanListener {
   private stopped = false;
   private lastProcessedLedger = 0;
 
+  /**
+   * In-process event deduplication cache.
+   * Key: `"<kind>:<txHash>"` — e.g. `"created:0xabc…"`.
+   * Bounded at DEDUP_CACHE_MAX entries; oldest evicted on overflow.
+   */
+  private readonly processedEventKeys = new Map<string, true>();
+
   constructor(
     private readonly cfg: CoordinatorConfig,
     private readonly orders: OrderService,
@@ -93,6 +106,29 @@ export class SorobanListener {
 
   stop(): void {
     this.stopped = true;
+  }
+
+  // ─── Event deduplication helpers ─────────────────────────────────────────
+
+  /** Build the dedup cache key: `"<kind>:<txHash>"`. */
+  private dedupKey(kind: string, txHash: string): string {
+    return `${kind}:${txHash}`;
+  }
+
+  /** Returns true if this (kind, txHash) pair was already processed in-process. */
+  isDuplicate(kind: string, txHash: string): boolean {
+    return this.processedEventKeys.has(this.dedupKey(kind, txHash));
+  }
+
+  /** Mark (kind, txHash) as processed; evicts oldest entry on overflow. */
+  private markProcessed(kind: string, txHash: string): void {
+    const key = this.dedupKey(kind, txHash);
+    if (this.processedEventKeys.has(key)) return;
+    if (this.processedEventKeys.size >= DEDUP_CACHE_MAX) {
+      const oldest = this.processedEventKeys.keys().next().value;
+      if (oldest !== undefined) this.processedEventKeys.delete(oldest);
+    }
+    this.processedEventKeys.set(key, true);
   }
 
   private async loop(contractId: string): Promise<void> {
@@ -187,6 +223,9 @@ export class SorobanListener {
    * A {@link MalformedEventError} is treated as an operational failure:
    * it is counted, logged at warn level, and skipped — it does NOT mutate
    * order state.  Unknown/governance topics (null) are silently skipped.
+   *
+   * Duplicate events (same kind + txHash already processed in this session)
+   * are dropped before any DB interaction.
    */
   private async processSorobanEvent(ev: SorobanRpcEvent): Promise<void> {
     const result = decodeHtlcEvent(ev.topic, ev.value);
@@ -217,6 +256,16 @@ export class SorobanListener {
     }
 
     const decoded: DecodedHtlcEvent = result;
+
+    // ── In-process deduplication ──────────────────────────────────────────
+    if (this.isDuplicate(decoded.kind, ev.txHash)) {
+      this.log.debug(
+        { kind: decoded.kind, txHash: ev.txHash, ledger: ev.ledger },
+        "Soroban event duplicate skipped (in-process cache)"
+      );
+      return;
+    }
+
     this.log.info(
       { kind: decoded.kind, schemaVersion: decoded.schemaVersion, ledger: ev.ledger, txHash: ev.txHash },
       "Soroban HTLC event decoded"
@@ -243,6 +292,7 @@ export class SorobanListener {
           blockNumber: ev.ledger,
           timelock: decoded.timelock,
         });
+        this.markProcessed(decoded.kind, ev.txHash);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("cannot record") && !msg.includes("duplicate")) {
@@ -279,6 +329,7 @@ export class SorobanListener {
             decoded.preimage,
             ev.txHash
           );
+          this.markProcessed(decoded.kind, ev.txHash);
           return;
         }
         await this.orders.recordSecret(
@@ -286,6 +337,7 @@ export class SorobanListener {
           decoded.preimage,
           ev.txHash
         );
+        this.markProcessed(decoded.kind, ev.txHash);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("cannot record") && !msg.includes("duplicate")) {
@@ -318,9 +370,11 @@ export class SorobanListener {
             return;
           }
           await this.orders.markStatus(byHash.publicId, "refunded");
+          this.markProcessed(decoded.kind, ev.txHash);
           return;
         }
         await this.orders.markStatus(order.publicId, "refunded");
+        this.markProcessed(decoded.kind, ev.txHash);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("cannot transition") && !msg.includes("duplicate")) {
