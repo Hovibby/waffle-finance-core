@@ -219,6 +219,17 @@ export function useFreighter() {
       const { address } = await freighterApi.getAddress();
       console.log('✅ [freighter] connected:', address);
 
+      // ── Wallet-locked diagnostic ──────────────────────────────────────────
+      // Freighter returns an empty address string when the wallet is locked.
+      if (!address) {
+        setError(
+          'wallet_locked',
+          'Freighter is locked. Please unlock it and try again.',
+          'Open the Freighter extension, enter your password to unlock, then retry.',
+        );
+        return;
+      }
+
       let network: string | null = null;
       let networkPassphrase: string | null = null;
       try {
@@ -227,6 +238,19 @@ export function useFreighter() {
         networkPassphrase = net.networkPassphrase;
       } catch {
         // Non-fatal — network details will be populated by the watcher.
+      }
+
+      // ── Network mismatch diagnostic ───────────────────────────────────────
+      // Freighter reports its network name as "TESTNET" or "PUBLIC" (mainnet).
+      const networkMode = (import.meta as any).env?.VITE_NETWORK_MODE ?? 'testnet';
+      const expectedNetwork = networkMode === 'mainnet' ? 'PUBLIC' : 'TESTNET';
+      if (network && network.toUpperCase() !== expectedNetwork) {
+        setError(
+          'network_mismatch',
+          `Freighter is connected to ${network} but this app expects ${expectedNetwork}.`,
+          `Open Freighter → Settings → Network and switch to ${expectedNetwork}, then retry.`,
+        );
+        return;
       }
 
       setState((prev) =>
@@ -246,11 +270,20 @@ export function useFreighter() {
       return address;
     } catch (error) {
       console.error('❌ [freighter] connection error:', error);
+
+      // ── Wallet-locked diagnostic (exception path) ─────────────────────────
+      const msg = error instanceof Error ? error.message : '';
+      const isLocked =
+        msg.toLowerCase().includes('locked') ||
+        msg.toLowerCase().includes('wallet is locked');
+
       const errorMessage = error instanceof Error ? error.message : 'Failed to connect to Freighter';
       setError(
-        'freighter_connect_failed',
-        errorMessage,
-        'Ensure Freighter is unlocked, the page has permission, and you are on the correct Stellar network.'
+        isLocked ? 'wallet_locked' : 'freighter_connect_failed',
+        isLocked ? 'Freighter is locked. Please unlock it and try again.' : errorMessage,
+        isLocked
+          ? 'Open the Freighter extension, enter your password to unlock, then retry.'
+          : 'Ensure Freighter is unlocked, the page has permission, and you are on the correct Stellar network.',
       );
       throw error;
     }
