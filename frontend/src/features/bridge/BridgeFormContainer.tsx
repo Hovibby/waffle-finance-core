@@ -8,6 +8,7 @@ import {
 } from '@stellar/stellar-sdk';
 import { classifyRpcError, parseBalanceHex } from '@wafflefinance/sdk/shared-utils';
 import { isTestnet, getCurrentNetwork } from '../../config/networks';
+import { selectApiBaseUrl, selectIsMockDataEnabled } from '../../config/selectors';
 import { parseHtlcReceipt } from '../../lib/parseHtlcReceipt';
 import { sanitizeAmountInput } from '../../lib/sanitizeAmountInput';
 import { usePersistedBridgeDraft } from '../../hooks/usePersistedBridgeDraft';
@@ -262,11 +263,8 @@ const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed
 };
 
 const SEPOLIA_CHAIN_ID = '0xaa36a7'; // 11155111 in hex
-const PRODUCTION_API_BASE_URL = 'https://oversync-k36vx.ondigitalocean.app';
-const API_BASE_URL = import.meta.env.PROD
-  ? ''
-  : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
-const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
+const API_BASE_URL = selectApiBaseUrl();
+const ENABLE_MOCK_DATA = selectIsMockDataEnabled();
 
 function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; dstChain: SupportedChain } {
   const parts = dir.split('_to_');

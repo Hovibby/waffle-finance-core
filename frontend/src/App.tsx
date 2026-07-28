@@ -6,7 +6,7 @@ import { useSolanaWallet } from './hooks/useSolanaWallet'
 import { useEthereumWallet } from './hooks/useEthereumWallet'
 import { useNetworkMode } from './lib/useNetworkMode'
 import { pingBackendWake } from './lib/wakeBackend'
-import { isMainnetEnabled } from './config/networks'
+import { selectIsMainnetEnabled, selectResolvedNetworkMode, selectCurrentEthereumNetwork, selectCurrentStellarNetwork, selectApiBaseUrl } from './config/selectors';
 
 // Non-critical components are lazy-loaded so the initial bridge form bundle
 // stays as small as possible. Suspense boundaries provide invisible fallbacks
@@ -253,7 +253,7 @@ function App() {
               </a>
             </nav>
 
-            {isMainnetEnabled() ? (
+            {selectIsMainnetEnabled() ? (
               <button
                 onClick={toggleNetwork}
                 className={`network-pill px-3 py-1.5 text-xs font-semibold transition-all duration-200 md:px-3.5 ${
