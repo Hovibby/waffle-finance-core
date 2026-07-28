@@ -3,7 +3,13 @@ import { sepolia, mainnet } from "viem/chains";
 import type { Logger } from "pino";
 import type { CoordinatorConfig } from "../config.js";
 import type { OrderService } from "../services/order-service.js";
-import { observeListenerEventProcessing, recordListenerProgress, listenerLastBlock } from "../metrics.js";
+import {
+  observeListenerEventProcessing,
+  recordListenerProgress,
+  listenerLastBlock,
+  workflowDispatchDecisions,
+} from "../metrics.js";
+import { decideDispatch } from "../services/workflow-priority-policy.js";
 
 // ---------------------------------------------------------------------------
 // ABI event definitions (must remain unchanged)
@@ -426,6 +432,20 @@ export class EthereumListener {
           this.storeConfirmedHash(Number(blockNumber), block.hash as string);
         }
 
+        const decision = decideDispatch({
+          path: "live",
+          mutation: "src_lock",
+          incomingSequence: Number(blockNumber),
+          existingSequence: order.srcLockBlock,
+          alreadyApplied: order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "live",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!decision.shouldApply) continue;
+
         try {
           await this.orders.recordSrcLock({
             publicId: order.publicId,
@@ -456,6 +476,21 @@ export class EthereumListener {
   ): Promise<void> {
     const blockNumber = Number(log.blockNumber as bigint);
     recordListenerProgress("ethereum", blockNumber, chainHead);
+
+    const order = await this.orders.get(publicId);
+    const decision = decideDispatch({
+      path: "live",
+      mutation: "src_lock",
+      incomingSequence: blockNumber,
+      existingSequence: order?.srcLockBlock ?? null,
+      alreadyApplied: !order || order.srcOrderId !== null,
+    });
+    workflowDispatchDecisions.inc({
+      path: "live",
+      mutation: "src_lock",
+      outcome: decision.reason,
+    });
+    if (!decision.shouldApply) return;
 
     try {
       await this.orders.recordSrcLock({

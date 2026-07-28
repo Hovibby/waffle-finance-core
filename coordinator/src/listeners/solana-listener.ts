@@ -2,8 +2,13 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import type { Logger } from "pino";
 import type { CoordinatorConfig } from "../config.js";
 import type { OrderService } from "../services/order-service.js";
-import { observeListenerEventProcessing, recordListenerProgress } from "../metrics.js";
+import {
+  observeListenerEventProcessing,
+  recordListenerProgress,
+  workflowDispatchDecisions,
+} from "../metrics.js";
 import { isSolanaPlaceholder } from "../config.js";
+import { decideDispatch } from "../services/workflow-priority-policy.js";
 
 /**
  * Confirmation level constants for Solana commitment model.
@@ -332,6 +337,19 @@ export class SolanaListener {
             this.log.info({ hashlock, orderId }, "Solana order observed without local announce");
             return;
           }
+          const decision = decideDispatch({
+            path: "live",
+            mutation: "src_lock",
+            incomingSequence: effectiveSlot,
+            existingSequence: order.srcLockBlock,
+            alreadyApplied: order.srcOrderId !== null,
+          });
+          workflowDispatchDecisions.inc({
+            path: "live",
+            mutation: "src_lock",
+            outcome: decision.reason,
+          });
+          if (!decision.shouldApply) return;
           await this.orders.recordSrcLock({
             publicId: order.publicId,
             orderId,
@@ -359,6 +377,19 @@ export class SolanaListener {
           try {
             const order = await this.orders.findBySrcOrderId("solana", orderId);
             if (order) {
+              const decision = decideDispatch({
+                path: "live",
+                mutation: "secret_reveal",
+                incomingSequence: slot ?? null,
+                existingSequence: null,
+                alreadyApplied: order.preimage !== null,
+              });
+              workflowDispatchDecisions.inc({
+                path: "live",
+                mutation: "secret_reveal",
+                outcome: decision.reason,
+              });
+              if (!decision.shouldApply) return;
               await this.orders.recordSecret(order.publicId, preimage, sig);
             }
           } catch (err) {
@@ -375,6 +406,19 @@ export class SolanaListener {
           try {
             const order = await this.orders.findBySrcOrderId("solana", orderId);
             if (order) {
+              const decision = decideDispatch({
+                path: "live",
+                mutation: "refund",
+                incomingSequence: slot ?? null,
+                existingSequence: order.srcLockBlock,
+                alreadyApplied: order.status === "refunded" || order.status === "completed",
+              });
+              workflowDispatchDecisions.inc({
+                path: "live",
+                mutation: "refund",
+                outcome: decision.reason,
+              });
+              if (!decision.shouldApply) return;
               await this.orders.markStatus(order.publicId, "refunded");
             }
           } catch (err) {

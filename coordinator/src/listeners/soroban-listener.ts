@@ -7,12 +7,14 @@ import {
   observeListenerEventProcessing,
   recordListenerProgress,
   sorobanDecodeErrors,
+  workflowDispatchDecisions,
 } from "../metrics.js";
 import {
   decodeHtlcEvent,
   isMalformedEvent,
   type DecodedHtlcEvent,
 } from "../soroban-events.js";
+import { decideDispatch } from "../services/workflow-priority-policy.js";
 
 /** Maximum ledger gap before we treat it as a node inconsistency and re-scan. */
 const MAX_LEDGER_GAP = 100;
@@ -236,6 +238,19 @@ export class SorobanListener {
           );
           return;
         }
+        const decision = decideDispatch({
+          path: "live",
+          mutation: "src_lock",
+          incomingSequence: ev.ledger,
+          existingSequence: order.srcLockBlock,
+          alreadyApplied: order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "live",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!decision.shouldApply) return;
         await this.orders.recordSrcLock({
           publicId: order.publicId,
           orderId: decoded.orderId.toString(),
@@ -274,6 +289,19 @@ export class SorobanListener {
             );
             return;
           }
+          const decision = decideDispatch({
+            path: "live",
+            mutation: "secret_reveal",
+            incomingSequence: ev.ledger,
+            existingSequence: null,
+            alreadyApplied: byHash.preimage !== null,
+          });
+          workflowDispatchDecisions.inc({
+            path: "live",
+            mutation: "secret_reveal",
+            outcome: decision.reason,
+          });
+          if (!decision.shouldApply) return;
           await this.orders.recordSecret(
             byHash.publicId,
             decoded.preimage,
@@ -281,6 +309,19 @@ export class SorobanListener {
           );
           return;
         }
+        const decision = decideDispatch({
+          path: "live",
+          mutation: "secret_reveal",
+          incomingSequence: ev.ledger,
+          existingSequence: null,
+          alreadyApplied: order.preimage !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "live",
+          mutation: "secret_reveal",
+          outcome: decision.reason,
+        });
+        if (!decision.shouldApply) return;
         await this.orders.recordSecret(
           order.publicId,
           decoded.preimage,
@@ -317,9 +358,35 @@ export class SorobanListener {
             );
             return;
           }
+          const decision = decideDispatch({
+            path: "live",
+            mutation: "refund",
+            incomingSequence: ev.ledger,
+            existingSequence: byHash.srcLockBlock,
+            alreadyApplied: byHash.status === "refunded" || byHash.status === "completed",
+          });
+          workflowDispatchDecisions.inc({
+            path: "live",
+            mutation: "refund",
+            outcome: decision.reason,
+          });
+          if (!decision.shouldApply) return;
           await this.orders.markStatus(byHash.publicId, "refunded");
           return;
         }
+        const decision = decideDispatch({
+          path: "live",
+          mutation: "refund",
+          incomingSequence: ev.ledger,
+          existingSequence: order.srcLockBlock,
+          alreadyApplied: order.status === "refunded" || order.status === "completed",
+        });
+        workflowDispatchDecisions.inc({
+          path: "live",
+          mutation: "refund",
+          outcome: decision.reason,
+        });
+        if (!decision.shouldApply) return;
         await this.orders.markStatus(order.publicId, "refunded");
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

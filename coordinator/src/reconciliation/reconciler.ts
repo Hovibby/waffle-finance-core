@@ -17,12 +17,14 @@ import {
   reconciliationLastRun,
   reconciliationEventsReplayed,
   sorobanDecodeErrors,
+  workflowDispatchDecisions,
 } from "../metrics.js";
 import { validatePreimage } from "./secret-reconciler.js";
 import {
   decodeHtlcEvent,
   isMalformedEvent,
 } from "../soroban-events.js";
+import { decideDispatch } from "../services/workflow-priority-policy.js";
 
 const ORDER_CREATED = parseAbiItem(
   "event OrderCreated(uint256 indexed orderId, address indexed sender, address indexed beneficiary, address token, uint256 amount, uint256 safetyDeposit, bytes32 hashlock, uint64 timelock)"
@@ -172,7 +174,19 @@ export class Reconciler {
       if (!args?.hashlock) continue;
       try {
         const order = await this.orders.findByHashlock(args.hashlock);
-        if (!order || order.srcOrderId) continue; // already known
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "src_lock",
+          incomingSequence: Number(log.blockNumber ?? 0n),
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) continue; // already known or lower priority
         await this.orders.recordSrcLock({
           publicId: order.publicId,
           orderId: args.orderId.toString(),
@@ -201,7 +215,19 @@ export class Reconciler {
       if (!args?.orderId || !args?.preimage) continue;
       try {
         const order = await this.orders.findBySrcOrderId("ethereum", args.orderId.toString());
-        if (!order || order.preimage) continue;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "secret_reveal",
+          incomingSequence: Number(log.blockNumber ?? 0n),
+          existingSequence: null,
+          alreadyApplied: !order || order.preimage !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "secret_reveal",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) continue;
         if (!validatePreimage(args.preimage, order.hashlock)) {
           this.log.warn(
             { orderId: args.orderId.toString(), hashlock: order.hashlock },
@@ -231,7 +257,19 @@ export class Reconciler {
       if (!args?.orderId) continue;
       try {
         const order = await this.orders.findBySrcOrderId("ethereum", args.orderId.toString());
-        if (!order || order.status === "refunded" || order.status === "completed") continue;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "refund",
+          incomingSequence: Number(log.blockNumber ?? 0n),
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.status === "refunded" || order.status === "completed",
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "refund",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) continue;
         await this.orders.markStatus(order.publicId, "refunded");
         n++;
         this.log.info({ orderId: args.orderId.toString() }, "reconciler: replayed ETH OrderRefunded");
@@ -308,7 +346,19 @@ export class Reconciler {
     if (result.kind === "created") {
       try {
         const order = await this.orders.findByHashlock(result.hashlock);
-        if (!order || order.srcOrderId) return 0;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "src_lock",
+          incomingSequence: ev.ledger,
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) return 0;
         await this.orders.recordSrcLock({
           publicId: order.publicId,
           orderId: result.orderId.toString(),
@@ -338,7 +388,19 @@ export class Reconciler {
           "stellar",
           result.orderId.toString()
         );
-        if (!order || order.preimage) return 0;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "secret_reveal",
+          incomingSequence: ev.ledger,
+          existingSequence: null,
+          alreadyApplied: !order || order.preimage !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "secret_reveal",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) return 0;
         if (!validatePreimage(result.preimage, order.hashlock)) {
           this.log.warn(
             { orderId: result.orderId.toString(), hashlock: order.hashlock },
@@ -366,7 +428,19 @@ export class Reconciler {
           "stellar",
           result.orderId.toString()
         );
-        if (!order || order.status === "refunded" || order.status === "completed") {
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "refund",
+          incomingSequence: ev.ledger,
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.status === "refunded" || order.status === "completed",
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "refund",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) {
           return 0;
         }
         await this.orders.markStatus(order.publicId, "refunded");
@@ -444,7 +518,19 @@ export class Reconciler {
       if (!hashlock || !orderId) return 0;
       try {
         const order = await this.orders.findByHashlock(hashlock);
-        if (!order || order.srcOrderId) return 0;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "src_lock",
+          incomingSequence: null,
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) return 0;
         await this.orders.recordSrcLock({
           publicId: order.publicId,
           orderId,
@@ -465,7 +551,19 @@ export class Reconciler {
       if (!preimage || !orderId) return 0;
       try {
         const order = await this.orders.findBySrcOrderId("solana", orderId);
-        if (!order || order.preimage) return 0;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "secret_reveal",
+          incomingSequence: null,
+          existingSequence: null,
+          alreadyApplied: !order || order.preimage !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "secret_reveal",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) return 0;
         if (!validatePreimage(preimage, order.hashlock)) {
           this.log.warn(
             { orderId, hashlock: order.hashlock },
@@ -487,7 +585,19 @@ export class Reconciler {
       if (!orderId) return 0;
       try {
         const order = await this.orders.findBySrcOrderId("solana", orderId);
-        if (!order || order.status === "refunded" || order.status === "completed") return 0;
+        const decision = decideDispatch({
+          path: "replay",
+          mutation: "refund",
+          incomingSequence: null,
+          existingSequence: order?.srcLockBlock ?? null,
+          alreadyApplied: !order || order.status === "refunded" || order.status === "completed",
+        });
+        workflowDispatchDecisions.inc({
+          path: "replay",
+          mutation: "refund",
+          outcome: decision.reason,
+        });
+        if (!order || !decision.shouldApply) return 0;
         await this.orders.markStatus(order.publicId, "refunded");
         return 1;
       } catch (err: any) {

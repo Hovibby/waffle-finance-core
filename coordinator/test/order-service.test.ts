@@ -198,6 +198,72 @@ describe("OrderService", () => {
     const list2 = await orders.get(order.publicId);
     expect(list2!.status).toBe("dst_locked");
   });
+
+  it("rejects conflicting srcLock updates for the same order", async () => {
+    const db = await freshDb();
+    const orders = new OrderService(new OrdersRepository(db), log);
+    const order = await orders.announce({
+      direction: "eth_to_xlm",
+      hashlock: VALID_HASHLOCK,
+      srcChain: "ethereum",
+      srcAddress: VALID_ETH_ADDR,
+      srcAsset: "native",
+      srcAmount: "1",
+      srcSafetyDeposit: "1",
+      dstChain: "stellar",
+      dstAddress: VALID_STELLAR_ADDR,
+      dstAsset: "native",
+      dstAmount: "1",
+    });
+
+    await orders.recordSrcLock({
+      publicId: order.publicId,
+      orderId: "101",
+      txHash: "0xfirst",
+      blockNumber: 1,
+      timelock: 0,
+    });
+
+    await expect(
+      orders.recordSrcLock({
+        publicId: order.publicId,
+        orderId: "102",
+        txHash: "0xsecond",
+        blockNumber: 2,
+        timelock: 0,
+      })
+    ).rejects.toThrowError(OrderValidationError);
+  });
+
+  it("rejects conflicting preimage writes once a secret is recorded", async () => {
+    const db = await freshDb();
+    const orders = new OrderService(new OrdersRepository(db), log);
+    const order = await orders.announce({
+      direction: "eth_to_xlm",
+      hashlock: VALID_HASHLOCK,
+      srcChain: "ethereum",
+      srcAddress: VALID_ETH_ADDR,
+      srcAsset: "native",
+      srcAmount: "1",
+      srcSafetyDeposit: "1",
+      dstChain: "stellar",
+      dstAddress: VALID_STELLAR_ADDR,
+      dstAsset: "native",
+      dstAmount: "1",
+    });
+    await orders.recordSrcLock({
+      publicId: order.publicId,
+      orderId: "1",
+      txHash: "0xsrc",
+      blockNumber: 1,
+      timelock: 0,
+    });
+    await orders.recordSecret(order.publicId, "0x" + "a".repeat(64), "0xsecret");
+
+    await expect(
+      orders.recordSecret(order.publicId, "0x" + "b".repeat(64), "0xsecret2")
+    ).rejects.toThrowError(OrderValidationError);
+  });
 });
 
 describe("SecretService", () => {
