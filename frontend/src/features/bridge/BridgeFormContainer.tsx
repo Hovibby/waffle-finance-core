@@ -28,6 +28,9 @@ import {
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
 import { useRouteDerivedValues } from '../../hooks/useRouteDerivedValues';
+import { useNetworkRouteValidator } from '../../hooks/useNetworkRouteValidator';
+import { useBridgeOrchestration } from '../../hooks/useBridgeOrchestration';
+import { useBridgeErrorHandler } from '../../hooks/useBridgeErrorHandler';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -276,17 +279,30 @@ function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; ds
 }
 
 export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, signStellarTransaction }: BridgeFormProps): React.JSX.Element {
-  const {
-    direction,
-    amount,
-    setDirection,
-    setAmount,
-    clearPersistedDraft,
-  } = usePersistedBridgeDraft({
+  const orchestration = useBridgeOrchestration({
     ethAddress,
     stellarAddress,
     solanaAddress,
   });
+  const { direction, amount, setDirection, setAmount, isSubmitting, setIsSubmitting, orderCreated, setOrderCreated, orderId, setOrderId, statusMessage, setStatusMessage, balance, setBalance, activeQuote, setActiveQuote, fromToken, toToken, walletsReady, unsupportedReasonsByRoute, clearPersistedDraft, wasRestored } = orchestration;
+
+  const routeValidation = useNetworkRouteValidator({
+    direction,
+    ethAddress,
+    stellarAddress,
+    solanaAddress,
+  });
+
+  const errorHandler = useBridgeErrorHandler();
+
+  // Invalidate stale quote and amount when route validation fails after a network/route switch.
+  useEffect(() => {
+    if (!routeValidation.isValid) {
+      setActiveQuote(null);
+      setAmount('');
+      setStatusMessage(routeValidation.reason ?? 'Unsupported route');
+    }
+  }, [routeValidation.isValid, routeValidation.reason, setActiveQuote, setAmount, setStatusMessage]);
   const [networkInfo, setNetworkInfo] = useState(() => {
     const currentNetwork = getCurrentNetwork();
     const isTestnetMode = isTestnet();
@@ -1650,6 +1666,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           </div>
           {validationErrors.route && (
             <p className="mt-1.5 text-xs text-red-300">{validationErrors.route}</p>
+          )}
+          {routeValidation.reason && (
+            <p className="mt-1.5 text-xs text-red-300" role="alert">{routeValidation.reason}</p>
           )}
           {validationErrors.quote && (
             <p className="mt-1.5 text-xs text-amber-300" role="alert">{validationErrors.quote}</p>
