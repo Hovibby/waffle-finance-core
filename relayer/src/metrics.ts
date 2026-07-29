@@ -558,3 +558,189 @@ export const retryEngineMetrics = {
   circuitState: retryEngineCircuitState,
   backoffSeconds: retryEngineBackoffSeconds,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Pipeline observability metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Total orders ingested at the policy boundary of POST /api/orders/create.
+ * Labelled by direction so operators can compare xlm_to_eth vs eth_to_xlm volume.
+ */
+export const orderIngestionTotal = new Counter({
+  name: 'relayer_order_ingestion_total',
+  help: 'Total orders received at the /api/orders/create policy boundary',
+  labelNames: ['direction'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total relay decisions labelled by direction and result
+ * (accepted | rejected_route | rejected_permissions | rejected_validation).
+ */
+export const relayDecisionTotal = new Counter({
+  name: 'relayer_relay_decision_total',
+  help: 'Total relay decisions made at order creation, by direction and result',
+  labelNames: ['direction', 'result'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current number of active (in-flight) orders in the activeOrders map.
+ * Updated on every store and on settlement completion.
+ */
+export const orderQueueDepth = new Gauge({
+  name: 'relayer_order_queue_depth',
+  help: 'Current number of active orders in the in-memory activeOrders map',
+  registers: [registry],
+});
+
+/**
+ * End-to-end latency of a settlement submission attempt, from the moment
+ * the HTTP handler starts to when the response is sent.
+ */
+export const submissionLatencySeconds = new Histogram({
+  name: 'relayer_submission_latency_seconds',
+  help: 'Settlement submission latency from request start to response, by direction and result',
+  labelNames: ['direction', 'result'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [registry],
+});
+
+/**
+ * Latency of a Stellar payment receipt lookup (Horizon verify call).
+ * Labels indicate the verification outcome for SLO tracking.
+ */
+export const receiptLatencySeconds = new Histogram({
+  name: 'relayer_receipt_latency_seconds',
+  help: 'Duration of Horizon payment verification calls, by outcome',
+  labelNames: ['result'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [registry],
+});
+
+/**
+ * Histogram of retry attempt counts per settlement operation.
+ * `operation` is the action name passed to the RetryEngine.
+ * `result` is 'success' or 'failure'.
+ */
+export const retryAttemptsHistogram = new Histogram({
+  name: 'relayer_retry_attempts',
+  help: 'Number of retry attempts made per settlement operation',
+  labelNames: ['operation', 'result'] as const,
+  buckets: [0, 1, 2, 3, 4, 5],
+  registers: [registry],
+});
+
+/**
+ * Total orders that were permanently dropped (no further relay possible),
+ * labelled by direction and reason.
+ */
+export const droppedOrdersTotal = new Counter({
+  name: 'relayer_dropped_orders_total',
+  help: 'Total orders permanently dropped after exhausting all recovery paths',
+  labelNames: ['direction', 'reason'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current chain delay in seconds observed for a given chain.
+ * Non-zero value indicates the chain is lagging behind expected block times.
+ */
+export const chainDelayGauge = new Gauge({
+  name: 'relayer_chain_delay_seconds',
+  help: 'Observed chain delay in seconds for each monitored chain',
+  labelNames: ['chain'] as const,
+  registers: [registry],
+});
+
+/** Pipeline metrics bundle — useful for test assertions. */
+export const pipelineMetrics = {
+  orderIngestionTotal,
+  relayDecisionTotal,
+  orderQueueDepth,
+  submissionLatencySeconds,
+  receiptLatencySeconds,
+  retryAttemptsHistogram,
+  droppedOrdersTotal,
+  chainDelayGauge,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Settlement failure & recovery metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Total settlement failures recorded in the SettlementFailureStore,
+ * labelled by direction, category, and chain.
+ */
+export const settlementFailuresTotal = new Counter({
+  name: 'relayer_settlement_failures_total',
+  help: 'Total settlement failures recorded, by direction, category, and chain',
+  labelNames: ['direction', 'category', 'chain'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total settlement failure events broken down by category and recoverability.
+ * Useful for dashboards that need to separate recoverable noise from real problems.
+ */
+export const settlementFailuresByCategory = new Counter({
+  name: 'relayer_settlement_failures_by_category_total',
+  help: 'Total settlement failure events by category and recoverability class',
+  labelNames: ['category', 'recoverability'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total recovery (retry) attempts initiated after a prior settlement failure,
+ * labelled by direction.
+ */
+export const settlementRecoveryAttemptsTotal = new Counter({
+  name: 'relayer_settlement_recovery_attempts_total',
+  help: 'Total recovery attempts initiated for previously failed settlement orders',
+  labelNames: ['direction'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total orders that successfully recovered (settled) after at least one failure,
+ * labelled by direction.
+ */
+export const settlementRecoveredTotal = new Counter({
+  name: 'relayer_settlement_recovered_total',
+  help: 'Total orders successfully settled after one or more prior failures',
+  labelNames: ['direction'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total terminal settlement failures — failures from which no recovery is
+ * possible (insufficient balance, auth error, etc.), labelled by direction and category.
+ */
+export const settlementTerminalTotal = new Counter({
+  name: 'relayer_settlement_terminal_total',
+  help: 'Total settlement failures classified as terminal (no further retries)',
+  labelNames: ['direction', 'category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current number of orders that have at least one failure recorded and are
+ * in pending/recovering/requires_review status. Alert if this grows unbounded.
+ */
+export const settlementPendingRecoveryGauge = new Gauge({
+  name: 'relayer_settlement_pending_recovery',
+  help: 'Current count of orders awaiting recovery after a settlement failure',
+  registers: [registry],
+});
+
+/** Settlement failure & recovery metrics bundle — useful for test assertions. */
+export const settlementFailureMetrics = {
+  failuresTotal: settlementFailuresTotal,
+  failuresByCategory: settlementFailuresByCategory,
+  recoveryAttemptsTotal: settlementRecoveryAttemptsTotal,
+  recoveredTotal: settlementRecoveredTotal,
+  terminalTotal: settlementTerminalTotal,
+  pendingRecoveryGauge: settlementPendingRecoveryGauge,
+} as const;
