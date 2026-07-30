@@ -134,6 +134,29 @@ cypress/screenshots/
 *.bak
 *.orig
 
+# Test snapshots (vitest, jest, snapbox, etc.)
+*.snap
+*.snap.new
+**/__snapshots__/
+**/snapshots/
+**/snapshots/*.snap.new
+**/test-snapshots/
+**/test_snapshots/
+
+# Vitest coverage
+coverage/
+
+# Playwright / Cypress / E2E artifacts
+e2e-results/
+playwright-report/
+cypress/videos/
+cypress/screenshots/
+
+# Misc
+*.tmp
+*.bak
+*.orig
+
 # Miscellaneous
 .cache/
 .parcel-cache/
