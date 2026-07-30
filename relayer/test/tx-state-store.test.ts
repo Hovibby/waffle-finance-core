@@ -430,4 +430,28 @@ describe('TxStateStore — disk persistence and restart recovery', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('resumes mid-submission after restart without duplicating receipt work', async () => {
+    const dir = path.join(os.tmpdir(), `waffle-tx-store-test-${Date.now()}`);
+    try {
+      const store1 = new TxStateStore({ storageDir: dir });
+      store1.create({ orderId: 'resume-mid-submit', correlationId: 'cid', route: 'xlm_to_eth' });
+      store1.ackSubmission('resume-mid-submit', '0xresume');
+
+      // Simulate process restart with an in-flight submission_acked record.
+      const store2 = new TxStateStore({ storageDir: dir });
+      expect(store2.get('resume-mid-submit')!.state).toBe('submission_acked');
+
+      const provider = makeProvider(makeReceipt({ hash: '0xresume', blockNumber: 88 }));
+      await store2.reconcile(provider, 'startup');
+      expect(store2.get('resume-mid-submit')!.state).toBe('chain_mined');
+
+      // A second sweep with the same receipt must not re-apply transitions.
+      await store2.reconcile(provider, 'scheduled');
+      expect(store2.get('resume-mid-submit')!.state).toBe('chain_mined');
+      expect(store2.get('resume-mid-submit')!.transitions.filter((t) => t.to === 'chain_mined')).toHaveLength(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

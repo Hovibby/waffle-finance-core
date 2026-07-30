@@ -240,6 +240,14 @@ export const reconciliationEventsReplayed = new Counter({
   registers: [registry]
 });
 
+/** Dispatch outcomes for live/replay/recovery event paths */
+export const workflowDispatchDecisions = new Counter({
+  name: "coordinator_workflow_dispatch_decisions_total",
+  help: "Event dispatch decisions by path, mutation, and outcome",
+  labelNames: ["path", "mutation", "outcome"] as const,
+  registers: [registry],
+});
+
 /** Stale cleanup runs (success | failure) */
 export const staleCleanupRuns = new Counter({
   name: "coordinator_stale_cleanup_runs_total",

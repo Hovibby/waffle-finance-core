@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   observeListenerEventProcessing,
   recordListenerProgress,
+  workflowDispatchDecisions,
   registry
 } from "../src/metrics.js";
 
@@ -35,6 +36,19 @@ describe("listener metrics", () => {
 
     expect(metrics).toMatch(
       /coordinator_listener_event_processing_duration_seconds_count\{chain="ethereum",event="OrderCreated"\} 1/
+    );
+  });
+
+  it("records workflow dispatch decisions with path and mutation labels", async () => {
+    workflowDispatchDecisions.inc({
+      path: "live",
+      mutation: "src_lock",
+      outcome: "applied",
+    });
+
+    const metrics = await registry.metrics();
+    expect(metrics).toContain(
+      'coordinator_workflow_dispatch_decisions_total{mutation="src_lock",outcome="applied",path="live"} 1'
     );
   });
 });

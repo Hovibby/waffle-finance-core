@@ -199,6 +199,14 @@ export class OrderService {
       this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "duplicate src lock ignored");
       return;
     }
+    if (
+      order.srcOrderId !== null &&
+      (order.srcOrderId !== input.orderId || order.srcLockTx !== input.txHash)
+    ) {
+      throw new OrderValidationError(
+        `conflicting src lock for ${input.publicId}: existing=${order.srcOrderId}/${order.srcLockTx} incoming=${input.orderId}/${input.txHash}`
+      );
+    }
 
     if (!canTransition(order.status, "src_locked") && order.status !== "src_locked") {
       throw new OrderValidationError(`cannot record src lock from status ${order.status}`);
@@ -256,9 +264,14 @@ export class OrderService {
     if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
 
     // Idempotency check
-    if (order.preimage === preimage && order.secretRevealedTx === txHash) {
+    if (order.preimage === preimage) {
       this.log.info({ publicId }, "duplicate secret ignored");
       return;
+    }
+    if (order.preimage !== null && order.preimage !== preimage) {
+      throw new OrderValidationError(
+        `conflicting preimage for ${publicId}: existing=${order.preimage} incoming=${preimage}`
+      );
     }
 
     if (!canTransition(order.status, "secret_revealed") && order.status !== "secret_revealed") {
