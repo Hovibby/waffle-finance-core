@@ -16,7 +16,6 @@ out/
 .env.production.local
 
 # IDE and editors
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -169,9 +168,23 @@ cypress/screenshots/
 tmp/
 temp/
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json 
+# Test snapshots and artifacts
+**/__snapshots__/
+**/*.snap
+proptest-regressions/
+
+# Rust
+target/
+*.wasm
+soroban/target/
+
+# Docker
+docker-compose.override.yml
+
+# Turbo
+.turbo/
+
+# Misc
+AGENTS.md
+.kilocode/
+ 
