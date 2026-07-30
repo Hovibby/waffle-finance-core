@@ -192,4 +192,67 @@ describe('usePersistedBridgeDraft', () => {
     expect(raw.stellarAddress).toBeUndefined();
     expect(raw.fingerprint).toBe('1-1-1');
   });
+
+  it('detects conflict when stored draft has higher conflict count', () => {
+    const conflictDraft = {
+      v: 1,
+      direction: 'eth_to_sol',
+      amount: '0.99',
+      fingerprint: '1-1-1',
+      savedAt: Date.now(),
+      conflictCount: 5,
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(conflictDraft));
+
+    const { result } = renderHook(() =>
+      usePersistedBridgeDraft({
+        ethAddress: ETH,
+        stellarAddress: XLM,
+        solanaAddress: SOL,
+      }),
+    );
+    // Draft was restored but flagged as conflicted
+    expect(result.current.wasRestored).toBe(true);
+    expect(result.current.wasConflictDetected).toBe(true);
+    expect(result.current.direction).toBe('eth_to_sol');
+    expect(result.current.amount).toBe('0.99');
+  });
+
+  it('rejects stale draft after conflict and resets to defaults on next mount', () => {
+    const staleDraft = {
+      v: 1,
+      direction: 'xlm_to_eth',
+      amount: '1.5',
+      fingerprint: '1-1-1',
+      savedAt: Date.now(),
+      conflictCount: 10,
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(staleDraft));
+
+    const { result } = renderHook(() =>
+      usePersistedBridgeDraft({
+        ethAddress: ETH,
+        stellarAddress: XLM,
+        solanaAddress: SOL,
+      }),
+    );
+    // First mount detects conflict
+    expect(result.current.wasConflictDetected).toBe(true);
+    expect(result.current.wasRestored).toBe(true);
+
+    // Simulate app clearing the conflicted draft
+    act(() => result.current.clearPersistedDraft());
+
+    // Second mount should start fresh
+    const second = renderHook(() =>
+      usePersistedBridgeDraft({
+        ethAddress: ETH,
+        stellarAddress: XLM,
+        solanaAddress: SOL,
+      }),
+    );
+    expect(second.result.current.direction).toBe('eth_to_xlm');
+    expect(second.result.current.amount).toBe('');
+    expect(second.result.current.wasConflictDetected).toBe(false);
+  });
 });
