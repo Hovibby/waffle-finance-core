@@ -35,6 +35,12 @@ const REGRESSION_THRESHOLD = 5;
 const PENDING_SLOTS_MAX_AGE = 200;
 
 /**
+ * Maximum number of processed signature keys in the in-process dedup cache.
+ * Bounded to avoid unbounded memory growth in long-running processes.
+ */
+const DEDUP_CACHE_MAX = 10_000;
+
+/**
  * Polls the Solana RPC for HTLC program logs and feeds order events into
  * the OrderService with full reorg/fork awareness.
  *
@@ -78,6 +84,13 @@ export class SolanaListener {
    * slot → [publicId, ...]
    */
   private readonly processedBySlot: Map<number, string[]> = new Map();
+
+  /**
+   * In-process event deduplication cache.
+   * Key: transaction signature (unique per on-chain transaction).
+   * Bounded at DEDUP_CACHE_MAX entries; oldest evicted on overflow.
+   */
+  private readonly processedSigs = new Map<string, true>();
 
   constructor(
     private readonly cfg: CoordinatorConfig,
@@ -216,6 +229,25 @@ export class SolanaListener {
   }
 
   // ---------------------------------------------------------------------------
+  // Event deduplication helpers
+  // ---------------------------------------------------------------------------
+
+  /** Returns true if this signature was already processed in-process. */
+  isDuplicate(sig: string): boolean {
+    return this.processedSigs.has(sig);
+  }
+
+  /** Mark a signature as processed; evicts oldest on overflow. */
+  private markSigProcessed(sig: string): void {
+    if (this.processedSigs.has(sig)) return;
+    if (this.processedSigs.size >= DEDUP_CACHE_MAX) {
+      const oldest = this.processedSigs.keys().next().value;
+      if (oldest !== undefined) this.processedSigs.delete(oldest);
+    }
+    this.processedSigs.set(sig, true);
+  }
+
+  // ---------------------------------------------------------------------------
   // Reorg / fork handling
   // ---------------------------------------------------------------------------
 
@@ -291,6 +323,14 @@ export class SolanaListener {
    * the fields we need.
    */
   private handleLogs(sig: string, logs: string[], slot?: number): void {
+    // ── In-process deduplication ────────────────────────────────────────────
+    // If we have already processed this signature in the current process
+    // lifetime, skip without touching the DB.
+    if (this.isDuplicate(sig)) {
+      this.log.debug({ sig }, "Solana event duplicate skipped (in-process cache)");
+      return;
+    }
+
     let eventType: string | null = null;
     const payload: Record<string, unknown> = {};
 
@@ -339,6 +379,7 @@ export class SolanaListener {
             blockNumber: effectiveSlot,
             timelock,
           });
+          this.markSigProcessed(sig);
 
           // Track the processed order under its slot for regression rollback.
           if (!this.processedBySlot.has(effectiveSlot)) {
@@ -360,6 +401,7 @@ export class SolanaListener {
             const order = await this.orders.findBySrcOrderId("solana", orderId);
             if (order) {
               await this.orders.recordSecret(order.publicId, preimage, sig);
+              this.markSigProcessed(sig);
             }
           } catch (err) {
             this.log.warn({ err, orderId }, "could not record Solana secret");
@@ -376,6 +418,7 @@ export class SolanaListener {
             const order = await this.orders.findBySrcOrderId("solana", orderId);
             if (order) {
               await this.orders.markStatus(order.publicId, "refunded");
+              this.markSigProcessed(sig);
             }
           } catch (err) {
             this.log.warn({ err, orderId }, "could not mark Solana order refunded");
