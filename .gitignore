@@ -96,6 +96,20 @@ yarn.lock
 # Testing
 .coverage/
 junit.xml
+# Vitest / Jest snapshot directories and files
+**/__snapshots__/
+*.snap
+# Vitest HTML report and blob report outputs
+html-report/
+blob-reports/
+.vitest-cache/
+
+# Cursor stores (runtime state — not source)
+.cursor/
+.soroban-cursor/
+
+# Kiro agent workspace (local tooling state)
+.kilo/
 
 # Miscellaneous
 .cache/
