@@ -139,6 +139,15 @@ export function useEthereumWallet() {
     };
   }, [setError]);
 
+  /**
+   * Expected Ethereum chain IDs for each network mode.
+   * Sepolia = 0xaa36a7 (11155111), Mainnet = 0x1 (1).
+   */
+  const EXPECTED_CHAIN_IDS: Record<string, string[]> = {
+    testnet: ['0xaa36a7'],
+    mainnet: ['0x1'],
+  };
+
   const connect = useCallback(async () => {
     const provider = typeof window !== 'undefined' ? window.ethereum : undefined;
     if (!provider) {
@@ -149,13 +158,28 @@ export function useEthereumWallet() {
     setState((prev) => transition(prev, { isLoading: true, error: null, errorCode: null, hint: null, phase: 'requesting_permission' }));
     try {
       const accounts = await provider.request({ method: 'eth_requestAccounts' });
-      const chainId = await provider.request({ method: 'eth_chainId' }).catch(() => null);
+      const chainId = await provider.request({ method: 'eth_chainId' }).catch(() => null) as string | null;
+
+      // ── Network mismatch diagnostic ─────────────────────────────────────
+      // Determine expected chain IDs based on VITE_NETWORK_MODE env var.
+      const networkMode = (import.meta as any).env?.VITE_NETWORK_MODE ?? 'testnet';
+      const expectedChains = EXPECTED_CHAIN_IDS[networkMode] ?? EXPECTED_CHAIN_IDS['testnet'];
+      if (chainId && !expectedChains.includes(chainId.toLowerCase())) {
+        const expected = networkMode === 'mainnet' ? 'Ethereum Mainnet' : 'Sepolia testnet';
+        setError(
+          'network_mismatch',
+          `MetaMask is connected to the wrong network (chain ID ${chainId}).`,
+          `Switch MetaMask to ${expected} and try again.`,
+        );
+        return;
+      }
+
       if (accounts.length > 0) {
         setState((prev) =>
           transition(prev, {
             isConnected: true,
             address: accounts[0],
-            chainId: chainId as string | null,
+            chainId: chainId,
             isLoading: false,
             error: null,
             errorCode: null,
@@ -165,12 +189,19 @@ export function useEthereumWallet() {
         );
       }
     } catch (err: any) {
+      // ── Wallet-locked diagnostic ────────────────────────────────────────
+      // MetaMask returns error code -32002 when the extension is locked.
+      const isLocked = err?.code === -32002;
       setError(
-        'metamask_connect_failed',
-        err?.message ?? 'MetaMask connection failed',
-        err?.code === 4001
-          ? 'You rejected the connection request in MetaMask.'
-          : 'Check the MetaMask popup and try again.'
+        isLocked ? 'wallet_locked' : 'metamask_connect_failed',
+        isLocked
+          ? 'MetaMask is locked. Please unlock it and try again.'
+          : (err?.message ?? 'MetaMask connection failed'),
+        isLocked
+          ? 'Open MetaMask, enter your password to unlock, then retry.'
+          : (err?.code === 4001
+            ? 'You rejected the connection request in MetaMask.'
+            : 'Check the MetaMask popup and try again.'),
       );
     }
   }, [setError]);
