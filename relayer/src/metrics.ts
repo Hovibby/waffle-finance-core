@@ -558,3 +558,142 @@ export const retryEngineMetrics = {
   circuitState: retryEngineCircuitState,
   backoffSeconds: retryEngineBackoffSeconds,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Settlement service metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Total settlement attempts made by the SettlementService, labelled by
+ * direction (eth_to_xlm / xlm_to_eth) and failure_category.
+ *
+ * failure_category values:
+ *   none              — attempt succeeded (no failure)
+ *   transient         — retryable error (RPC timeout, rate limit, etc.)
+ *   terminal          — non-retryable error (bad auth, insufficient funds)
+ *   confirmation_delay — tx submitted but not yet mined
+ *   unknown           — unclassified error
+ */
+export const settlementAttemptsTotal = new Counter({
+  name: 'relayer_settlement_attempts_total',
+  help: 'Total settlement attempts by direction and failure category',
+  labelNames: ['direction', 'failure_category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total settlement failures (exhausted all retries or hit a terminal error),
+ * labelled by direction and failure_category.
+ */
+export const settlementFailuresTotal = new Counter({
+  name: 'relayer_settlement_failures_total',
+  help: 'Total settlement failures after retries exhausted, by direction and failure category',
+  labelNames: ['direction', 'failure_category'] as const,
+  registers: [registry],
+});
+
+/**
+ * Total settlement recoveries initiated via the recovery endpoint or
+ * automatic reconciliation, labelled by direction and trigger
+ * (manual / scheduled / startup).
+ */
+export const settlementRecoveryTotal = new Counter({
+  name: 'relayer_settlement_recovery_total',
+  help: 'Total settlement recovery actions initiated',
+  labelNames: ['direction', 'trigger'] as const,
+  registers: [registry],
+});
+
+/**
+ * Current number of orders in each intermediate settlement state.
+ * Sampled after every state transition.
+ */
+export const settlementStateGauge = new Gauge({
+  name: 'relayer_settlement_state_current',
+  help: 'Current count of settlement orders in each intermediate state',
+  labelNames: ['state'] as const,
+  registers: [registry],
+});
+
+/**
+ * Duration histogram for the full settlement lifecycle, from order acceptance
+ * to terminal state (complete or terminal_failure).
+ */
+export const settlementDurationSeconds = new Histogram({
+  name: 'relayer_settlement_duration_seconds',
+  help: 'Duration of full settlement lifecycle in seconds',
+  labelNames: ['direction', 'outcome'] as const,
+  buckets: [1, 5, 15, 30, 60, 120, 300, 600],
+  registers: [registry],
+});
+
+/** Settlement service metrics bundle. */
+export const settlementServiceMetrics = {
+  attemptsTotal: settlementAttemptsTotal,
+  failuresTotal: settlementFailuresTotal,
+  recoveryTotal: settlementRecoveryTotal,
+  stateGauge: settlementStateGauge,
+  durationSeconds: settlementDurationSeconds,
+} as const;
+
+// ---------------------------------------------------------------------------
+// Pipeline metrics (order ingestion, relay decisions, latency)
+// ---------------------------------------------------------------------------
+
+export const orderIngestionTotal = new Counter({
+  name: 'relayer_order_ingestion_total',
+  help: 'Total orders received at the ingestion boundary, before any policy checks',
+  labelNames: ['direction'] as const,
+  registers: [registry],
+});
+
+export const orderQueueDepth = new Gauge({
+  name: 'relayer_order_queue_depth',
+  help: 'Current number of in-memory active orders',
+  registers: [registry],
+});
+
+export const relayDecisionTotal = new Counter({
+  name: 'relayer_relay_decision_total',
+  help: 'Total relay decisions (accepted / rejected_route / rejected_permissions)',
+  labelNames: ['direction', 'result'] as const,
+  registers: [registry],
+});
+
+export const submissionLatencySeconds = new Histogram({
+  name: 'relayer_submission_latency_seconds',
+  help: 'Time from order acceptance to ETH/XLM transaction broadcast',
+  labelNames: ['direction', 'result'] as const,
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [registry],
+});
+
+export const receiptLatencySeconds = new Histogram({
+  name: 'relayer_receipt_latency_seconds',
+  help: 'Time to receive on-chain confirmation after broadcast',
+  labelNames: ['result'] as const,
+  buckets: [1, 5, 15, 30, 60, 120, 300],
+  registers: [registry],
+});
+
+export const retryAttemptsHistogram = new Histogram({
+  name: 'relayer_retry_attempts',
+  help: 'Number of retry attempts per operation',
+  labelNames: ['operation', 'result'] as const,
+  buckets: [0, 1, 2, 3, 4, 5],
+  registers: [registry],
+});
+
+export const droppedOrdersTotal = new Counter({
+  name: 'relayer_dropped_orders_total',
+  help: 'Total orders permanently dropped (fatal failure, no recovery)',
+  labelNames: ['direction', 'reason'] as const,
+  registers: [registry],
+});
+
+export const chainDelayGauge = new Gauge({
+  name: 'relayer_chain_delay_seconds',
+  help: 'Observed chain head lag or confirmation delay',
+  labelNames: ['chain'] as const,
+  registers: [registry],
+});

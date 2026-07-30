@@ -109,7 +109,6 @@ export async function runCommand(): Promise<void> {
   );
 
   const healthPort = Number(process.env.RESOLVER_HEALTH_PORT ?? 3003);
-  const healthServer = startResolverHealthServer({ cfg, supervisor, registryStatus }, healthPort);
   const healthServer = startResolverHealthServer(
     { cfg, supervisor, policy, telemetryChains: observedChains.map(chainLabel) },
     healthPort
@@ -154,7 +153,6 @@ export async function runCommand(): Promise<void> {
 
     // Tell the supervisor to stop and cancel any pending restart sleep.
     supervisor.stop();
-    registryStatus.stop();
 
     // Stop listeners concurrently.  Each stop is independently try-caught so
     // one failure doesn't prevent the other from being cleaned up.
@@ -288,6 +286,12 @@ export async function runCommand(): Promise<void> {
             log.info({ orderId: e.orderId, ledger: e.ledger }, "Soroban order refunded");
             ordersProcessedTotal.inc({ chain: CHAIN_SOROBAN, action: "order_refunded" });
             listenerLastEventTimestampSeconds.set({ chain: CHAIN_SOROBAN }, Math.floor(Date.now() / 1000));
+          },
+          onUnknownEvent: ({ topics, ledger, txHash }) => {
+            log.debug(
+              { topicCount: topics.length, ledger, txHash },
+              "Soroban unknown/non-HTLC event — skipping"
+            );
           },
         });
       }
