@@ -16,6 +16,15 @@ import { startRefundWatchdog } from './services/refund-watchdog.js';
 import { refundXlmToUser, HorizonTimeoutError } from './services/xlm-refund.js';
 import { globalRefundLedger } from './services/refund-ledger.js';
 import { globalStellarProofLedger } from './services/stellar-proof-ledger.js';
+import { globalSettlementFailureStore } from './services/settlement-failure-store.js';
+import {
+  classifyFailureCategory,
+  ETH_BALANCE_RETRY,
+  ETH_SEND_RETRY,
+  ETH_CONFIRM_RETRY,
+  HORIZON_VERIFY_RETRY,
+} from './services/settlement-retry-policy.js';
+import { globalRetryEngine, RetryExhaustedError } from './utils/retry-engine.js';
 import {
   verifyIncomingStellarPayment,
   StellarTxNotFoundError,
@@ -420,6 +429,71 @@ function validateConfig() {
       formatStartupErrors(errors) + '\n' +
       'Fix all of the above before starting the relayer.'
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settlement retry helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap a settlement action with the global RetryEngine and automatically
+ * record every failure attempt in the SettlementFailureStore.
+ *
+ * On every failure (including the retried ones) the store is updated with:
+ *   - the structured FailureCategory derived from the error
+ *   - the direction and chain
+ *
+ * On eventual success after at least one prior failure the store is updated
+ * to `recovered` and the txHash is stamped for the audit trail.
+ *
+ * On terminal failure (RetryExhaustedError or a terminal fault class) the
+ * store stays in `failed` / `pending` state so the admin endpoint surfaces it.
+ *
+ * @param action    RetryEngine action namespace (e.g. 'eth-send', 'horizon-verify').
+ * @param opts      RunOptions from the settlement-retry-policy constants.
+ * @param fn        The async operation to execute.
+ * @param meta      Contextual info recorded in the failure store.
+ */
+async function runWithSettlementRetry<T>(
+  action: string,
+  opts: import('./utils/retry-engine.js').RunOptions,
+  fn: () => Promise<T>,
+  meta: {
+    orderId: string;
+    direction: string;
+    chain: 'ethereum' | 'stellar' | 'unknown';
+    recoveredTxHash?: (result: T) => string | undefined;
+  },
+): Promise<T> {
+  // Mark recovery in progress if this order has had prior failures.
+  if (globalSettlementFailureStore.hasFailed(meta.orderId)) {
+    globalSettlementFailureStore.markRecovering(meta.orderId);
+  }
+
+  try {
+    const result = await globalRetryEngine.run(action, fn, opts);
+
+    // Success after a prior failure → mark recovered.
+    if (globalSettlementFailureStore.hasFailed(meta.orderId)) {
+      const txHash = meta.recoveredTxHash?.(result) ?? '';
+      globalSettlementFailureStore.markRecovered(meta.orderId, txHash);
+    }
+
+    return result;
+  } catch (err: unknown) {
+    // Record the failure with full category classification.
+    const category = classifyFailureCategory(err, meta.chain);
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    globalSettlementFailureStore.recordFailure({
+      orderId: meta.orderId,
+      direction: meta.direction,
+      category,
+      errorMessage,
+      chain: meta.chain,
+      recoveryAction: `RetryEngine exhausted for action=${action}`,
+    });
+    throw err;
   }
 }
 
@@ -1640,26 +1714,16 @@ async function initializeRelayer() {
           const provider = new ethers.JsonRpcProvider(rpcUrl);
           const relayerWallet = new ethers.Wallet(privateKey, provider);
 
-          // Get relayer balance with retry for rate limiting
-          let balance: bigint | undefined;
-          let balanceRetryCount = 0;
-          const maxBalanceRetries = 5;
-          while (balanceRetryCount <= maxBalanceRetries) {
-            try {
-              balance = await provider.getBalance(relayerWallet.address);
-              break;
-            } catch (error: any) {
-              balanceRetryCount++;
-              if ((error?.code === 429 || error?.message?.includes('rate limit')) && balanceRetryCount <= maxBalanceRetries) {
-                await new Promise(r => setTimeout(r, Math.pow(2, balanceRetryCount) * 1000));
-                continue;
-              }
-              throw error;
-            }
-          }
+          // ── Balance check (retried via RetryEngine) ───────────────────────
+          const balance = await runWithSettlementRetry(
+            'eth-balance',
+            ETH_BALANCE_RETRY,
+            () => provider.getBalance(relayerWallet.address),
+            { orderId, direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' },
+          );
 
           const gasCost = 21000n * ethers.parseUnits('20', 'gwei');
-          if (balance !== undefined && balance < ethAmountWei + gasCost) {
+          if (balance < ethAmountWei + gasCost) {
             return res.status(400).json({
               error: 'Insufficient relayer balance',
               balance: ethers.formatEther(balance),
@@ -1674,77 +1738,33 @@ async function initializeRelayer() {
             gasLimit: 21000,
             gasPrice: ethers.parseUnits('20', 'gwei'),
           };
-          
-          // Send transaction with retry for rate limiting
-          let ethTxResponse;
-          let retryCount = 0;
-          const maxRetries = 3;
-          
-          while (retryCount <= maxRetries) {
-            try {
-              ethTxResponse = await relayerWallet.sendTransaction(tx);
-              break; // Success, exit retry loop
-            } catch (txError: any) {
-              retryCount++;
-              
-              // Enhanced Alchemy rate limiting detection
-              const isRateLimit = txError.code === 'UNKNOWN_ERROR' && txError.error?.code === 429 ||
-                                txError.code === 429 ||
-                                txError.message?.includes('exceeded') ||
-                                txError.message?.includes('compute units') ||
-                                txError.message?.includes('rate limit') ||
-                                txError.error?.message?.includes('exceeded');
-              
-              if (isRateLimit && retryCount <= maxRetries) {
-                const delayMs = Math.pow(2, retryCount) * 1000; // Exponential backoff: 2s, 4s, 8s
-                console.log(`ΓÅ│ Alchemy rate limit detected (process endpoint, attempt ${retryCount}/${maxRetries}). Error:`, txError.message || txError.error?.message);
-                console.log(`ΓÅ│ Waiting ${delayMs}ms before retry...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-              }
-              
-              // If not rate limiting or exhausted retries, throw
-              console.error('Γ¥î Transaction failed after retries (process endpoint):', txError);
-              throw txError;
-            }
-          }
-          // ── Retry histogram: eth_send ─────────────────────────────────────
-          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, retryCount);
+
+          // ── ETH send (retried via RetryEngine + SettlementFailureStore) ───
+          const ethTxResponse = await runWithSettlementRetry(
+            'eth-send',
+            ETH_SEND_RETRY,
+            () => relayerWallet.sendTransaction(tx),
+            {
+              orderId,
+              direction: storedOrder?.direction ?? 'xlm_to_eth',
+              chain: 'ethereum',
+              recoveredTxHash: (r) => r.hash,
+            },
+          );
+          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, 0);
           console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
-          
-          // Wait for confirmation with retry logic
-          let ethTxReceipt;
-          let confirmRetryCount = 0;
-          const maxConfirmRetries = 3;
-          
-          while (confirmRetryCount <= maxConfirmRetries) {
-            try {
-              ethTxReceipt = await ethTxResponse.wait();
-              console.log('Γ£à ETH transaction confirmed!');
-              break;
-            } catch (confirmError: any) {
-              confirmRetryCount++;
-              
-              // Check for rate limiting during confirmation
-              const isRateLimit = confirmError.code === 429 ||
-                                confirmError.message?.includes('exceeded') ||
-                                confirmError.message?.includes('rate limit');
-              
-              if (isRateLimit && confirmRetryCount <= maxConfirmRetries) {
-                const delayMs = Math.pow(2, confirmRetryCount) * 1000;
-                console.log(`ΓÅ│ Rate limit during confirmation (process endpoint, attempt ${confirmRetryCount}/${maxConfirmRetries}). Waiting ${delayMs}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-              }
-              
-              // If not rate limiting or exhausted retries, throw
-              console.error('Γ¥î Transaction confirmation failed (process endpoint):', confirmError);
-              throw confirmError;
-            }
-          }
+
+          // ── Wait for confirmation (retried via RetryEngine) ───────────────
+          const ethTxReceipt = await runWithSettlementRetry(
+            'eth-confirm',
+            ETH_CONFIRM_RETRY,
+            () => ethTxResponse.wait(),
+            { orderId, direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' },
+          );
+          console.log('Γ£à ETH transaction confirmed!');
           console.log('≡ƒöì ETH tx hash:', ethTxReceipt?.hash);
           console.log('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxReceipt?.hash);
-          
+
           // Update order status
           storedOrder.status = 'completed';
           storedOrder.ethTxHash = ethTxReceipt?.hash;
@@ -1772,12 +1792,23 @@ async function initializeRelayer() {
           
         } catch (ethError: any) {
           console.error('Γ¥î ETH transaction failed:', ethError);
-          // ── Pipeline metrics: fatal ETH send failure ──────────────────────
-          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, 3);
+          // ── Failure store + pipeline metrics ─────────────────────────────
+          retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, 0);
           droppedOrdersTotal.inc({ direction: 'xlm_to_eth', reason: 'eth_tx_failed' });
+          const procFailCategory = classifyFailureCategory(ethError, 'ethereum');
+          globalSettlementFailureStore.recordFailure({
+            orderId,
+            direction: storedOrder?.direction ?? 'xlm_to_eth',
+            category: procFailCategory,
+            errorMessage: ethError.message,
+            chain: 'ethereum',
+            recoveryAction: 'ETH send exhausted all retries in /api/orders/process',
+          });
           res.status(500).json({
             error: 'ETH release failed',
-            details: ethError.message
+            details: ethError.message,
+            orderId,
+            recoveryHint: 'Check /api/admin/settlement-failures for recovery status.',
           });
         }
         
@@ -2153,43 +2184,22 @@ async function initializeRelayer() {
 
         const provider = new ethers.JsonRpcProvider(rpcUrl);
         const relayerWallet = new ethers.Wallet(privateKey, provider);
-        
+
         console.log('≡ƒöæ Relayer ETH address:', relayerWallet.address);
-        
-        // Get relayer balance with retry logic for Alchemy rate limiting
+
+        // ── Balance check (retried via RetryEngine) ───────────────────────
         console.log('≡ƒöì Getting relayer balance...');
-        let balance;
-        let balanceRetryCount2 = 0;
-        const maxBalanceRetries2 = 5;
-        
-        while (balanceRetryCount2 <= maxBalanceRetries2) {
-          try {
-            balance = await withTimeout(
-              provider.getBalance(relayerWallet.address),
-              RELAYER_CONFIG.rpcTimeoutMs,
-              'RPC getBalance timeout'
-            );
-            console.log('≡ƒÆ░ Relayer ETH balance:', ethers.formatEther(balance), 'ETH');
-            break; // Success, exit retry loop
-          } catch (error: any) {
-            balanceRetryCount2++;
-            
-            // Check if it's Alchemy rate limiting (code 429)
-            if (error?.code === 429 || error?.message?.includes('exceeded') || error?.message?.includes('rate limit')) {
-              const delayMs = Math.pow(2, balanceRetryCount2) * 1000; // Exponential backoff: 2s, 4s, 8s, 16s, 32s
-              console.log(`ΓÅ│ Alchemy rate limit hit (attempt ${balanceRetryCount2}/${maxBalanceRetries2}). Waiting ${delayMs}ms...`);
-              
-              if (balanceRetryCount2 <= maxBalanceRetries2) {
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-              }
-            }
-            
-            // If it's not rate limiting or we've exhausted retries, throw
-            console.error('Γ¥î Failed to get relayer balance:', error.message);
-            throw error;
-          }
-        }
+        const balance = await runWithSettlementRetry(
+          'eth-balance',
+          ETH_BALANCE_RETRY,
+          () => withTimeout(
+            provider.getBalance(relayerWallet.address),
+            RELAYER_CONFIG.rpcTimeoutMs,
+            'RPC getBalance timeout',
+          ),
+          { orderId, direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' },
+        );
+        console.log('≡ƒÆ░ Relayer ETH balance:', ethers.formatEther(balance), 'ETH');
         
         // ── Derive ETH amount from the Horizon-verified XLM amount ────────────
         // All arithmetic is integer-based (bigint stroops → bigint wei).
@@ -2265,40 +2275,24 @@ async function initializeRelayer() {
         }
 
         let ethTxResponse: any;
-        let txRetryCount = 0;
-        const maxTxRetries = 3;
-        while (txRetryCount <= maxTxRetries) {
-          try {
-            ethTxResponse = await withTimeout(
-              relayerWallet.sendTransaction(tx),
-              RELAYER_CONFIG.rpcTimeoutMs,
-              'RPC sendTransaction timeout'
-            );
-            break;
-          } catch (txError: any) {
-            txRetryCount++;
-            const isRateLimit =
-              (txError.code === 'UNKNOWN_ERROR' && txError.error?.code === 429) ||
-              txError.code === 429 ||
-              txError.message?.includes('exceeded') ||
-              txError.message?.includes('compute units') ||
-              txError.message?.includes('rate limit') ||
-              txError.error?.message?.includes('exceeded');
-            if (isRateLimit && txRetryCount <= maxTxRetries) {
-              const delayMs = Math.pow(2, txRetryCount) * 1000; // Exponential backoff: 2s, 4s, 8s
-              console.log(`ΓÅ│ Alchemy rate limit detected (attempt ${txRetryCount}/${maxTxRetries}). Error:`, txError.message || txError.error?.message);
-              console.log(`ΓÅ│ Waiting ${delayMs}ms before retry...`);
-              await new Promise(resolve => setTimeout(resolve, delayMs));
-              continue;
-            }
-            
-            // If not rate limiting or exhausted retries, throw
-            console.error('Γ¥î Transaction failed after retries:', txError);
-            throw txError;
-          }
-        }
+        // ── ETH send (retried via RetryEngine + SettlementFailureStore) ───
+        ethTxResponse = await runWithSettlementRetry(
+          'eth-send',
+          ETH_SEND_RETRY,
+          () => withTimeout(
+            relayerWallet.sendTransaction(tx),
+            RELAYER_CONFIG.rpcTimeoutMs,
+            'RPC sendTransaction timeout',
+          ),
+          {
+            orderId,
+            direction: storedOrder?.direction ?? 'xlm_to_eth',
+            chain: 'ethereum',
+            recoveredTxHash: (r) => r.hash,
+          },
+        );
         // ── Retry histogram: eth_send ─────────────────────────────────────
-        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, txRetryCount);
+        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, 0);
         console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
         console.log('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxResponse.hash);
         
@@ -2393,13 +2387,25 @@ async function initializeRelayer() {
         }
 
         // ── Pipeline metrics: ETH send fatal failure (xlm-to-eth) ────────
-        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, txRetryCount ?? 0);
+        retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, 0);
         droppedOrdersTotal.inc({ direction: 'xlm_to_eth', reason: 'eth_tx_failed' });
+        // ── Settlement failure store ──────────────────────────────────────
+        const xlmToEthFailCategory = classifyFailureCategory(ethError, 'ethereum');
+        globalSettlementFailureStore.recordFailure({
+          orderId,
+          direction: storedOrder?.direction ?? 'xlm_to_eth',
+          category: xlmToEthFailCategory,
+          errorMessage: ethError.message,
+          chain: 'ethereum',
+          recoveryAction: 'XLM refund attempted automatically; watchdog will follow up',
+        });
 
         return res.status(500).json({
           error: 'ETH release failed',
           details: ethError.message,
           errorCode: ethError.code,
+          orderId,
+          recoveryHint: 'Check /api/admin/settlement-failures for recovery status.',
           refund: refundResult
             ? { status: 'completed', stellarTxHash: refundResult.hash, message: 'Your XLM has been automatically refunded.' }
             : {
@@ -2792,46 +2798,21 @@ async function initializeRelayer() {
           throw new Error(`Γ¥î Insufficient relayer balance! Need ${ethers.formatEther(totalRequired)} ETH, have ${ethers.formatEther(relayerBalance)} ETH`);
         }
 
-        // Create ETH HTLC with retry mechanism
-        let ethTx;
-        let retryCount = 0;
-        const maxRetries = 3;
-        
-        while (retryCount <= maxRetries) {
-          try {
-            ethTx = await mainnetHTLCContract.createOrder(
-              '0x0000000000000000000000000000000000000000', // ETH
-              ethAmountWei,
-              '0x' + orderData.hashLock, // Add 0x prefix for Ethereum contract
-              timelockEth,
-              orderData.ethAddress, // User gets ETH
-              process.env.RELAYER_ETH_ADDRESS!, // Relayer refund
-              { value: ethAmountWei }
-            );
-            break; // Success, exit retry loop
-          } catch (createError: any) {
-            console.log('≡ƒöì ETH HTLC createOrder error:', createError.code, createError.message);
-            
-            // Check for rate limiting
-            const isRateLimited = (
-              createError.code === 'UNKNOWN_ERROR' && 
-              createError.error?.code === 429
-            ) || (
-              createError.message?.includes('compute units per second') ||
-              createError.message?.includes('rate limit') ||
-              createError.code === 429
-            );
-            
-            if (isRateLimited && retryCount < maxRetries) {
-              retryCount++;
-              const delay = 3000 * retryCount; // 3s, 6s, 9s
-              console.log(`ΓÅ│ Alchemy rate limited, retrying ETH HTLC in ${delay}ms (attempt ${retryCount}/${maxRetries})`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-            } else {
-              throw createError; // Re-throw if not rate limiting or max retries reached
-            }
-          }
-        }
+        // Create ETH HTLC — retried via RetryEngine for rate-limit recovery
+        const ethTx = await runWithSettlementRetry(
+          'eth-send',
+          ETH_SEND_RETRY,
+          () => mainnetHTLCContract.createOrder(
+            '0x0000000000000000000000000000000000000000', // ETH
+            ethAmountWei,
+            '0x' + orderData.hashLock,
+            timelockEth,
+            orderData.ethAddress,
+            process.env.RELAYER_ETH_ADDRESS!,
+            { value: ethAmountWei }
+          ),
+          { orderId, direction: 'xlm_to_eth', chain: 'ethereum' },
+        );
 
         console.log('≡ƒô¥ ETH HTLC TX sent:', ethTx.hash);
         const ethReceipt = await ethTx.wait();
@@ -3233,6 +3214,85 @@ async function initializeRelayer() {
   });
 
   console.log('Γ£à Admin endpoints registered');
+
+  // ── GET /api/admin/settlement-failures ───────────────────────────────────
+  //
+  // Returns all orders that have at least one recorded settlement failure.
+  // Operators use this to:
+  //   - Identify orders that failed mid-flow and need manual intervention.
+  //   - Confirm that the recovery watchdog has already acted.
+  //   - Filter by recovery status (pending / recovering / recovered / failed /
+  //     requires_review) to prioritise manual actions.
+  //
+  // Query params:
+  //   ?status=pending|recovering|recovered|failed|requires_review  (optional filter)
+  //   ?limit=50                                                      (default 100)
+  //
+  // Response shape:
+  //   { summary, records: OrderFailureRecord[] }
+  app.get('/api/admin/settlement-failures', requireAdminAuth(), (_req, res) => {
+    try {
+      const statusFilter = typeof _req.query.status === 'string' ? _req.query.status : undefined;
+      const limit = Math.min(parseInt(String(_req.query.limit ?? '100'), 10) || 100, 500);
+
+      const all = globalSettlementFailureStore.all()
+        .filter(r => !statusFilter || r.recoveryStatus === statusFilter)
+        .sort((a, b) => b.lastUpdatedAt - a.lastUpdatedAt)
+        .slice(0, limit);
+
+      res.json({
+        summary: globalSettlementFailureStore.summary(),
+        total: globalSettlementFailureStore.size(),
+        filtered: all.length,
+        records: all.map(r => ({
+          orderId: r.orderId,
+          direction: r.direction,
+          recoveryStatus: r.recoveryStatus,
+          failureCount: r.failureCount,
+          recoveryAttempts: r.recoveryAttempts,
+          firstFailedAt: new Date(r.firstFailedAt).toISOString(),
+          lastUpdatedAt: new Date(r.lastUpdatedAt).toISOString(),
+          terminalReason: r.terminalReason,
+          recoveredTxHash: r.recoveredTxHash,
+          // Last 3 events for brevity; full history is on disk.
+          recentEvents: r.events.slice(-3).map(e => ({
+            at: e.at,
+            category: e.category,
+            recoverability: e.recoverability,
+            chain: e.chain,
+            attempt: e.attempt,
+            errorMessage: e.errorMessage,
+            recoveryAction: e.recoveryAction,
+          })),
+        })),
+      });
+    } catch (err: any) {
+      console.error('Γ¥î /api/admin/settlement-failures failed:', err);
+      res.status(500).json({ error: 'Failed to retrieve settlement failures', details: err.message });
+    }
+  });
+
+  // ── GET /api/admin/settlement-failures/:orderId ──────────────────────────
+  //
+  // Returns the complete failure record for a single order including the full
+  // event history. Useful when investigating a specific stuck order.
+  app.get('/api/admin/settlement-failures/:orderId', requireAdminAuth(), (_req, res) => {
+    try {
+      const record = globalSettlementFailureStore.get(_req.params.orderId);
+      if (!record) {
+        return res.status(404).json({
+          error: 'No failure record found for this orderId',
+          orderId: _req.params.orderId,
+        });
+      }
+      res.json({ record });
+    } catch (err: any) {
+      console.error('Γ¥î /api/admin/settlement-failures/:orderId failed:', err);
+      res.status(500).json({ error: 'Failed to retrieve failure record', details: err.message });
+    }
+  });
+
+  console.log('Γ£à Settlement failures endpoint registered');
 
   // ═══════════════════════════════════════════════════════════════════════════════════════
             // 1INCH ESCROW FACTORY ENDPOINTS - Using createDstEscrow approach
