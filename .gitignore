@@ -156,6 +156,10 @@ cypress/screenshots/
 *.bak
 *.orig
 
+# Test snapshots
+**/__snapshots__/
+**/*.snap
+
 # Miscellaneous
 .cache/
 .parcel-cache/

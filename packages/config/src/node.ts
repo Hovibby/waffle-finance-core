@@ -70,6 +70,11 @@ export function loadCoordinatorConfig(
     secretStorageKey: rawEnv.SECRET_STORAGE_KEY,
     apiKeys: rawEnv.COORDINATOR_API_KEYS ?? "",
     trustedProxies: rawEnv.COORDINATOR_TRUSTED_PROXIES ?? "",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     ethereum: {
       rpcUrl: resolveEthereumRpcUrl(isMainnet ? "mainnet" : "testnet", rawEnv),
       chainId: isMainnet ? 1 : 11_155_111,
@@ -164,6 +169,11 @@ export function loadRelayerConfig(
     nodeEnv: rawEnv.NODE_ENV ?? "development",
     enableMockMode: rawEnv.ENABLE_MOCK_MODE ?? "false",
     debug: rawEnv.DEBUG ?? "false",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     resolverAllowlist: rawEnv.RELAYER_RESOLVER_ADDRESSES,
     rpcTimeoutMs: rawEnv.RELAYER_RPC_TIMEOUT_MS ?? "30000",
     ethereum: {
@@ -273,6 +283,11 @@ export function loadResolverConfig(
     pollIntervalMs: rawEnv.RESOLVER_POLL_INTERVAL_MS ?? "15000",
     coordinatorUrl: rawEnv.COORDINATOR_URL ?? "http://localhost:3001",
     logLevel: rawEnv.LOG_LEVEL ?? "info",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     ethereum: {
       rpcUrl: resolveEthereumRpcUrl(isMainnet ? "mainnet" : "testnet", rawEnv),
       chainId: isMainnet ? 1 : 11_155_111,
