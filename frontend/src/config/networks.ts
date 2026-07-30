@@ -1,30 +1,16 @@
 /**
- * Network Configuration for WaffleFinance
+ * Network Configuration Layer for WaffleFinance
+ *
+ * This layer is responsible for resolving the active blockchain network
+ * configuration (Ethereum + Stellar) based on environment and URL parameters.
+ * It does NOT own API base URLs, feature flags, or route definitions.
  */
 
-import { loadFrontendConfig } from '@wafflefinance/config';
 import { resolveViteMainnetRpcUrl, resolveViteSepoliaRpcUrl } from './rpc-urls';
 
 export type AppNetworkMode = 'mainnet' | 'testnet';
 
-// Central configuration entry point for the frontend dApp
-export const frontendConfig = loadFrontendConfig((import.meta as any).env || {});
-
-/**
- * When false, the dApp is testnet-only. Mainnet toggle shows "Mainnet Coming".
- * Re-enable with VITE_MAINNET_ENABLED=true (post v2 audit / mainnet launch).
- */
-export const isMainnetEnabled = (): boolean => {
-  return frontendConfig.mainnetEnabled;
-};
-
-/** Clamp requested mode when mainnet is temporarily disabled. */
-export const resolveNetworkMode = (requested: AppNetworkMode): AppNetworkMode => {
-  if (requested === 'mainnet' && !isMainnetEnabled()) {
-    return 'testnet';
-  }
-  return requested;
-};
+// ── Network resolution ────────────────────────────────────────────────────────
 
 function readNetworkNameFromEnvOrUrl(): AppNetworkMode {
   let networkName: AppNetworkMode = 'testnet';
@@ -37,10 +23,30 @@ function readNetworkNameFromEnvOrUrl(): AppNetworkMode {
     }
   }
 
-  networkName = frontendConfig.network;
+  const raw = (import.meta as any).env || {};
+  networkName = raw.VITE_NETWORK ?? raw.VITE_NETWORK_MODE ?? 'testnet';
 
   return resolveNetworkMode(networkName);
 }
+
+/** Clamp requested mode when mainnet is temporarily disabled. */
+export const resolveNetworkMode = (requested: AppNetworkMode): AppNetworkMode => {
+  if (requested === 'mainnet' && !isMainnetEnabled()) {
+    return 'testnet';
+  }
+  return requested;
+};
+
+/** When false, the dApp is testnet-only. Mainnet toggle shows "Mainnet Coming". */
+export const isMainnetEnabled = (): boolean => {
+  const raw = (import.meta as any).env || {};
+  return raw.VITE_MAINNET_ENABLED === 'true';
+};
+
+/** True when the resolved network is testnet. */
+export const isTestnet = (): boolean => readNetworkNameFromEnvOrUrl() !== 'mainnet';
+
+// ── Network config types ──────────────────────────────────────────────────────
 
 export interface NetworkConfig {
   id: number;
@@ -66,6 +72,8 @@ export interface StellarNetworkConfig {
   testnet: boolean;
 }
 
+// ── Static network definitions ────────────────────────────────────────────────
+
 export const ETHEREUM_NETWORKS: Record<string, NetworkConfig> = {
   mainnet: {
     id: 1,
@@ -73,7 +81,7 @@ export const ETHEREUM_NETWORKS: Record<string, NetworkConfig> = {
     displayName: 'Ethereum Mainnet',
     rpcUrl: resolveViteMainnetRpcUrl(),
     explorerUrl: 'https://etherscan.io',
-    escrowFactory: '0xa7bCb4EAc8964306F9e3764f67Db6A7af6DdF99A', // 1inch Escrow Factory
+    escrowFactory: '0xa7bCb4EAc8964306F9e3764f67Db6A7af6DdF99A',
     nativeCurrency: {
       name: 'Ether',
       symbol: 'ETH',
@@ -87,7 +95,7 @@ export const ETHEREUM_NETWORKS: Record<string, NetworkConfig> = {
     displayName: 'Sepolia Testnet',
     rpcUrl: resolveViteSepoliaRpcUrl(),
     explorerUrl: 'https://sepolia.etherscan.io',
-    escrowFactory: '0x3f344ACDd17a0c4D21096da895152820f595dc8A', // Testnet HTLC Bridge
+    escrowFactory: '0x3f344ACDd17a0c4D21096da895152820f595dc8A',
     nativeCurrency: {
       name: 'Sepolia Ether',
       symbol: 'SEP',
@@ -132,9 +140,9 @@ export const STELLAR_NETWORKS: Record<string, StellarNetworkConfig> = {
 export const CONTRACT_ADDRESSES = {
   ethereum: {
     mainnet: {
-      htlcBridge: '0x0000000000000000000000000000000000000000', // Will use 1inch escrow instead
-      escrowFactory: '0xa7bcb4eac8964306f9e3764f67db6a7af6ddf99a', // 1inch Escrow Factory
-      testToken: '0xA0b86a33E6441b8bB770AE39aaDC4e75C0f03E6F', // WETH mainnet
+      htlcBridge: '0x0000000000000000000000000000000000000000',
+      escrowFactory: '0xa7bcb4eac8964306f9e3764f67db6a7af6ddf99a',
+      testToken: '0xA0b86a33E6441b8bB770AE39aaDC4e75C0f03E6F',
     },
     sepolia: {
       htlcBridge: '0x3f344ACDd17a0c4D21096da895152820f595dc8A',
@@ -144,10 +152,8 @@ export const CONTRACT_ADDRESSES = {
   },
   stellar: {
     mainnet: {
-      // Stellar uses account addresses, not contract addresses
-      // These should be actual funded accounts for mainnet operations
-      bridgeAccount: 'GCKFBEIYTKP6RSTVVK6FKXKMK7DIS3R6SEWXO5SWH3V7GDPRX2VDKYXB', // Replace with actual mainnet bridge account
-      escrowAccount: 'GCKFBEIYTKP6RSTVVK6FKXKMK7DIS3R6SEWXO5SWH3V7GDPRX2VDKYXB', // Replace with actual mainnet escrow account
+      bridgeAccount: 'GCKFBEIYTKP6RSTVVK6FKXKMK7DIS3R6SEWXO5SWH3V7GDPRX2VDKYXB',
+      escrowAccount: 'GCKFBEIYTKP6RSTVVK6FKXKMK7DIS3R6SEWXO5SWH3V7GDPRX2VDKYXB',
     },
     testnet: {
       bridgeAccount: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
@@ -187,7 +193,8 @@ export const FAUCETS = {
   },
 };
 
-// Environment-based configuration with URL parameter support
+// ── Derived network accessors ─────────────────────────────────────────────────
+
 export const getCurrentNetwork = () => {
   const networkName = readNetworkNameFromEnvOrUrl();
   return {
@@ -205,7 +212,8 @@ export const getContractAddresses = () => {
 };
 
 export const getFaucets = () => {
-  const networkName = (import.meta as any).env?.VITE_NETWORK || 'testnet';
+  const raw = (import.meta as any).env || {};
+  const networkName = raw.VITE_NETWORK || 'testnet';
   if (networkName === 'mainnet') {
     return { ethereum: [], stellar: [] };
   }
@@ -214,5 +222,3 @@ export const getFaucets = () => {
     stellar: FAUCETS.stellar.testnet,
   };
 };
-
-export const isTestnet = () => readNetworkNameFromEnvOrUrl() !== 'mainnet'; 

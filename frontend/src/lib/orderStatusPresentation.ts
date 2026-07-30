@@ -1,5 +1,5 @@
 /**
- * Order status presentation layer (issue #317).
+ * Order status presentation layer (issues #317, #279).
  *
  * This module is the single mapping between the bridge lifecycle's internal
  * state representation and what the user sees. The UI never performs raw
@@ -10,6 +10,11 @@
  * src_locked, dst_locked, etc.) into the normalised `OrderStatus` enum used
  * by the frontend Transaction model. This means the coordinator can move
  * between internal phases without the UI needing to enumerate every state.
+ *
+ * `presentCoordinatorPhase` provides a richer, per-coordinator-state label
+ * and description for surfaces that want to surface the granular lifecycle
+ * step (e.g. a detail panel or tooltip). The coarser `presentOrderStatus` is
+ * still used for badge colours and terminal-state logic.
  */
 
 export type OrderStatus =
@@ -55,22 +60,37 @@ export interface OrderStatusPresentation {
   recoveryMessage?: string;
 }
 
+/**
+ * Granular per-coordinator-state label and description.
+ * Used by detail panels and tooltips that want to show the exact lifecycle
+ * step rather than the coarser badge label.
+ */
+export interface CoordinatorPhasePresentation {
+  /** Short human-readable label for this coordinator state. */
+  stepLabel: string;
+  /** One-sentence explanation of what is happening right now. */
+  stepDescription: string;
+  /** When the user should take action (empty string = no action needed). */
+  userAction: string;
+}
+
 // ── Raw coordinator → normalised OrderStatus ──────────────────────────────────
 
 const COORDINATOR_STATE_MAP: Record<string, OrderStatus> = {
-  announced: 'pending',
-  src_locked: 'pending',
-  dst_locked: 'pending',
+  announced:       'pending',
+  src_locked:      'pending',
+  dst_locked:      'pending',
   secret_revealed: 'pending',
-  processing: 'pending',
-  pending: 'pending',
-  completed: 'completed',
-  confirmed: 'confirmed',
-  cancelled: 'cancelled',
-  failed: 'failed',
-  expired: 'expired',
-  timed_out: 'timed_out',
-  refunded: 'refunded',
+  claim_pending:   'pending',
+  processing:      'pending',
+  pending:         'pending',
+  completed:       'completed',
+  confirmed:       'confirmed',
+  cancelled:       'cancelled',
+  failed:          'failed',
+  expired:         'expired',
+  timed_out:       'timed_out',
+  refunded:        'refunded',
 };
 
 /**
@@ -83,6 +103,131 @@ const COORDINATOR_STATE_MAP: Record<string, OrderStatus> = {
 export function translateCoordinatorState(raw: string): OrderStatus {
   if (!raw || typeof raw !== 'string') return 'pending';
   return COORDINATOR_STATE_MAP[raw.toLowerCase()] ?? 'pending';
+}
+
+// ── Coordinator state → granular UX step ─────────────────────────────────────
+
+/**
+ * Translate a raw coordinator lifecycle state string into a granular step
+ * label and description for detail panels or tooltips.
+ *
+ * This intentionally exposes finer-grained messaging than `presentOrderStatus`
+ * so users can understand exactly where their swap is in the pipeline.
+ */
+export function presentCoordinatorPhase(raw: string): CoordinatorPhasePresentation {
+  const state = raw?.toLowerCase() ?? '';
+
+  switch (state) {
+    case 'announced':
+      return {
+        stepLabel: 'Awaiting source lock',
+        stepDescription:
+          'Your swap has been announced to the coordinator. Waiting for you to lock funds on the source chain.',
+        userAction: 'Lock your funds on the source chain to proceed.',
+      };
+
+    case 'src_locked':
+      return {
+        stepLabel: 'Source locked',
+        stepDescription:
+          'Your funds are locked in the HTLC on the source chain. The resolver is now locking the destination funds.',
+        userAction: '',
+      };
+
+    case 'dst_locked':
+      return {
+        stepLabel: 'Destination locked',
+        stepDescription:
+          'The resolver has locked the destination funds. Waiting for the preimage to be revealed to claim.',
+        userAction: '',
+      };
+
+    case 'secret_revealed':
+      return {
+        stepLabel: 'Secret revealed',
+        stepDescription:
+          'The preimage has been revealed on-chain. Claim transactions are being submitted on both legs.',
+        userAction: '',
+      };
+
+    case 'claim_pending':
+      return {
+        stepLabel: 'Claim in progress',
+        stepDescription:
+          'The claim transaction is pending confirmation on the destination chain.',
+        userAction: '',
+      };
+
+    case 'processing':
+      return {
+        stepLabel: 'Processing',
+        stepDescription:
+          'The coordinator is finalising settlement. Both legs should confirm shortly.',
+        userAction: '',
+      };
+
+    case 'completed':
+      return {
+        stepLabel: 'Completed',
+        stepDescription: 'Both legs have settled successfully. Your swap is complete.',
+        userAction: '',
+      };
+
+    case 'confirmed':
+      return {
+        stepLabel: 'Confirmed',
+        stepDescription:
+          'Settlement has been confirmed on both chains. No further action needed.',
+        userAction: '',
+      };
+
+    case 'cancelled':
+      return {
+        stepLabel: 'Cancelled',
+        stepDescription:
+          'This swap was cancelled before funds were locked on-chain.',
+        userAction: '',
+      };
+
+    case 'failed':
+      return {
+        stepLabel: 'Failed',
+        stepDescription:
+          'An error occurred during processing. If funds were locked you may claim a refund.',
+        userAction: 'Use the Refund action below to reclaim any locked funds.',
+      };
+
+    case 'expired':
+      return {
+        stepLabel: 'Timelock expired',
+        stepDescription:
+          'The HTLC timelock expired before settlement completed. Locked funds are now eligible for refund.',
+        userAction: 'Use the Refund action below to reclaim your locked funds.',
+      };
+
+    case 'timed_out':
+      return {
+        stepLabel: 'Coordinator timed out',
+        stepDescription:
+          'The coordinator did not complete settlement within the expected window. Locked funds can be refunded.',
+        userAction: 'Use the Refund action below to reclaim your locked funds.',
+      };
+
+    case 'refunded':
+      return {
+        stepLabel: 'Refunded',
+        stepDescription: 'Your locked funds have been returned to your source wallet.',
+        userAction: '',
+      };
+
+    default:
+      return {
+        stepLabel: 'Processing',
+        stepDescription:
+          'Transaction is in progress. The coordinator has not reported a final status yet.',
+        userAction: '',
+      };
+  }
 }
 
 // ── OrderStatus → UX presentation ────────────────────────────────────────────
@@ -101,7 +246,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'initiated',
         label: 'Pending',
-        description: 'Your bridge transaction is being processed by the coordinator.',
+        description: 'Your swap is being processed. Waiting for on-chain confirmation across both legs.',
         colorClass: 'text-yellow-400 bg-yellow-500/20',
         iconName: 'clock',
         isTerminal: false,
@@ -111,7 +256,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'completed',
         label: 'Confirmed',
-        description: 'Your bridge transaction has been confirmed on both chains.',
+        description: 'Your swap has been confirmed on both chains. Funds delivered successfully.',
         colorClass: 'text-green-400 bg-green-500/20',
         iconName: 'check-circle',
         isTerminal: true,
@@ -121,7 +266,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'completed',
         label: 'Completed',
-        description: 'Your bridge transaction has been successfully settled.',
+        description: 'Your swap has settled successfully. Destination funds are in your wallet.',
         colorClass: 'text-green-400 bg-green-500/20',
         iconName: 'check-circle',
         isTerminal: true,
@@ -131,7 +276,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'failed',
         label: 'Cancelled',
-        description: 'This bridge transaction was cancelled before settlement.',
+        description: 'This swap was cancelled before any funds were locked on-chain.',
         colorClass: 'text-gray-400 bg-gray-500/20',
         iconName: 'x-circle',
         isTerminal: true,
@@ -141,7 +286,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'failed',
         label: 'Failed',
-        description: 'This transaction encountered an error during processing.',
+        description: 'This swap encountered an error during processing. Locked funds can be reclaimed.',
         colorClass: 'text-red-400 bg-red-500/20',
         iconName: 'x-circle',
         isTerminal: true,
@@ -152,7 +297,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'refunded',
         label: 'Refunded',
-        description: 'Your funds have been returned to your source wallet.',
+        description: 'Your locked funds have been returned to your source wallet.',
         colorClass: 'text-emerald-400 bg-emerald-500/20',
         iconName: 'undo',
         isTerminal: true,
@@ -162,7 +307,7 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'expired',
         label: 'Expired',
-        description: 'The timelock window for this transaction has expired without settlement.',
+        description: 'The HTLC timelock expired without settlement. Your locked funds are ready to refund.',
         colorClass: 'text-orange-400 bg-orange-500/20',
         iconName: 'clock',
         isTerminal: true,
@@ -173,7 +318,8 @@ export function presentOrderStatus(status: OrderStatus): OrderStatusPresentation
       return {
         phase: 'expired',
         label: 'Timed out',
-        description: 'The coordinator did not complete settlement within the expected timelock window.',
+        description:
+          'The coordinator did not complete settlement within the expected timelock window. Use Refund to reclaim locked funds.',
         colorClass: 'text-orange-400 bg-orange-500/20',
         iconName: 'clock',
         isTerminal: true,

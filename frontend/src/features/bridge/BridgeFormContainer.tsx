@@ -8,6 +8,7 @@ import {
 } from '@stellar/stellar-sdk';
 import { classifyRpcError, parseBalanceHex } from '@wafflefinance/sdk/shared-utils';
 import { isTestnet, getCurrentNetwork } from '../../config/networks';
+import { selectApiBaseUrl, selectIsMockDataEnabled } from '../../config/selectors';
 import { parseHtlcReceipt } from '../../lib/parseHtlcReceipt';
 import { sanitizeAmountInput } from '../../lib/sanitizeAmountInput';
 import { usePersistedBridgeDraft } from '../../hooks/usePersistedBridgeDraft';
@@ -28,6 +29,9 @@ import {
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
 import { useRouteDerivedValues } from '../../hooks/useRouteDerivedValues';
+import { useNetworkRouteValidator } from '../../hooks/useNetworkRouteValidator';
+import { useBridgeOrchestration } from '../../hooks/useBridgeOrchestration';
+import { useBridgeErrorHandler } from '../../hooks/useBridgeErrorHandler';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -262,11 +266,8 @@ const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed
 };
 
 const SEPOLIA_CHAIN_ID = '0xaa36a7'; // 11155111 in hex
-const PRODUCTION_API_BASE_URL = 'https://oversync-k36vx.ondigitalocean.app';
-const API_BASE_URL = import.meta.env.PROD
-  ? ''
-  : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
-const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
+const API_BASE_URL = selectApiBaseUrl();
+const ENABLE_MOCK_DATA = selectIsMockDataEnabled();
 
 function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; dstChain: SupportedChain } {
   const parts = dir.split('_to_');
@@ -276,17 +277,30 @@ function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; ds
 }
 
 export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, signStellarTransaction }: BridgeFormProps): React.JSX.Element {
-  const {
-    direction,
-    amount,
-    setDirection,
-    setAmount,
-    clearPersistedDraft,
-  } = usePersistedBridgeDraft({
+  const orchestration = useBridgeOrchestration({
     ethAddress,
     stellarAddress,
     solanaAddress,
   });
+  const { direction, amount, setDirection, setAmount, isSubmitting, setIsSubmitting, orderCreated, setOrderCreated, orderId, setOrderId, statusMessage, setStatusMessage, balance, setBalance, activeQuote, setActiveQuote, fromToken, toToken, walletsReady, unsupportedReasonsByRoute, clearPersistedDraft, wasRestored } = orchestration;
+
+  const routeValidation = useNetworkRouteValidator({
+    direction,
+    ethAddress,
+    stellarAddress,
+    solanaAddress,
+  });
+
+  const errorHandler = useBridgeErrorHandler();
+
+  // Invalidate stale quote and amount when route validation fails after a network/route switch.
+  useEffect(() => {
+    if (!routeValidation.isValid) {
+      setActiveQuote(null);
+      setAmount('');
+      setStatusMessage(routeValidation.reason ?? 'Unsupported route');
+    }
+  }, [routeValidation.isValid, routeValidation.reason, setActiveQuote, setAmount, setStatusMessage]);
   const [networkInfo, setNetworkInfo] = useState(() => {
     const currentNetwork = getCurrentNetwork();
     const isTestnetMode = isTestnet();
@@ -1650,6 +1664,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           </div>
           {validationErrors.route && (
             <p className="mt-1.5 text-xs text-red-300">{validationErrors.route}</p>
+          )}
+          {routeValidation.reason && (
+            <p className="mt-1.5 text-xs text-red-300" role="alert">{routeValidation.reason}</p>
           )}
           {validationErrors.quote && (
             <p className="mt-1.5 text-xs text-amber-300" role="alert">{validationErrors.quote}</p>

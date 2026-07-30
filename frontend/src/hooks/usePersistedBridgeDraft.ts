@@ -56,6 +56,10 @@ interface StoredDraft {
   fingerprint: string;
   /** Epoch ms. */
   savedAt: number;
+  /** Optional conflict marker: if a newer draft was saved elsewhere (e.g. another tab),
+   * this field is incremented. When loading, if the stored conflict count is higher than
+   * the in-memory one, the draft is considered stale and rejected. */
+  conflictCount: number;
 }
 
 interface UsePersistedBridgeDraftParams {
@@ -75,6 +79,8 @@ interface UsePersistedBridgeDraftResult {
   setAmount: Dispatch<SetStateAction<string>>;
   /** Returns true if the loaded value came from persistent storage. */
   wasRestored: boolean;
+  /** True when the loaded draft was rejected because a newer version exists elsewhere. */
+  wasConflictDetected: boolean;
   /** Clear any persisted draft (used by `New Bridge` reset flows). */
   clearPersistedDraft: () => void;
 }
@@ -163,26 +169,32 @@ export function usePersistedBridgeDraft({
   );
 
   // One-shot read on mount so we don't have to keep re-checking storage.
-  const initialRef = useRef<{ direction: BridgeDirection; amount: string; wasRestored: boolean } | null>(null);
+  const initialRef = useRef<{ direction: BridgeDirection; amount: string; wasRestored: boolean; wasConflictDetected: boolean; conflictCount: number } | null>(null);
   if (initialRef.current === null) {
     const stored = readDraft();
+    const inMemoryCount = 0;
     initialRef.current =
       stored && stored.fingerprint === fingerprint
         ? {
             direction: stored.direction,
             amount: stored.amount,
             wasRestored: true,
+            wasConflictDetected: (stored.conflictCount ?? 0) > inMemoryCount,
+            conflictCount: stored.conflictCount ?? 0,
           }
         : {
             direction: DEFAULT_DIRECTION,
-            amount: "",
+            amount: '',
             wasRestored: false,
+            wasConflictDetected: false,
+            conflictCount: 0,
           };
   }
 
   const [direction, setDirectionState] = useState<BridgeDirection>(initialRef.current.direction);
   const [amount, setAmountState] = useState<string>(initialRef.current.amount);
   const [wasRestored, setWasRestored] = useState<boolean>(initialRef.current.wasRestored);
+  const [conflictCount, setConflictCount] = useState<number>(initialRef.current.conflictCount);
 
   // `isFirstRender` guards the persistence effect below. We don't want to
   // write a fresh default-value entry on every initial mount — a user that
@@ -214,8 +226,10 @@ export function usePersistedBridgeDraft({
       isFirstRender.current = false;
       return;
     }
-    writeDraft({ direction, amount, fingerprint, savedAt: Date.now() });
-  }, [direction, amount, fingerprint]);
+    const nextCount = conflictCount + 1;
+    setConflictCount(nextCount);
+    writeDraft({ direction, amount, fingerprint, savedAt: Date.now(), conflictCount: nextCount });
+  }, [direction, amount, fingerprint, conflictCount]);
 
   const clearPersistedDraft = useCallback(() => {
     clearDraft();
@@ -230,6 +244,7 @@ export function usePersistedBridgeDraft({
     setDirection: setDirectionState,
     setAmount: setAmountState,
     wasRestored,
+    wasConflictDetected: initialRef.current?.wasConflictDetected ?? false,
     clearPersistedDraft,
   };
 }

@@ -72,6 +72,7 @@ export const coordinatorConfigSchema = z.object({
     .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined)),
   apiKeys: z.string().default(""),
   trustedProxies: z.string().default(""),
+  featureFlags: featureFlagsSchema.default({}),
   ethereum: z.object({
     rpcUrl: z.string().url(),
     chainId: z.number().int(),
@@ -107,6 +108,7 @@ export const relayerConfigSchema = z.object({
   nodeEnv: z.string().default("development"),
   enableMockMode: z.coerce.boolean().default(false),
   debug: z.coerce.boolean().default(false),
+  featureFlags: featureFlagsSchema.default({}),
   resolverAllowlist: z
     .string()
     .optional()
@@ -165,6 +167,7 @@ export const resolverConfigSchema = z.object({
   pollIntervalMs: z.coerce.number().int().positive().default(15000),
   coordinatorUrl: z.string().url().default("http://localhost:3001"),
   logLevel: logLevelSchema,
+  featureFlags: featureFlagsSchema.default({}),
   ethereum: z.object({
     rpcUrl: z.string().url(),
     chainId: z.number().int(),
@@ -214,6 +217,22 @@ export const frontendConfigSchema = z.object({
   infuraApiKey: z.string().optional(),
   oneinchApiKey: z.string().optional(),
   apiBaseUrl: z.string().url().default("http://localhost:3001"),
+  featureFlags: z
+    .object({
+      solanaSimulationMode: z.coerce.boolean().default(false),
+      sorobanEarlySupport: z.coerce.boolean().default(false),
+      experimentalUiRoutes: z.coerce.boolean().default(false),
+    })
+    .default({}),
 });
 
 export type FrontendConfig = z.infer<typeof frontendConfigSchema>;
+
+// Shared feature flags schema (used by coordinator/relayer/resolver)
+export const featureFlagsSchema = z.object({
+  solanaSimulationMode: z.coerce.boolean().default(false),
+  sorobanEarlySupport: z.coerce.boolean().default(false),
+  experimentalUiRoutes: z.coerce.boolean().default(false),
+});
+
+export type FeatureFlags = z.infer<typeof featureFlagsSchema>;

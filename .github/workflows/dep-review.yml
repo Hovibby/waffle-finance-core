@@ -1,0 +1,162 @@
+name: Dependency Review
+
+# Runs on every pull-request that touches the dependency graph.
+# Purpose: surface vulnerable, licenced-improperly, or policy-violating
+# packages before they land on main.
+#
+# Three complementary checks run in parallel:
+#
+#   1. dependency-review  — GitHub's built-in action, compares the old and new
+#                           lock-file snapshots and blocks PRs that introduce
+#                           known CVEs or forbidden licences.
+#
+#   2. validate-deps      — workspace-local script (scripts/check-dep-versions.mjs)
+#                           enforces the cross-package version-alignment rules
+#                           defined in docs/DEPENDENCY_POLICY.md.
+#
+#   3. label-critical     — labels PRs that touch audit-critical packages
+#                           (@solana/web3.js, @stellar/stellar-sdk, viem, ethers,
+#                           @openzeppelin/contracts) so reviewers know to apply
+#                           the §4.3 major-upgrade checklist.
+#
+# See docs/DEPENDENCY_POLICY.md for the full policy and upgrade procedures.
+
+on:
+  pull_request:
+    # Run whenever the lockfile or any package manifest changes.
+    paths:
+      - 'pnpm-lock.yaml'
+      - '**/package.json'
+      - 'soroban/Cargo.toml'
+      - 'soroban/Cargo.lock'
+      - '.github/workflows/dep-review.yml'
+
+permissions:
+  contents: read
+  pull-requests: write   # needed for the labelling step
+
+jobs:
+  # ── 1. GitHub dependency-review action ──────────────────────────────────────
+  dependency-review:
+    name: Dependency review (CVE + licence scan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Block on any vulnerability with a CVSS score ≥ 7.0 (High / Critical).
+          # Moderate issues are surfaced as warnings but do not block merge.
+          fail-on-severity: high
+
+          # Only GPL-family licences are forbidden in a commercial product context.
+          # MIT, Apache-2.0, ISC, BSD-*, 0BSD, CC0-1.0 are all acceptable.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.0, LGPL-2.1, LGPL-3.0
+
+          # Surface the full vulnerability report as a PR comment so reviewers
+          # see the detail without digging into the Action logs.
+          comment-summary-in-pr: always
+
+          # Allow specific advisories to be suppressed here (add GHSA IDs when
+          # a known false-positive or accepted risk has been reviewed).
+          # allow-ghsas: GHSA-xxxx-xxxx-xxxx
+
+  # ── 2. Workspace dep-version alignment ──────────────────────────────────────
+  validate-deps:
+    name: Validate dep versions (policy alignment)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The validator is a dependency-free Node script — no install needed.
+      - name: Run dep-version validator
+        run: node scripts/check-dep-versions.mjs
+
+  # ── 3. Label PRs that touch audit-critical packages ────────────────────────
+  label-critical-deps:
+    name: Label critical-dependency changes
+    runs-on: ubuntu-latest
+    # Only label when the lockfile actually changed — package.json edits alone
+    # do not necessarily change the resolved graph.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect critical-package changes
+        id: detect
+        run: |
+          # Compare the base branch lockfile to the PR branch lockfile.
+          # The presence of any of the critical package names in the diff
+          # is sufficient to trigger the "critical-deps" label.
+          git fetch origin ${{ github.base_ref }} --depth=1 2>/dev/null || true
+
+          CRITICAL_PACKAGES=(
+            "@solana/web3.js"
+            "@stellar/stellar-sdk"
+            "@stellar/freighter-api"
+            "viem"
+            "ethers"
+            "@openzeppelin/contracts"
+            "tweetnacl"
+            "noble-curves"
+            "@noble/curves"
+            "@noble/hashes"
+          )
+
+          CHANGED=false
+          for pkg in "${CRITICAL_PACKAGES[@]}"; do
+            if git diff "origin/${{ github.base_ref }}" -- pnpm-lock.yaml \
+                | grep -q "\"${pkg}\""; then
+              echo "Critical package touched: ${pkg}"
+              CHANGED=true
+            fi
+          done
+
+          echo "critical_changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Add critical-deps label
+        if: steps.detect.outputs.critical_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --add-label "critical-deps" \
+            --repo ${{ github.repository }} \
+          || echo "Label may already exist or gh not available — skipping"
+
+      - name: Post review-required comment
+        if: steps.detect.outputs.critical_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ⚠️ Critical dependency change detected',
+                '',
+                'This PR modifies one or more **audit-critical packages**',
+                '(`@solana/web3.js`, `@stellar/stellar-sdk`, `viem`, `ethers`,',
+                '`@openzeppelin/contracts`, or a cryptography primitive).',
+                '',
+                'Before merging, verify the following per',
+                '[docs/DEPENDENCY_POLICY.md §4.3](../blob/main/docs/DEPENDENCY_POLICY.md#43-major-upgrades):',
+                '',
+                '- [ ] Changelog reviewed for breaking changes or security advisories',
+                '- [ ] All affected packages updated to the same version in one PR',
+                '- [ ] Full test suite passes (`pnpm test`)',
+                '- [ ] Two reviewers have approved (one familiar with the package changelog)',
+                '- [ ] `docs/DEPENDENCY_POLICY.md` §2 tables updated if the range changed',
+                '',
+                '_This comment is posted automatically by the dep-review workflow._',
+              ].join('\n'),
+            });

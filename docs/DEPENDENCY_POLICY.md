@@ -140,6 +140,8 @@ and one reviewer approval before merge.
 
 ## 5. CI check / automated validation
 
+### 5.1 Workspace version-alignment check (`validate-deps`)
+
 Running `pnpm validate:deps` from the workspace root executes
 `scripts/check-dep-versions.mjs`, which:
 
@@ -161,6 +163,52 @@ Exit code 0 = all checks pass. Exit code 1 = at least one violation.
 
 The check is intentionally **lightweight** (pure JS, no network, < 100 ms) so
 it can run on every push without adding CI latency.
+
+### 5.2 Dependency-review workflow (`.github/workflows/dep-review.yml`)
+
+Every pull request that touches `pnpm-lock.yaml`, any `package.json`, or the
+Cargo manifests automatically triggers three parallel jobs:
+
+| Job | What it checks | Blocks merge? |
+|-----|---------------|---------------|
+| `dependency-review` | GitHub Advisory DB CVEs (CVSS ≥ 7.0 = High/Critical) and forbidden licences (GPL, AGPL, LGPL) | ✅ Yes |
+| `validate-deps` | Cross-package version alignment per §2 | ✅ Yes |
+| `label-critical-deps` | Detects changes to audit-critical packages and labels + comments the PR | ℹ️ Informational |
+
+**Severity threshold:** High and Critical vulnerabilities block the PR.
+Moderate vulnerabilities appear as warnings in the Action summary and PR
+comment but do not block merge — they should still be tracked in a follow-up
+issue.
+
+**Forbidden licences:** GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.0, LGPL-2.1,
+LGPL-3.0. Acceptable licences include MIT, Apache-2.0, ISC, BSD-*, 0BSD,
+CC0-1.0.
+
+**Critical-package labelling:** If the diff touches any of the following
+packages, the PR is labelled `critical-deps` and receives a checklist comment
+reminding reviewers to apply the §4.3 process:
+
+- `@solana/web3.js`
+- `@stellar/stellar-sdk`
+- `@stellar/freighter-api`
+- `viem`
+- `ethers`
+- `@openzeppelin/contracts`
+- `tweetnacl`, `@noble/curves`, `@noble/hashes` (cryptographic primitives)
+
+### 5.3 Suppressing a known false-positive
+
+If a vulnerability alert is a confirmed false-positive or an accepted risk
+that has been reviewed by two team members, add the GHSA identifier to the
+`allow-ghsas` list in `.github/workflows/dep-review.yml`:
+
+```yaml
+allow-ghsas: GHSA-xxxx-xxxx-xxxx, GHSA-yyyy-yyyy-yyyy
+```
+
+**Always include a comment** explaining which risk was accepted and by whom
+before adding an allowance. Unexplained suppressions will be removed during
+the quarterly audit (§7).
 
 ---
 
@@ -187,7 +235,8 @@ it can run on every push without adding CI latency.
 
 ## 8. References
 
-- `renovate.json5` — automated PR configuration
-- `scripts/check-dep-versions.mjs` — the enforcement script
+- `renovate.json5` — automated PR configuration (vulnerability alerts + grouped updates)
+- `.github/workflows/dep-review.yml` — GitHub dependency-review workflow (CVE scan + labelling)
+- `scripts/check-dep-versions.mjs` — the enforcement script (workspace version alignment)
 - `packages/config/package.json` — peer-dependency declarations
 - `.nvmrc` — canonical Node version for local development

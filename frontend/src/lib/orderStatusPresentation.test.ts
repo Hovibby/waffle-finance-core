@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   presentOrderStatus,
+  presentCoordinatorPhase,
   translateCoordinatorState,
   type OrderStatus,
   type UxPhase,
@@ -137,6 +138,38 @@ describe('presentOrderStatus — label text', () => {
   });
 });
 
+// ── Descriptions contain meaningful content ───────────────────────────────────
+
+describe('presentOrderStatus — description quality', () => {
+  it('pending description mentions on-chain confirmation', () => {
+    expect(presentOrderStatus('pending').description).toMatch(/on-chain|confirmation/i);
+  });
+
+  it('expired description mentions timelock', () => {
+    expect(presentOrderStatus('expired').description).toMatch(/timelock/i);
+  });
+
+  it('timed_out description mentions coordinator and refund', () => {
+    const p = presentOrderStatus('timed_out');
+    expect(p.description).toMatch(/coordinator|timelock/i);
+  });
+
+  it('failed description mentions locked funds or refund', () => {
+    const p = presentOrderStatus('failed');
+    expect(p.description).toMatch(/locked|refund/i);
+  });
+
+  it('completed description mentions destination funds or wallet', () => {
+    const p = presentOrderStatus('completed');
+    expect(p.description).toMatch(/wallet|settled|destination/i);
+  });
+
+  it('cancelled description mentions no funds locked', () => {
+    const p = presentOrderStatus('cancelled');
+    expect(p.description).toMatch(/cancel|locked/i);
+  });
+});
+
 // ── translateCoordinatorState ─────────────────────────────────────────────────
 
 describe('translateCoordinatorState', () => {
@@ -145,6 +178,7 @@ describe('translateCoordinatorState', () => {
     ['src_locked',      'pending'],
     ['dst_locked',      'pending'],
     ['secret_revealed', 'pending'],
+    ['claim_pending',   'pending'],
     ['processing',      'pending'],
     ['completed',       'completed'],
     ['confirmed',       'confirmed'],
@@ -178,11 +212,96 @@ describe('translateCoordinatorState', () => {
   });
 });
 
+// ── presentCoordinatorPhase — granular per-state messaging ────────────────────
+
+describe('presentCoordinatorPhase — stepLabel completeness', () => {
+  const states = [
+    'announced',
+    'src_locked',
+    'dst_locked',
+    'secret_revealed',
+    'claim_pending',
+    'processing',
+    'completed',
+    'confirmed',
+    'cancelled',
+    'failed',
+    'expired',
+    'timed_out',
+    'refunded',
+  ];
+
+  it.each(states)('returns a non-empty stepLabel for "%s"', (state) => {
+    const p = presentCoordinatorPhase(state);
+    expect(p.stepLabel).toBeTruthy();
+    expect(p.stepDescription).toBeTruthy();
+  });
+});
+
+describe('presentCoordinatorPhase — stepDescription content', () => {
+  it('"announced" tells user to lock source funds', () => {
+    const p = presentCoordinatorPhase('announced');
+    expect(p.stepDescription).toMatch(/lock|funds|source/i);
+    expect(p.userAction).toMatch(/lock/i);
+  });
+
+  it('"src_locked" says source funds are locked', () => {
+    const p = presentCoordinatorPhase('src_locked');
+    expect(p.stepDescription).toMatch(/locked|source/i);
+    expect(p.userAction).toBe('');
+  });
+
+  it('"dst_locked" mentions destination funds locked', () => {
+    const p = presentCoordinatorPhase('dst_locked');
+    expect(p.stepDescription).toMatch(/destination|locked/i);
+    expect(p.userAction).toBe('');
+  });
+
+  it('"secret_revealed" mentions preimage', () => {
+    const p = presentCoordinatorPhase('secret_revealed');
+    expect(p.stepDescription).toMatch(/preimage/i);
+    expect(p.userAction).toBe('');
+  });
+
+  it('"claim_pending" mentions claim transaction', () => {
+    const p = presentCoordinatorPhase('claim_pending');
+    expect(p.stepDescription).toMatch(/claim/i);
+    expect(p.userAction).toBe('');
+  });
+
+  it('"failed" provides a userAction pointing to refund', () => {
+    const p = presentCoordinatorPhase('failed');
+    expect(p.userAction).toMatch(/refund/i);
+  });
+
+  it('"expired" provides a userAction pointing to refund', () => {
+    const p = presentCoordinatorPhase('expired');
+    expect(p.userAction).toMatch(/refund/i);
+  });
+
+  it('"timed_out" provides a userAction pointing to refund', () => {
+    const p = presentCoordinatorPhase('timed_out');
+    expect(p.userAction).toMatch(/refund/i);
+  });
+
+  it('terminal success states have empty userAction', () => {
+    expect(presentCoordinatorPhase('completed').userAction).toBe('');
+    expect(presentCoordinatorPhase('confirmed').userAction).toBe('');
+    expect(presentCoordinatorPhase('refunded').userAction).toBe('');
+    expect(presentCoordinatorPhase('cancelled').userAction).toBe('');
+  });
+
+  it('returns a sensible fallback for unknown states', () => {
+    const p = presentCoordinatorPhase('some_future_state');
+    expect(p.stepLabel).toBeTruthy();
+    expect(p.stepDescription).toBeTruthy();
+  });
+});
+
 // ── Degraded / partial data resilience ───────────────────────────────────────
 
 describe('presentOrderStatus — degraded data resilience', () => {
   it('does not throw when called with a cast unknown status', () => {
-    // Simulates a future coordinator state the frontend has not seen before.
     const unknownStatus = 'some_future_state' as OrderStatus;
     expect(() => presentOrderStatus(unknownStatus)).not.toThrow();
   });

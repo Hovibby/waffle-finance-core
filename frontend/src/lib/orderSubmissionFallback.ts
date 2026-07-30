@@ -50,6 +50,12 @@ export type OrderSubmissionCode =
   | 'receipt_timeout'
   /** The on-chain transaction was included but reverted (status 0x0). */
   | 'tx_reverted'
+  /** Quote fetch failed or returned malformed data. */
+  | 'quote_failure'
+  /** Server returned an unrecognized response shape. */
+  | 'unrecognized_response'
+  /** Order state mismatch during reconciliation. */
+  | 'reconciliation_failure'
   /** Any other, unclassified error. */
   | 'unknown_error';
 
@@ -536,4 +542,34 @@ function extractMessage(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+export function classifyQuoteError(err: unknown): OrderSubmissionFailure {
+  const message = extractMessage(err);
+  return failure(
+    'quote_failure',
+    `Quote fetch failed: ${message}`,
+    true,
+    ['retry_submission', 'wait_and_retry'],
+  );
+}
+
+export function classifyReconciliationError(err: unknown): OrderSubmissionFailure {
+  const message = extractMessage(err);
+  return failure(
+    'reconciliation_failure',
+    `Order state mismatch: ${message}`,
+    false,
+    ['contact_support'],
+  );
+}
+
+export function classifyUnrecognizedResponse(err: unknown): OrderSubmissionFailure {
+  const message = extractMessage(err);
+  return failure(
+    'unrecognized_response',
+    `Unrecognized server response: ${message}`,
+    true,
+    ['retry_submission', 'wait_and_retry'],
+  );
 }

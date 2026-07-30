@@ -181,11 +181,43 @@ export function useSolanaWallet() {
         })
       );
     } catch (err: any) {
-      setError(
-        'phantom_connect_failed',
-        err?.message ?? 'Phantom connection failed',
-        'Check the Phantom popup. If you denied access, approve it and retry.'
-      );
+      // ── Wallet-locked diagnostic ──────────────────────────────────────────
+      // Phantom emits a "Wallet is locked" message when the user has not
+      // unlocked the extension. We surface a dedicated error code so the UI
+      // can render a targeted recovery hint.
+      const isLocked =
+        err?.message?.toLowerCase().includes('locked') ||
+        err?.message?.toLowerCase().includes('wallet is locked');
+
+      // ── Network mismatch diagnostic ───────────────────────────────────────
+      // Phantom exposes a `network` property; "mainnet-beta" is production
+      // Solana. In testnet/devnet mode we expect "devnet".
+      const expectedNetwork =
+        (import.meta as any).env?.VITE_NETWORK_MODE === 'mainnet' ? 'mainnet-beta' : 'devnet';
+      const providerNetwork = (provider as any)?.network;
+      const isNetworkMismatch =
+        providerNetwork &&
+        providerNetwork !== expectedNetwork;
+
+      if (isLocked) {
+        setError(
+          'wallet_locked',
+          'Phantom is locked. Please unlock it and try again.',
+          'Open Phantom, enter your password to unlock, then retry.',
+        );
+      } else if (isNetworkMismatch) {
+        setError(
+          'network_mismatch',
+          `Phantom is connected to "${providerNetwork}" but this app expects "${expectedNetwork}".`,
+          `Switch Phantom to ${expectedNetwork} in Settings → Network and retry.`,
+        );
+      } else {
+        setError(
+          'phantom_connect_failed',
+          err?.message ?? 'Phantom connection failed',
+          'Check the Phantom popup. If you denied access, approve it and retry.',
+        );
+      }
     }
   }, [setError]);
 
