@@ -145,18 +145,7 @@ export const FEATURE_FLAG_REGISTRY = {
  * to the registry automatically extends this type.
  */
 export type FeatureFlagSet = Readonly<{
-  /** Enable the testnet faucet UI. */
-  faucetEnabled: boolean;
-  /** Enable the transaction history stream UI. */
-  historyStreamEnabled: boolean;
-  /** Enable the refund dialog flow. */
-  refundFlowEnabled: boolean;
-  /** Enable Solana bridge routes. */
-  solanaRoutesEnabled: boolean;
-  /** Enable the intro animation on first visit. */
-  introAnimationEnabled: boolean;
-  /** Enable the dark veil background effect. */
-  darkVeilEnabled: boolean;
+  [K in keyof typeof FEATURE_FLAG_REGISTRY]: boolean;
 }>;
 
 /** All valid flag key strings. */
