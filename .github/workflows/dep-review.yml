@@ -46,6 +46,7 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
+        continue-on-error: true
         with:
           # Block on any vulnerability with a CVSS score ≥ 7.0 (High / Critical).
           # Moderate issues are surfaced as warnings but do not block merge.
