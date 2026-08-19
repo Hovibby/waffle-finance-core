@@ -205,7 +205,26 @@ async function main(): Promise<void> {
 
   const repo = new OrdersRepository(db);
   const auditRepo = new AuditRepository(db);
-  const orders = new OrderService(repo, log, { auditRepo });
+
+  // ── SSE Broker ────────────────────────────────────────────────────────────
+  let sseBroker: SseBroker | undefined;
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl) {
+    log.info({ redisUrl: redisUrl.replace(/\/\/.*@/, "//***@") }, "SSE: Redis URL found — creating multi-instance adapter");
+    try {
+      const redisAdapter = await createRedisAdapter(redisUrl, log);
+      sseBroker = new SseBroker({ redisAdapter });
+      log.info("SSE broker started in multi-instance mode (Redis Pub/Sub)");
+    } catch (err) {
+      log.warn({ err }, "SSE: Redis adapter creation failed — falling back to single-instance mode");
+      sseBroker = new SseBroker();
+    }
+  } else {
+    sseBroker = new SseBroker();
+    log.info("SSE broker started in single-instance mode (no REDIS_URL)");
+  }
+
+  const orders = new OrderService(repo, log, { auditRepo, sseBroker });
   const secrets = new SecretService(orders, log, cfg.secretStorageKey ?? undefined);
   const quotes = new QuoteService(log);
 
@@ -301,6 +320,7 @@ async function main(): Promise<void> {
     secrets,
     quotes,
     auditRepo,
+    sseBroker,
     getReconciliationStatus: () => reconciler.getStatus(),
     getReadinessChecks: createReadinessChecks({
       cfg,
@@ -499,6 +519,9 @@ async function main(): Promise<void> {
       .catch(() => {
         /* non-fatal */
       });
+
+    // Gracefully close all open SSE streams before stopping other services
+    sseBroker?.shutdown();
 
     // Stop the maintenance scheduler first so no new jobs are enqueued
     // after we begin draining.
