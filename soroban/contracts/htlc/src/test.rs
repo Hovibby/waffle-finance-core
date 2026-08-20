@@ -2351,3 +2351,376 @@ fn refund_after_claim_is_rejected_as_not_refundable() {
         "refund after claim must be rejected"
     );
 }
+
+// =====================================================================
+// Order metadata: version, asset classification, timestamps (#500)
+// =====================================================================
+
+#[test]
+fn order_version_field_is_1_for_new_orders() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x50u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.version, 1,
+        "newly created orders must carry version=1 for upgrade-safe deserialization");
+}
+
+#[test]
+fn order_created_at_is_recorded_and_finalised_at_is_zero_while_funded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let now = env.ledger().timestamp();
+    let preimage = Bytes::from_array(&env, &[0x51u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.created_at, now, "created_at must equal the ledger timestamp at creation");
+    assert_eq!(order.finalised_at, 0, "finalised_at must be 0 while order is Funded");
+}
+
+#[test]
+fn finalised_at_is_set_on_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x52u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    // Advance time so finalised_at differs from created_at.
+    advance_ledger(&env, 100);
+    let claim_time = env.ledger().timestamp();
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.finalised_at, claim_time,
+        "finalised_at must be set to the ledger timestamp at the moment of claim");
+    assert_eq!(order.status, OrderStatus::Claimed);
+}
+
+#[test]
+fn finalised_at_is_set_on_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x53u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    let refund_time = env.ledger().timestamp();
+    let cleaner = Address::generate(&env);
+    htlc.refund_order(&order_id, &cleaner);
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.finalised_at, refund_time,
+        "finalised_at must be set to the ledger timestamp at refund");
+    assert_eq!(order.status, OrderStatus::Refunded);
+}
+
+#[test]
+fn asset_classified_as_token_when_no_native_token_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x54u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token,
+        "asset must be classified as Token when no native token is registered");
+}
+
+#[test]
+fn asset_classified_as_native_when_native_token_matches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Register this SAC as the native token address.
+    htlc.set_native_token(&asset);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x55u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native,
+        "asset must be classified as Native when its address matches the registered native token");
+}
+
+#[test]
+fn asset_classified_as_token_after_native_token_cleared() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Set then clear the native token binding.
+    htlc.set_native_token(&asset);
+    htlc.clear_native_token();
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x56u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token,
+        "asset must fall back to Token after the native token binding is cleared");
+}
+
+#[test]
+fn create_order_with_htlc_contract_as_asset_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let preimage = Bytes::from_array(&env, &[0x57u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    // Using the HTLC contract's own address as the asset must be rejected before
+    // any token transfer, as it would silently succeed with no external balance change.
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &htlc.address,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAsset.into(),
+        "using the HTLC contract itself as the asset must be rejected with InvalidAsset");
+}
+
+#[test]
+fn order_id_increments_monotonically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x58u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let id1 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+    let id2 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+    let id3 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
+    assert_eq!(id3, 3);
+    assert_eq!(htlc.next_order_id(), 4,
+        "next_order_id must be one ahead of the last issued id");
+}
+
+#[test]
+fn extend_order_ttl_on_claimed_order_restores_finalised_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x59u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+    // Erode some TTL to make the re-extension observable.
+    advance_sequence(&env, 100_000);
+    assert!(order_ttl(&env, &htlc, order_id) < FINALISED_ORDER_TTL_LEDGERS);
+
+    htlc.extend_order_ttl(&order_id);
+    assert_eq!(order_ttl(&env, &htlc, order_id), FINALISED_ORDER_TTL_LEDGERS,
+        "extend_order_ttl on a claimed order must restore the finalised TTL");
+}
+
+#[test]
+fn extend_order_ttl_on_refunded_order_restores_finalised_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x5au8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    let cleaner = Address::generate(&env);
+    htlc.refund_order(&order_id, &cleaner);
+    advance_sequence(&env, 100_000);
+    assert!(order_ttl(&env, &htlc, order_id) < FINALISED_ORDER_TTL_LEDGERS);
+
+    htlc.extend_order_ttl(&order_id);
+    assert_eq!(order_ttl(&env, &htlc, order_id), FINALISED_ORDER_TTL_LEDGERS,
+        "extend_order_ttl on a refunded order must restore the finalised TTL");
+}
+
+#[test]
+fn create_order_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let preimage = Bytes::from_array(&env, &[0x5bu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &0i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAmount.into(),
+        "create_order with amount=0 must be rejected");
+}
+
+#[test]
+fn create_order_negative_safety_deposit_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let preimage = Bytes::from_array(&env, &[0x5cu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &(-1i128), &hashlock, &600u64,
+    );
+    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAmount.into(),
+        "create_order with negative safety_deposit must be rejected");
+}
+
+#[test]
+fn preimage_is_stored_after_claim() {
+    // Validate that the revealed preimage is persisted in the order record
+    // so off-chain indexers can verify the hashlock opening without re-hashing.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x5du8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    // Before claim, preimage is empty.
+    let order_before = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order_before.preimage.len(), 0,
+        "preimage must be empty before claim");
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    let order_after = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order_after.preimage, preimage,
+        "revealed preimage must be stored in the order record after claim");
+}
