@@ -1444,6 +1444,9 @@ fn multiple_slash_events_cumulate_total_slashed() {
     sac.mint(&r, &stake);
     registry.register(&r, &stake);
 
+    // Advance time so last_slash_at is non-zero (Soroban test env starts at timestamp 0).
+    advance_time(&env, 1000);
+
     let s1 = min_stake;
     let s2 = 50_0000000i128;
     let s3 = 25_0000000i128;
@@ -1538,9 +1541,10 @@ fn full_lifecycle_slash_inactive_exit_and_reregister() {
     registry.request_unregister(&r);
     advance_time(&env, PERIOD);
     let remaining = registry.get(&r).unwrap().stake;
+    let balance_before = token.balance(&r);
     registry.withdraw_stake(&r);
 
-    assert_eq!(token.balance(&r), remaining);
+    assert_eq!(token.balance(&r), balance_before + remaining);
     assert!(registry.get(&r).is_none(), "entry must be removed after withdraw_stake");
 
     // Re-register cleanly with a fresh stake.
