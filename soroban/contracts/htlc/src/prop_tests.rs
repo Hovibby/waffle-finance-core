@@ -78,11 +78,11 @@ proptest! {
                     // error-escalation path poisons shared state even when the
                     // unwind is caught.
                     match htlc_client.try_create_order(&sender, &beneficiary, &sender, &asset, &amount, &safety, &hashlock, &timelock) {
-                        Ok(id) => {
+                        Ok(Ok(id)) => {
                             order_ids.push(Some(id));
                             preimages.push(pre.clone());
                         }
-                        Err(_) => {
+                        _ => {
                             order_ids.push(None);
                             preimages.push(Bytes::new(&env));
                         }
