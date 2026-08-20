@@ -11,6 +11,9 @@
   },
   "dependencies": {
     "@wafflefinance/sdk": "workspace:*",
+    "@stellar/stellar-sdk": "^13.3.0",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^6.0.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {
