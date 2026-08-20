@@ -54,6 +54,11 @@ proptest! {
         let mut accounts: Vec<Address> = Vec::new();
         let mut preimages: Vec<Bytes> = Vec::new();
         let mut order_ids: Vec<Option<u64>> = Vec::new();
+        // Absolute expiry timestamp per order. soroban-env-host escalates
+        // Error::NotExpired to a host panic that bypasses catch_unwind and
+        // leaves the Env in an inconsistent state, so we guard refund calls
+        // with an explicit timestamp check instead of relying on catch_unwind.
+        let mut order_expiries: Vec<u64> = Vec::new();
 
         // Seed some accounts
         for _ in 0..6 {
@@ -78,10 +83,12 @@ proptest! {
                         Ok(id) => {
                             order_ids.push(Some(id));
                             preimages.push(pre.clone());
+                            order_expiries.push(env.ledger().timestamp() + timelock);
                         }
                         Err(_) => {
                             order_ids.push(None);
                             preimages.push(Bytes::new(&env));
+                            order_expiries.push(0);
                         }
                     }
                 }
@@ -97,8 +104,11 @@ proptest! {
                 Action::Refund { order_idx } => {
                     if let Some(id_opt) = order_ids.get(order_idx) {
                         if let Some(id) = id_opt {
-                            let caller = accounts[(env.ledger().sequence() as usize + 3) % accounts.len()].clone();
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.refund_order(id, &caller)));
+                            let expiry = order_expiries.get(order_idx).copied().unwrap_or(u64::MAX);
+                            if env.ledger().timestamp() > expiry {
+                                let caller = accounts[(env.ledger().sequence() as usize + 3) % accounts.len()].clone();
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.refund_order(id, &caller)));
+                            }
                         }
                     }
                 }
