@@ -54,11 +54,6 @@ proptest! {
         let mut accounts: Vec<Address> = Vec::new();
         let mut preimages: Vec<Bytes> = Vec::new();
         let mut order_ids: Vec<Option<u64>> = Vec::new();
-        // Absolute expiry timestamp per order. soroban-env-host escalates
-        // Error::NotExpired to a host panic that bypasses catch_unwind and
-        // leaves the Env in an inconsistent state, so we guard refund calls
-        // with an explicit timestamp check instead of relying on catch_unwind.
-        let mut order_expiries: Vec<u64> = Vec::new();
 
         // Seed some accounts
         for _ in 0..6 {
@@ -77,18 +72,19 @@ proptest! {
                     let beneficiary = accounts[((env.ledger().sequence() as usize) + 1) % accounts.len()].clone();
                     let pre = Bytes::from_array(&env, &[42u8; 32]);
                     let hashlock = BytesN::<32>::from(env.crypto().sha256(&pre));
-                    // attempt create_order, ignore panics
-                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.create_order(&sender, &beneficiary, &sender, &asset, &amount, &safety, &hashlock, &timelock)));
-                    match res {
+                    // Use try_* variants so errors are returned as Result rather
+                    // than panicking.  The panicking variants + catch_unwind
+                    // corrupt the Env in soroban-env-host ≥ 22 because the host's
+                    // error-escalation path poisons shared state even when the
+                    // unwind is caught.
+                    match htlc_client.try_create_order(&sender, &beneficiary, &sender, &asset, &amount, &safety, &hashlock, &timelock) {
                         Ok(id) => {
                             order_ids.push(Some(id));
                             preimages.push(pre.clone());
-                            order_expiries.push(env.ledger().timestamp() + timelock);
                         }
                         Err(_) => {
                             order_ids.push(None);
                             preimages.push(Bytes::new(&env));
-                            order_expiries.push(0);
                         }
                     }
                 }
@@ -97,18 +93,15 @@ proptest! {
                         if let Some(id) = id_opt {
                             let caller = accounts[(env.ledger().sequence() as usize + 2) % accounts.len()].clone();
                             let pre = if use_correct_preimage { preimages[order_idx].clone() } else { Bytes::from_array(&env, &[7u8; 32]) };
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.claim_order(id, &pre, &caller)));
+                            let _ = htlc_client.try_claim_order(id, &pre, &caller);
                         }
                     }
                 }
                 Action::Refund { order_idx } => {
                     if let Some(id_opt) = order_ids.get(order_idx) {
                         if let Some(id) = id_opt {
-                            let expiry = order_expiries.get(order_idx).copied().unwrap_or(u64::MAX);
-                            if env.ledger().timestamp() > expiry {
-                                let caller = accounts[(env.ledger().sequence() as usize + 3) % accounts.len()].clone();
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| htlc_client.refund_order(id, &caller)));
-                            }
+                            let caller = accounts[(env.ledger().sequence() as usize + 3) % accounts.len()].clone();
+                            let _ = htlc_client.try_refund_order(id, &caller);
                         }
                     }
                 }
