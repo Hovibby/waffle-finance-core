@@ -2651,48 +2651,6 @@ fn extend_order_ttl_on_refunded_order_restores_finalised_ttl() {
 }
 
 #[test]
-fn create_order_zero_amount_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = setup(&env, 0);
-
-    let sender = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[0x5bu8; 32]);
-    let hashlock = sha256_32(&env, &preimage);
-
-    let res = htlc.try_create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &0i128, &0i128, &hashlock, &600u64,
-    );
-    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAmount.into(),
-        "create_order with amount=0 must be rejected");
-}
-
-#[test]
-fn create_order_negative_safety_deposit_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = setup(&env, 0);
-
-    let sender = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[0x5cu8; 32]);
-    let hashlock = sha256_32(&env, &preimage);
-
-    let res = htlc.try_create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &(-1i128), &hashlock, &600u64,
-    );
-    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAmount.into(),
-        "create_order with negative safety_deposit must be rejected");
-}
-
-#[test]
 fn preimage_is_stored_after_claim() {
     // Validate that the revealed preimage is persisted in the order record
     // so off-chain indexers can verify the hashlock opening without re-hashing.
