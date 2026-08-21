@@ -181,3 +181,21 @@ export class SolanaHtlcSim extends BaseHtlcSim implements HtlcSim {
     o.finalisedAt = this.now;
   }
 }
+
+// ── Async interface for live-network devnet simulators ───────────────────────
+
+/**
+ * Async counterpart of HtlcSim for real-network devnet implementations.
+ *
+ * createOrder / claimOrder / refundOrder / getOrder are async because they
+ * submit on-chain transactions and wait for confirmation. advanceTime is
+ * retained as a synchronous no-op — time advances naturally on live networks.
+ */
+export interface AsyncHtlcSim {
+  readonly name: "evm" | "soroban" | "solana";
+  createOrder(input: CreateOrderInput): Promise<bigint>;
+  claimOrder(id: bigint, preimage: Hex): Promise<void>;
+  refundOrder(id: bigint): Promise<void>;
+  getOrder(id: bigint): Promise<OrderView>;
+  advanceTime(seconds: number): void;
+}
