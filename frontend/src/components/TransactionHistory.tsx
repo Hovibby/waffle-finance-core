@@ -6,6 +6,29 @@ import { useTransactionHistoryCache, type Transaction } from '../hooks/useTransa
 import { useTransactionHistoryQuery } from '../hooks/useTransactionHistoryQuery';
 import { presentOrderStatus } from '../lib/orderStatusPresentation';
 import type { Address } from 'viem';
+import OrderExport from './OrderExport';
+import OrderImport from './OrderImport';
+
+// ── Status presentation helpers ───────────────────────────────────────────────
+
+function getStatusPresentation(status: Transaction['status']) {
+  return presentOrderStatus(status as Parameters<typeof presentOrderStatus>[0]);
+}
+
+function getStatusIcon(status: Transaction['status']) {
+  const { iconName } = getStatusPresentation(status);
+  switch (iconName) {
+    case 'check-circle': return <CheckCircle className="h-3.5 w-3.5" />;
+    case 'x-circle':     return <XCircle className="h-3.5 w-3.5" />;
+    default:             return <Clock className="h-3.5 w-3.5" />;
+  }
+}
+
+function formatTime(timestamp: number): string {
+  const d = new Date(timestamp);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) +
+    ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
 
 interface TransactionHistoryProps {
   ethAddress?: string;
@@ -35,7 +58,7 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     apiBase: API_BASE_URL,
   });
 
-  const { result: { items: filteredTransactions, total }, options, setQuery, setSort } = useTransactionHistoryQuery(transactions);
+  const { result: { items: filteredTransactions, total }, options, setQuery } = useTransactionHistoryQuery(transactions);
 
   const isHistoryBusy = isLoading || isRefreshing;
 
@@ -203,6 +226,17 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           <RefreshCw className={`h-4 w-4 ${isHistoryBusy ? 'animate-spin' : ''}`} />
           Refresh
         </button>
+      </div>
+
+      {/* Export / Import panel — collapsible, rendered above the filter tabs */}
+      <div className="mb-4 shrink-0 space-y-2">
+        <OrderExport
+          transactions={transactions}
+          apiBase={API_BASE_URL}
+          ethAddress={ethAddress}
+          stellarAddress={stellarAddress}
+        />
+        <OrderImport onMerge={updateTransactions} />
       </div>
 
       <div className="mb-4 flex shrink-0 gap-2 overflow-x-auto pb-1">
