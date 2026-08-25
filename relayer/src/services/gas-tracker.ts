@@ -4,6 +4,9 @@
  */
 
 import { getCurrentTimestamp } from './utils.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger().child({ component: 'gas-tracker' });
 
 /**
  * Gas price information
@@ -69,7 +72,7 @@ export class GasPriceTracker {
 
     // Initial update
     this.updateGasPrices();
-    console.log('⛽ Gas price monitoring started');
+    logger.info('Gas price monitoring started');
   }
 
   /**
@@ -80,7 +83,7 @@ export class GasPriceTracker {
       clearInterval(this.updateInterval);
       this.updateInterval = null;
     }
-    console.log('⛽ Gas price monitoring stopped');
+    logger.info('Gas price monitoring stopped');
   }
 
   /**
@@ -216,9 +219,9 @@ export class GasPriceTracker {
         this.priceHistory = this.priceHistory.slice(-this.MAX_HISTORY_SIZE);
       }
 
-      console.log(`⛽ Gas price updated: ${mockGasPrice.standard} gwei`);
+      logger.debug({ gasPrice: mockGasPrice.standard }, 'Gas price updated');
     } catch (error) {
-      console.error('❌ Failed to update gas prices:', error);
+      logger.error({ err: error }, 'Failed to update gas prices');
     }
   }
 
