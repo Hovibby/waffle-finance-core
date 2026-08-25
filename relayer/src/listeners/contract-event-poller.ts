@@ -23,6 +23,7 @@ import type { Contract, EventLog, JsonRpcProvider } from 'ethers';
 import { startAdaptivePoll, type AdaptivePollHandle } from '../utils/adaptive-poll.js';
 import { withRetry, type RetryOptions } from '../utils/retry-policy.js';
 import { CursorStore } from '../utils/cursor-store.js';
+import { getLogger } from '../logger.js';
 
 export interface ContractEventBinding {
   /** Event name as declared in the contract ABI (e.g. "OrderCreated"). */
@@ -98,7 +99,7 @@ export async function startContractEventPoller(
   const persisted = cursorStore.load(label);
   if (persisted !== null) {
     lastProcessed = persisted;
-    console.log(`[${label}] resumed from persisted cursor ${lastProcessed}`);
+    getLogger().info({ label, cursor: lastProcessed }, `[${label}] resumed from persisted cursor`);
   } else {
     lastProcessed = options.startBlock ?? (await withRetry(() => provider.getBlockNumber(), retryOpts));
   }
@@ -110,7 +111,7 @@ export async function startContractEventPoller(
     try {
       cursorStore.save(label, block);
     } catch (err: any) {
-      console.warn(`[${label}] failed to persist cursor:`, err?.message ?? err);
+      getLogger().warn({ label, block, err: err?.message ?? err }, `[${label}] failed to persist cursor`);
     }
   };
 
@@ -127,7 +128,7 @@ export async function startContractEventPoller(
       for (const binding of bindings) {
         const filterFactory = contract.filters[binding.eventName];
         if (typeof filterFactory !== 'function') {
-          console.warn(`[${label}] no filter factory for event "${binding.eventName}"; skipping`);
+          getLogger().warn({ label, event: binding.eventName }, `[${label}] no filter factory for event; skipping`);
           continue;
         }
         const filter = filterFactory();
@@ -138,9 +139,9 @@ export async function startContractEventPoller(
             const args = Array.from(ev.args as any);
             await binding.handler(...args, ev as EventLog);
           } catch (handlerErr: any) {
-            console.error(
-              `[${label}] handler for ${binding.eventName} threw:`,
-              handlerErr?.message ?? handlerErr,
+            getLogger().error(
+              { label, event: binding.eventName, err: handlerErr?.message ?? handlerErr },
+              `[${label}] handler for ${binding.eventName} threw`,
             );
           }
         }
@@ -148,7 +149,10 @@ export async function startContractEventPoller(
 
       persistCursor(toBlock);
     } catch (err: any) {
-      console.warn(`[${label}] poll failed, cursor ${lastProcessed} preserved:`, err?.shortMessage ?? err?.message ?? err);
+      getLogger().warn(
+        { label, cursor: lastProcessed, err: err?.shortMessage ?? err?.message ?? String(err) },
+        `[${label}] poll failed, cursor preserved`,
+      );
     } finally {
       isPolling = false;
     }
@@ -163,8 +167,9 @@ export async function startContractEventPoller(
     tick,
   });
 
-  console.log(
-    `[${label}] from block ${lastProcessed}, ${bindings.length} event(s) — active ${intervalMs / 1000}s / idle ${idleIntervalMs / 1000}s`,
+  getLogger().info(
+    { label, fromBlock: lastProcessed, eventCount: bindings.length, activeIntervalMs: intervalMs, idleIntervalMs },
+    `[${label}] contract event poller started`,
   );
 
   return {

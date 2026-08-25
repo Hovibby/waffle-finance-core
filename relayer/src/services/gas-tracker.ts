@@ -4,6 +4,9 @@
  */
 
 import { getCurrentTimestamp } from './utils.js';
+import { getLogger } from '../logger.js';
+
+const log = getLogger().child({ service: 'gas-tracker' });
 
 /**
  * Gas price information
@@ -67,9 +70,8 @@ export class GasPriceTracker {
       this.updateGasPrices();
     }, intervalMs);
 
-    // Initial update
     this.updateGasPrices();
-    console.log('⛽ Gas price monitoring started');
+    log.info({ intervalMs }, '[gas-tracker] gas price monitoring started');
   }
 
   /**
@@ -80,7 +82,7 @@ export class GasPriceTracker {
       clearInterval(this.updateInterval);
       this.updateInterval = null;
     }
-    console.log('⛽ Gas price monitoring stopped');
+    log.info('[gas-tracker] gas price monitoring stopped');
   }
 
   /**
@@ -202,23 +204,21 @@ export class GasPriceTracker {
       this.currentGasPrice = mockGasPrice;
       this.congestionData = mockCongestion;
 
-      // Add to history
       this.priceHistory.push({
         timestamp: getCurrentTimestamp(),
         price: mockGasPrice.standard,
         baseFee: mockGasPrice.baseFee,
         priorityFee: mockGasPrice.priorityFee,
-        blockNumber: Math.floor(Math.random() * 1000000) + 17000000 // Mock block number
+        blockNumber: Math.floor(Math.random() * 1000000) + 17000000
       });
 
-      // Trim history if needed
       if (this.priceHistory.length > this.MAX_HISTORY_SIZE) {
         this.priceHistory = this.priceHistory.slice(-this.MAX_HISTORY_SIZE);
       }
 
-      console.log(`⛽ Gas price updated: ${mockGasPrice.standard} gwei`);
+      log.debug({ gasPrice: mockGasPrice.standard }, '[gas-tracker] gas price updated');
     } catch (error) {
-      console.error('❌ Failed to update gas prices:', error);
+      log.error({ err: error }, '[gas-tracker] failed to update gas prices');
     }
   }
 

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @fileoverview Relayer service for WaffleFinance cross-chain operations
  * @description Monitors Ethereum events and coordinates Stellar transactions
  */
@@ -12,6 +12,9 @@ import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { ethers } from 'ethers';
+import { getLogger } from './logger.js';
+
+const logger = getLogger();
 import { startRefundWatchdog } from './services/refund-watchdog.js';
 import { refundXlmToUser, HorizonTimeoutError } from './services/xlm-refund.js';
 import { globalRefundLedger } from './services/refund-ledger.js';
@@ -80,14 +83,14 @@ function calculateDynamicSafetyDeposit(amountInWei: string | bigint, networkMode
     const TESTNET_MIN_SAFETY_DEPOSIT = 0.01;
     safetyDepositInEth = Math.max(safetyDepositInEth, TESTNET_MIN_SAFETY_DEPOSIT);
     
-    console.log(`≡ƒ¢í∩╕Å TESTNET SAFETY DEPOSIT:
+    logger.info(`≡ƒ¢í∩╕Å TESTNET SAFETY DEPOSIT:
     ≡ƒôè Amount: ${amountInEth} ETH (~$${amountInUsd.toFixed(2)})
     ≡ƒÆí Dynamic calculation: ${originalSafetyDeposit} ETH
     Γ£à Testnet minimum applied: ${safetyDepositInEth} ETH
     ≡ƒôï Testnet requires minimum: ${TESTNET_MIN_SAFETY_DEPOSIT} ETH`);
   } else {
     // MAINNET: Use pure dynamic calculation (no forced minimum)
-    console.log(`≡ƒ¢í∩╕Å MAINNET SAFETY DEPOSIT:
+    logger.info(`≡ƒ¢í∩╕Å MAINNET SAFETY DEPOSIT:
     ≡ƒôè Amount: ${amountInEth} ETH (~$${amountInUsd.toFixed(2)})
     ≡ƒÆí Dynamic calculation: ${originalSafetyDeposit} ETH
     Γ£à Final amount (no forced minimum): ${safetyDepositInEth} ETH
@@ -134,8 +137,8 @@ function getNetworkConfig(networkMode?: string): any {
 
 
 
-console.log(`≡ƒîÉ Default Network Mode: ${DEFAULT_NETWORK_MODE.toUpperCase()}`);
-console.log(`≡ƒÅ¡ Default Escrow Factory: ${getNetworkConfig().ethereum.escrowFactory}`);
+logger.info(`≡ƒîÉ Default Network Mode: ${DEFAULT_NETWORK_MODE.toUpperCase()}`);
+logger.info(`≡ƒÅ¡ Default Escrow Factory: ${getNetworkConfig().ethereum.escrowFactory}`);
 
 // Real HTLC Bridge Contract ABI  
 const HTLC_BRIDGE_ABI = [
@@ -271,17 +274,17 @@ async function fetchPricesFromCoinGecko(): Promise<PriceSnapshot> {
       'https://api.coingecko.com/api/v3/simple/price?ids=stellar,ethereum&vs_currencies=usd'
     );
     if (!priceResponse.ok) {
-      console.warn('ΓÜá∩╕Å CoinGecko API non-OK:', priceResponse.status);
+      logger.warn({ value: priceResponse.status }, 'ΓÜá∩╕Å CoinGecko API non-OK:');
       return fallback;
     }
     const priceData = await priceResponse.json() as any;
     const xlmUsdPrice = priceData.stellar?.usd;
     const ethUsdPrice = priceData.ethereum?.usd;
     if (typeof xlmUsdPrice !== 'number' || typeof ethUsdPrice !== 'number' || xlmUsdPrice <= 0 || ethUsdPrice <= 0) {
-      console.warn('ΓÜá∩╕Å CoinGecko returned malformed prices, using fallback');
+      logger.warn('ΓÜá∩╕Å CoinGecko returned malformed prices, using fallback');
       return fallback;
     }
-    console.log('≡ƒôè Real-time prices fetched from CoinGecko:', { xlmUsdPrice, ethUsdPrice });
+    logger.info({ xlmUsdPrice, ethUsdPrice }, '≡ƒôè Real-time prices fetched from CoinGecko:');
     return {
       xlmUsdPrice,
       ethUsdPrice,
@@ -290,7 +293,7 @@ async function fetchPricesFromCoinGecko(): Promise<PriceSnapshot> {
       source: 'coingecko',
     };
   } catch (priceError: any) {
-    console.warn('ΓÜá∩╕Å Price fetch failed, using fallback prices:', priceError?.message);
+    logger.warn({ value: priceError?.message }, 'ΓÜá∩╕Å Price fetch failed, using fallback prices:');
     return fallback;
   }
 }
@@ -305,7 +308,7 @@ function triggerBackgroundRefresh(): void {
     .catch((err) => {
       // SWR background refresh; keep the stale entry. We log so an outage is
       // visible but never propagate the error to the caller serving stale.
-      console.warn('ΓÜá∩╕Å Background price refresh failed; keeping stale entry:', err?.message ?? err);
+      logger.warn({ err: err?.message ?? err }, '[price] background price refresh failed; keeping stale entry');
       return cachedPrices ?? {
         xlmUsdPrice: 0.12,
         ethUsdPrice: 3500,
@@ -499,8 +502,8 @@ async function runWithSettlementRetry<T>(
 
 // Initialize relayer service
 async function initializeRelayer() {
-  console.log('≡ƒöä Initializing WaffleFinance Relayer Service');
-  console.log('============================================');
+  logger.info('≡ƒöä Initializing WaffleFinance Relayer Service');
+  logger.info('============================================');
   
   // Configure Express middleware with enhanced CORS
   app.use(cors({
@@ -544,9 +547,9 @@ async function initializeRelayer() {
     assertSupportPolicy(supportPolicy);
   } catch (err) {
     if (err instanceof SupportPolicyValidationError) {
-      console.error('🚨 Relayer support policy is invalid — refusing to start:');
+      logger.error('🚨 Relayer support policy is invalid — refusing to start:');
       for (const problem of err.errors) {
-        console.error(`   [${problem.code}] ${problem.message}`);
+        logger.error(`   [${problem.code}] ${problem.message}`);
       }
       process.exit(1);
     }
@@ -555,20 +558,20 @@ async function initializeRelayer() {
   logSupportPolicy(supportPolicy);
 
   // Display configuration
-  console.log(`≡ƒîÉ Environment: ${RELAYER_CONFIG.nodeEnv}`);
-  console.log(`≡ƒöù Ethereum Network: ${RELAYER_CONFIG.ethereum.network}`);
-  console.log(`Γ¡É Stellar Network: ${RELAYER_CONFIG.stellar.network}`);
-  console.log(`≡ƒÅâ Mock Mode: ${RELAYER_CONFIG.enableMockMode ? 'Enabled' : 'Disabled'}`);
-  console.log(`≡ƒôè Port: ${RELAYER_CONFIG.port}`);
-  console.log(`ΓÅ▒∩╕Å  Poll Interval: ${RELAYER_CONFIG.pollInterval}ms`);
+  logger.info(`≡ƒîÉ Environment: ${RELAYER_CONFIG.nodeEnv}`);
+  logger.info(`≡ƒöù Ethereum Network: ${RELAYER_CONFIG.ethereum.network}`);
+  logger.info(`Γ¡É Stellar Network: ${RELAYER_CONFIG.stellar.network}`);
+  logger.info(`≡ƒÅâ Mock Mode: ${RELAYER_CONFIG.enableMockMode ? 'Enabled' : 'Disabled'}`);
+  logger.info(`≡ƒôè Port: ${RELAYER_CONFIG.port}`);
+  logger.info(`ΓÅ▒∩╕Å  Poll Interval: ${RELAYER_CONFIG.pollInterval}ms`);
   
   if (RELAYER_CONFIG.security.emergencyShutdown) {
-    console.error('≡ƒÜ¿ Emergency shutdown is active - service will not start');
+    logger.error('≡ƒÜ¿ Emergency shutdown is active - service will not start');
     process.exit(1);
   }
   
   if (RELAYER_CONFIG.security.maintenanceMode) {
-    console.warn('≡ƒöº Maintenance mode is active');
+    logger.warn('≡ƒöº Maintenance mode is active');
   }
 
   // Global order storage (in production this would be a database).
@@ -602,7 +605,7 @@ async function initializeRelayer() {
 
   const stopChainMonitoring = async (): Promise<void> => {
     if (!chainMonitoringStarted) return;
-    console.log('≡ƒÆñ Stopping chain monitoring ΓÇö no in-flight orders');
+    logger.info('≡ƒÆñ Stopping chain monitoring ΓÇö no in-flight orders');
     for (const poller of chainPollers) poller.stop();
     chainPollers.length = 0;
     escrowFactoryPoller?.stop();
@@ -619,7 +622,7 @@ async function initializeRelayer() {
   const reconcileChainMonitoring = (): void => {
     const expired = expireAbandonedOrders(activeOrders);
     if (expired > 0) {
-      console.log(`ΓÅ▒∩╕Å Expired ${expired} abandoned pre-deposit order(s)`);
+      logger.info(`ΓÅ▒∩╕Å Expired ${expired} abandoned pre-deposit order(s)`);
     }
     if (chainMonitoringStarted && !needsChainMonitoring(activeOrders)) {
       void stopChainMonitoring();
@@ -656,9 +659,9 @@ async function initializeRelayer() {
   // Start gas price tracking
   try {
     gasPriceTracker.startMonitoring(30000); // Monitor every 30 seconds
-    console.log('Γ¢╜ Gas price tracking started');
+    logger.info('Γ¢╜ Gas price tracking started');
   } catch (error) {
-    console.error('Γ¥î Failed to start gas price tracking:', error);
+    logger.error({ err: error }, 'Γ¥î Failed to start gas price tracking:');
   }
 
   // Start monitoring system
@@ -669,9 +672,9 @@ async function initializeRelayer() {
     monitor.registerService('gas-tracker', async () => ({ status: 'healthy' }));
     monitor.registerService('orders', async () => ({ status: 'healthy' }));
     monitor.startMonitoring(30000); // Monitor every 30 seconds
-    console.log('≡ƒôè Uptime monitoring started');
+    logger.info('≡ƒôè Uptime monitoring started');
   } catch (error) {
-    console.error('Γ¥î Failed to start monitoring system:', error);
+    logger.error({ err: error }, 'Γ¥î Failed to start monitoring system:');
   }
 
   // Chain listeners start lazily on the first swap order ΓÇö not at boot.
@@ -680,13 +683,13 @@ async function initializeRelayer() {
   // ===== ORDERS API ENDPOINTS =====
   
   // Γ£à Network-aware contract logging
-  console.log(`≡ƒîÉ Network Mode: ${DEFAULT_NETWORK_MODE.toUpperCase()}`);
+  logger.info(`≡ƒîÉ Network Mode: ${DEFAULT_NETWORK_MODE.toUpperCase()}`);
   if (DEFAULT_NETWORK_MODE === 'mainnet') {
-    console.log('≡ƒÅ¡ MAINNET Escrow Factory:', getEscrowFactoryAddress('mainnet'));
-    console.log('≡ƒÄ» MAINNET HTLC (XLMΓåÆETH only):', getHtlcBridgeAddress('mainnet'));
+    logger.info({ value: getEscrowFactoryAddress('mainnet') }, '≡ƒÅ¡ MAINNET Escrow Factory:');
+    logger.info({ value: getHtlcBridgeAddress('mainnet') }, '≡ƒÄ» MAINNET HTLC (XLMΓåÆETH only):');
   } else {
-    console.log('≡ƒº¬ TESTNET HTLC Bridge (Event Listener):', getHtlcBridgeAddress('testnet'));
-    console.log('≡ƒº¬ TESTNET Escrow Factory:', getEscrowFactoryAddress('testnet'));
+    logger.info({ value: getHtlcBridgeAddress('testnet') }, '≡ƒº¬ TESTNET HTLC Bridge (Event Listener):');
+    logger.info({ value: getEscrowFactoryAddress('testnet') }, '≡ƒº¬ TESTNET Escrow Factory:');
   }
 
   // DEBUG: Simple transaction test
@@ -713,7 +716,7 @@ async function initializeRelayer() {
   }
 
   // POST /api/orders/create - Create bridge order (Frontend Integration)
-  console.log("≡ƒôì DEBUG: About to register orders endpoint");
+  logger.info("≡ƒôì DEBUG: About to register orders endpoint");
   
   // Prometheus metrics endpoint ΓÇö no sensitive data exposed.
   const { metricsRouter } = await import('./routes/metrics.js');
@@ -818,20 +821,20 @@ async function initializeRelayer() {
     res.status(summary.actionable ? 200 : 503).json(summary);
   });
 
-  console.log('≡ƒôì DEBUG: Test endpoints registered (root + api)');
-  console.log('≡ƒôì DEBUG: Now registering transaction history endpoint...');
+  logger.info('≡ƒôì DEBUG: Test endpoints registered (root + api)');
+  logger.info('≡ƒôì DEBUG: Now registering transaction history endpoint...');
 
   // POST /api/transactions/history - RIGHT NEXT TO WORKING ENDPOINT
   app.post('/api/transactions/history', async (req, res) => {
-    console.log('≡ƒÄ» TRANSACTION HISTORY ENDPOINT HIT - NEXT TO ORDERS!');
+    logger.info('≡ƒÄ» TRANSACTION HISTORY ENDPOINT HIT - NEXT TO ORDERS!');
     try {
       const { ethAddress, stellarAddress } = req.body;
       
-      console.log('≡ƒôè Fetching transaction history for:', { ethAddress, stellarAddress });
+      logger.info({ ethAddress, stellarAddress }, '≡ƒôè Fetching transaction history for:');
       
       // Get all orders from activeOrders Map  
       const allOrders = Array.from(activeOrders.values());
-      console.log('≡ƒôè Total orders in activeOrders:', allOrders.length);
+      logger.info({ value: allOrders.length }, '≡ƒôè Total orders in activeOrders:');
       
       // Filter orders by user addresses and format for history
       const userTransactions = allOrders
@@ -863,7 +866,7 @@ async function initializeRelayer() {
         }))
         .sort((a, b) => b.timestamp - a.timestamp);
       
-      console.log(`≡ƒôè Found ${userTransactions.length} matching transactions for user`);
+      logger.info(`≡ƒôè Found ${userTransactions.length} matching transactions for user`);
       
       res.json({
         success: true,
@@ -872,7 +875,7 @@ async function initializeRelayer() {
       });
       
     } catch (error: any) {
-      console.error('Γ¥î Transaction history fetch failed:', error);
+      logger.error({ err: error }, 'Γ¥î Transaction history fetch failed:');
       res.status(500).json({
         error: 'Failed to fetch transaction history',
         details: error instanceof Error ? error.message : 'Unknown error'
@@ -882,20 +885,20 @@ async function initializeRelayer() {
   
   app.post('/api/orders/create', async (req, res) => {
     try {
-      console.log('≡ƒöì RAW REQUEST BODY:', JSON.stringify(req.body, null, 2));
+      logger.debug({ body: req.body }, '[orders/create] raw request body');
       
       const { fromChain, toChain, fromToken, toToken, amount, ethAddress, stellarAddress, direction, exchangeRate, network, networkMode } = req.body;
       
-      console.log('≡ƒÄ» EXTRACTED VALUES:', {
+      logger.info({
         amount: amount,
         amountType: typeof amount,
         amountLength: amount ? amount.length : 'undefined',
         amountString: String(amount)
-      });
+      }, '≡ƒÄ» EXTRACTED VALUES:');
       
       // Validate required fields
       if (!fromChain || !toChain || !fromToken || !toToken || !amount || !ethAddress || !stellarAddress) {
-        console.log('Γ¥î VALIDATION FAILED:', {
+        logger.info({
           fromChain: !!fromChain,
           toChain: !!toChain, 
           fromToken: !!fromToken,
@@ -903,7 +906,7 @@ async function initializeRelayer() {
           amount: !!amount,
           ethAddress: !!ethAddress,
           stellarAddress: !!stellarAddress
-        });
+        }, 'Γ¥î VALIDATION FAILED:');
         return res.status(400).json({
           error: 'Missing required fields',
           required: ['fromChain', 'toChain', 'fromToken', 'toToken', 'amount', 'ethAddress', 'stellarAddress']
@@ -934,7 +937,7 @@ async function initializeRelayer() {
       });
       if (!routeDecision.supported) {
         relayDecisionTotal.inc({ direction: ingestDirection, result: 'rejected_route' });
-        console.warn(
+        logger.warn(
           `🚫 Order rejected [${routeDecision.code}]: ${routeDecision.reason}`
         );
         return res.status(400).json({
@@ -944,7 +947,7 @@ async function initializeRelayer() {
           supported: supportSummary(supportPolicy).routes.map((r) => r.id),
         });
       }
-      console.log(
+      logger.info(
         `✅ Route ${routeDecision.from}→${routeDecision.to} ` +
         `(${routeDecision.tokenClass}) is supported`
       );
@@ -967,7 +970,7 @@ async function initializeRelayer() {
       );
       if (settlementDenial) {
         relayDecisionTotal.inc({ direction: ingestDirection, result: 'rejected_permissions' });
-        console.warn(
+        logger.warn(
           `🚫 Settlement permission denied [${settlementDenial.code}]: ${settlementDenial.reason}`
         );
         return res.status(403).json({
@@ -978,7 +981,7 @@ async function initializeRelayer() {
           chain: settlementDenial.chain,
         });
       }
-      console.log(`✅ Settlement permissions granted for direction "${direction}"`);
+      logger.info(`✅ Settlement permissions granted for direction "${direction}"`);
 
       // ── Pipeline metrics: accepted + queue depth + submission timer ──
       relayDecisionTotal.inc({ direction: ingestDirection, result: 'accepted' });
@@ -991,7 +994,7 @@ async function initializeRelayer() {
         submissionTimer({ result });
       });
 
-      console.log('≡ƒîë Creating bridge order:', {
+      logger.info({
         direction,
         fromChain,
         toChain,
@@ -1001,7 +1004,7 @@ async function initializeRelayer() {
         exchangeRate: exchangeRate || ETH_TO_XLM_RATE,
         ethAddress,
         stellarAddress
-      });
+      }, '≡ƒîë Creating bridge order:');
 
       // Normalize addresses to avoid checksum issues
       const normalizedEthAddress = ethAddress.toLowerCase();
@@ -1013,17 +1016,17 @@ async function initializeRelayer() {
       const requestNetwork = networkMode || network || (req.query.network) || DEFAULT_NETWORK_MODE;
       const isMainnetRequest = requestNetwork === 'mainnet';
       
-      console.log(`≡ƒîÉ Network Detection:`, {
+      logger.info({
         requestNetwork,
         queryParam: req.query.network,
         bodyNetworkMode: networkMode,
         bodyNetwork: network,
         envDefault: DEFAULT_NETWORK_MODE,
         finalDecision: isMainnetRequest ? 'MAINNET' : 'TESTNET'
-      });
+      }, `≡ƒîÉ Network Detection:`);
       
       // FORCE DEBUG: Always log this
-      console.log(`≡ƒöì CRITICAL DEBUG:`, {
+      logger.info({
         'networkMode': networkMode,
         'network': network,
         'req.query.network': req.query.network,
@@ -1031,7 +1034,7 @@ async function initializeRelayer() {
         'requestNetwork': requestNetwork,
         'isMainnetRequest': isMainnetRequest,
         'WILL_GO_TO': isMainnetRequest ? 'MAINNET_BRANCH' : 'TESTNET_BRANCH'
-      });
+      }, `≡ƒöì CRITICAL DEBUG:`);
       
       // For ETH to XLM direction
       if (direction === 'eth_to_xlm') {
@@ -1039,11 +1042,11 @@ async function initializeRelayer() {
         if (isMainnetRequest) {
           // MAINNET: Use DUAL CONTRACT APPROACH (1inch EscrowFactory + MainnetHTLC)
           const useHTLC = shouldUseHTLCContract('mainnet');
-          console.log(`≡ƒÅ¡ MAINNET: Using ${useHTLC ? 'HTLC + EscrowFactory' : 'EscrowFactory only'} approach...`);
+          logger.info(`≡ƒÅ¡ MAINNET: Using ${useHTLC ? 'HTLC + EscrowFactory' : 'EscrowFactory only'} approach...`);
 
           // MOCK MODE for ETHΓåÆXLM
           if (RELAYER_CONFIG.enableMockMode) {
-            console.log('≡ƒº¬ MOCK MODE: Simulating ETHΓåÆXLM mainnet escrow creation...');
+            logger.info('≡ƒº¬ MOCK MODE: Simulating ETHΓåÆXLM mainnet escrow creation...');
             
             const userAmountWei = ethers.parseEther(amount);
             const secret = ethers.hexlify(ethers.randomBytes(32));
@@ -1097,13 +1100,13 @@ async function initializeRelayer() {
 
         // amount is already a string like "0.00012", convert to wei
         const userAmountWei = ethers.parseEther(amount);
-        console.log(`≡ƒÆ░ User Amount: ${amount} ETH = ${userAmountWei.toString()} wei`);
+        logger.info(`≡ƒÆ░ User Amount: ${amount} ETH = ${userAmountWei.toString()} wei`);
         
         // Calculate real XLM amount from ETH using market prices
         const ethAmount = parseFloat(amount);
         const realMarketXlmAmount = (ethAmount * ethUsdPrice) / xlmUsdPrice;
         
-        console.log('≡ƒÆ▒ REAL MARKET ETHΓåÆXLM Exchange:', {
+        logger.info({
           ethAmount,
           ethUsdPrice: `$${ethUsdPrice}`,
           xlmUsdPrice: `$${xlmUsdPrice}`,
@@ -1111,7 +1114,7 @@ async function initializeRelayer() {
           ethTotalValue: `$${(ethAmount * ethUsdPrice).toFixed(4)}`,
           xlmAmount: `${realMarketXlmAmount.toFixed(7)} XLM`,
           xlmTotalValue: `$${(realMarketXlmAmount * xlmUsdPrice).toFixed(4)}`
-        });
+        }, '[orders/create] ETH-to-XLM real market exchange rate');
         
         // Generate HTLC parameters for cross-chain bridge
         const secretBytes = new Uint8Array(32);
@@ -1119,10 +1122,10 @@ async function initializeRelayer() {
         const secret = `0x${Array.from(secretBytes).map(b => b.toString(16).padStart(2, '0')).join('')}`;
         const hashLock = ethers.keccak256(secret);
         
-        console.log('≡ƒöæ Generated HTLC parameters:', {
+        logger.info({
           secret: '[REDACTED]',
           hashLock: hashLock
-        });
+        }, '≡ƒöæ Generated HTLC parameters:');
         
         // Calculate dynamic safety deposit with network awareness
         const actualSafetyDeposit = calculateDynamicSafetyDeposit(userAmountWei, requestNetwork);
@@ -1131,11 +1134,14 @@ async function initializeRelayer() {
         const amountInUsd = amountInEth * ethUsdPrice; // Use real ETH price
           const safetyDepositInEth = parseFloat(ethers.formatEther(actualSafetyDeposit));
           
-          console.log(`≡ƒÆ░ Dynamic Safety Deposit:
-          ≡ƒôè Amount: ${amountInEth} ETH (~$${amountInUsd.toFixed(2)})
-          ≡ƒ¢í∩╕Å Safety Deposit: ${safetyDepositInEth} ETH (~$${(safetyDepositInEth * 3500).toFixed(2)})`);
-          
-          console.log('≡ƒÆ░ Safety deposit:', ethers.formatEther(actualSafetyDeposit), 'ETH');
+          logger.info({
+            amountInEth,
+            amountInUsd: amountInUsd.toFixed(2),
+            safetyDepositInEth,
+            chain: 'ethereum',
+          }, '[orders/create] dynamic safety deposit calculated');
+
+          logger.info({ safetyDeposit: ethers.formatEther(actualSafetyDeposit), chain: 'ethereum' }, '[orders/create] safety deposit');
           
           // Generate order hash for 1inch protocol
           const orderHash = ethers.keccak256(
@@ -1186,21 +1192,21 @@ async function initializeRelayer() {
           const srcCancellationTimestamp = Math.floor(Date.now() / 1000) + (4 * 60 * 60); // 4 hours
           
           // Encode EscrowFactory createDstEscrow call (DO─₧RU MAINNET ABI!)
-          console.log('≡ƒöì DEBUG: About to encode createDstEscrow with:', {
+          logger.info({
             dstImmutables,
             srcCancellationTimestamp,
             abiLength: getEscrowFactoryABI(true).length
-          });
+          }, '≡ƒöì DEBUG: About to encode createDstEscrow with:');
           
           const escrowInterface = new ethers.Interface(getEscrowFactoryABI(true)); // true = mainnet
-          console.log('≡ƒöì DEBUG: Interface created, available functions:', escrowInterface.fragments.map(f => f.type === 'function' ? (f as any).name : f.type));
+          logger.debug({ functions: escrowInterface.fragments.map(f => f.type === 'function' ? (f as any).name : f.type) }, '[escrow] interface created');
           
           const encodedData = escrowInterface.encodeFunctionData("createDstEscrow", [
             dstImmutables,
             srcCancellationTimestamp
           ]);
           
-          console.log('≡ƒöì DEBUG: Encoded data length:', encodedData.length);
+          logger.info({ value: encodedData.length }, '≡ƒöì DEBUG: Encoded data length:');
 
           // Return direct EscrowFactory contract interaction
           res.json({
@@ -1272,8 +1278,8 @@ async function initializeRelayer() {
           networkMode: requestNetwork  // Γ£à Store network for XLMΓåÆETH processing
         });
 
-        console.log('Γ£à TESTNET ETHΓåÆXLM Order created:', orderId);
-        console.log('≡ƒÅ¡ TESTNET ESK─░ ESCROW MODE: User ΓåÆ createEscrow (bizim custom contract)');
+        logger.info({ value: orderId }, 'Γ£à TESTNET ETHΓåÆXLM Order created:');
+        logger.info('≡ƒÅ¡ TESTNET ESK─░ ESCROW MODE: User ΓåÆ createEscrow (bizim custom contract)');
         
         // Calculate dynamic safety deposit based on USD value with network awareness
         const orderAmountBigInt = BigInt(orderData.amount);
@@ -1328,7 +1334,7 @@ async function initializeRelayer() {
       } else if (direction === 'xlm_to_eth') {
         // XLMΓåÆETH: Create HTLC on both Stellar and Ethereum (MainnetHTLC)
 
-        console.log('≡ƒîƒ XLMΓåÆETH: Creating dual HTLC setup...');
+        logger.info('≡ƒîƒ XLMΓåÆETH: Creating dual HTLC setup...');
         
         // Get REAL-TIME exchange rates from market
         const realTimePrices = await getRealTimePrices();
@@ -1340,7 +1346,7 @@ async function initializeRelayer() {
         const realMarketRate = xlmUsdPrice / ethUsdPrice;
         const ethAmount = xlmAmount * realMarketRate;
         
-        console.log('≡ƒÆ▒ REAL MARKET XLMΓåÆETH Exchange:', {
+        logger.info({
           xlmAmount,
           xlmUsdPrice: `$${xlmUsdPrice}`,
           ethUsdPrice: `$${ethUsdPrice}`,
@@ -1348,19 +1354,19 @@ async function initializeRelayer() {
           xlmTotalValue: `$${(xlmAmount * xlmUsdPrice).toFixed(4)}`,
           ethAmount: `${ethAmount.toFixed(8)} ETH`,
           ethTotalValue: `$${(ethAmount * ethUsdPrice).toFixed(4)}`
-        });
+        }, '[orders/create] XLM-to-ETH real market exchange rate');
         
         // Generate HTLC parameters
         const secret = ethers.hexlify(ethers.randomBytes(32));
         const hashLock = ethers.keccak256(secret).substring(2); // Remove 0x prefix for Stellar
         
-        console.log('≡ƒöæ Generated HTLC parameters for XLMΓåÆETH:', {
+        logger.info({
           secret: '[REDACTED]',
           hashLock
-        });
+        }, '≡ƒöæ Generated HTLC parameters for XLMΓåÆETH:');
 
         if (RELAYER_CONFIG.enableMockMode) {
-          console.log('≡ƒº¬ MOCK MODE: Simulating XLMΓåÆETH HTLC creation...');
+          logger.info('≡ƒº¬ MOCK MODE: Simulating XLMΓåÆETH HTLC creation...');
           
           const orderData = {
             orderId,
@@ -1405,8 +1411,8 @@ async function initializeRelayer() {
         }
 
         // FIXED: Create pending order ONLY - NO ETH HTLC YET!
-        console.log('≡ƒîƒ XLMΓåÆETH: Creating pending order (awaiting XLM payment)...');
-        console.log('≡ƒô¥ User will send XLM first, then relayer will create ETH HTLC');
+        logger.info('≡ƒîƒ XLMΓåÆETH: Creating pending order (awaiting XLM payment)...');
+        logger.info('≡ƒô¥ User will send XLM first, then relayer will create ETH HTLC');
 
         // Safe ETH amount conversion with decimal limit
         const safeEthAmount = Math.min(Math.max(ethAmount, 0.000001), 10.0); // Min 0.000001, Max 10 ETH
@@ -1416,11 +1422,11 @@ async function initializeRelayer() {
         try {
           ethAmountWei = ethers.parseEther(roundedEthAmount.toString());
         } catch (parseError: any) {
-          console.warn('ΓÜá∩╕Å parseEther failed in create endpoint, using minimum amount:', parseError.message);
+          logger.warn({ value: parseError.message }, 'ΓÜá∩╕Å parseEther failed in create endpoint, using minimum amount:');
           ethAmountWei = ethers.parseEther("0.001"); // 0.001 ETH minimum
         }
         
-        console.log('≡ƒöó XLMΓåÆETH PENDING - ETH amount will be:', roundedEthAmount, 'ETH');
+        logger.info({ ethAmount: roundedEthAmount, chain: 'ethereum', direction: 'xlm_to_eth' }, '[orders/create] XLM-to-ETH pending ETH amount');
 
         // Store pending order data (NO ETH HTLC YET!)
         const relayerStellarAddress = process.env.RELAYER_STELLAR_PUBLIC || 'YOUR_STELLAR_PUBLIC_KEY_HERE';
@@ -1470,7 +1476,7 @@ async function initializeRelayer() {
       }
 
     } catch (error) {
-      console.error('Γ¥î Bridge order creation failed:', error);
+      logger.error({ err: error }, 'Γ¥î Bridge order creation failed:');
       res.status(500).json({
         error: 'Bridge order creation failed',
         details: error instanceof Error ? error.message : 'Unknown error'
@@ -1495,7 +1501,7 @@ async function initializeRelayer() {
         processSubmissionTimer({ result: res.statusCode < 400 ? 'success' : 'failure' });
       });
 
-      console.log('≡ƒîƒ Processing approved order:', { orderId, txHash, stellarTxHash });
+      logger.info({ orderId, txHash, stellarTxHash }, '≡ƒîƒ Processing approved order:');
       
       // Get stored order
       const storedOrder = activeOrders.get(orderId);
@@ -1511,21 +1517,21 @@ async function initializeRelayer() {
       const userEthAddress = storedOrder.ethAddress || ethAddress;
       const orderAmount = storedOrder.amount;
 
-      console.log('≡ƒôï Processing order with stored data:', {
+      logger.info({
         userStellarAddress,
         userEthAddress, 
         orderAmount,
         contractType: storedOrder.contractType
-      });
+      }, '≡ƒôï Processing order with stored data:');
 
       // Handle 1inch Escrow Factory orders first
       if (storedOrder.contractType === 'ONEINCH_ESCROW_FACTORY' && storedOrder.status === 'pending_escrow_deployment') {
-        console.log('≡ƒÅ¡ Processing 1inch Escrow Factory deployment...');
+        logger.info('≡ƒÅ¡ Processing 1inch Escrow Factory deployment...');
         
         try {
           // Escrow was deployed when user called createDstEscrow
           // Now we need to create corresponding escrow on Stellar
-          console.log('≡ƒîƒ Creating corresponding escrow on Stellar...');
+          logger.info('≡ƒîƒ Creating corresponding escrow on Stellar...');
           
           // Update order status to indicate escrow deployment success
           storedOrder.status = 'escrow_deployed';
@@ -1542,7 +1548,7 @@ async function initializeRelayer() {
           });
           
         } catch (escrowError: any) {
-          console.error('Γ¥î Escrow processing failed:', escrowError);
+          logger.error({ err: escrowError }, 'Γ¥î Escrow processing failed:');
           storedOrder.status = 'escrow_failed';
           
           return res.status(500).json({
@@ -1552,20 +1558,20 @@ async function initializeRelayer() {
         }
       }
 
-      console.log('≡ƒÜ¿ DEBUG: About to determine direction...', { stellarTxHash, txHash });
+      logger.info({ stellarTxHash, txHash }, '≡ƒÜ¿ DEBUG: About to determine direction...');
 
       // Determine direction based on incoming data
       const isXlmToEth = stellarTxHash && !txHash; // XLMΓåÆETH: Has stellarTxHash but no txHash
       const isEthToXlm = txHash && !stellarTxHash; // ETHΓåÆXLM: Has txHash but no stellarTxHash
 
-      console.log('≡ƒÜ¿ DEBUG: Direction variables computed:', { isXlmToEth, isEthToXlm });
+      logger.info({ isXlmToEth, isEthToXlm }, '≡ƒÜ¿ DEBUG: Direction variables computed:');
 
-      console.log('≡ƒöä Direction detected:', {
+      logger.info({
         isXlmToEth,
         isEthToXlm,
         stellarTxHash: stellarTxHash || 'none',
         ethTxHash: txHash || 'none'
-      });
+      }, '≡ƒöä Direction detected:');
 
       // XLMΓåÆETH: Send ETH to user
       if (isXlmToEth) {
@@ -1672,12 +1678,12 @@ async function initializeRelayer() {
             return res.status(400).json({ error: 'Verified XLM amount is too small to release any ETH', orderId });
           }
 
-          process.stdout.write(JSON.stringify({
-            level: 'info', msg: '[process/xlm-to-eth] amount calculation',
+          logger.info({
             orderId, verifiedXlmAmount: processVerifiedPayment.amount,
             xlmStroops: procXlmStroops.toString(), exchangeRate: processExchangeRate,
             ethAmountWei: ethAmountWei.toString(), ethFormatted: ethers.formatEther(ethAmountWei),
-          }) + '\n');
+            chain: 'ethereum', direction: 'xlm_to_eth',
+          }, '[process/xlm-to-eth] amount calculation');
 
           // ── Settlement-permission check (settle / ethereum) ──────────────
           //
@@ -1692,7 +1698,7 @@ async function initializeRelayer() {
               { command: 'settle', direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' }
             );
             if (!procSettleAuth.authorized) {
-              console.warn(
+              logger.warn(
                 `🚫 Settlement permission denied [${procSettleAuth.code}]: ${procSettleAuth.reason}`,
                 formatAuthorizationLog(procSettleAuth)
               );
@@ -1704,7 +1710,7 @@ async function initializeRelayer() {
                 chain: procSettleAuth.chain,
               });
             }
-            console.log(
+            logger.info(
               '✅ Settlement permission granted (process)',
               formatAuthorizationLog(procSettleAuth)
             );
@@ -1752,7 +1758,7 @@ async function initializeRelayer() {
             },
           );
           retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, 0);
-          console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
+          logger.info({ value: ethTxResponse.hash }, '≡ƒôñ ETH transaction sent:');
 
           // ── Wait for confirmation (retried via RetryEngine) ───────────────
           const ethTxReceipt = await runWithSettlementRetry(
@@ -1761,9 +1767,9 @@ async function initializeRelayer() {
             () => ethTxResponse.wait(),
             { orderId, direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' },
           );
-          console.log('Γ£à ETH transaction confirmed!');
-          console.log('≡ƒöì ETH tx hash:', ethTxReceipt?.hash);
-          console.log('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxReceipt?.hash);
+          logger.info('Γ£à ETH transaction confirmed!');
+          logger.info({ value: ethTxReceipt?.hash }, '≡ƒöì ETH tx hash:');
+          logger.info('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxReceipt?.hash);
 
           // Update order status
           storedOrder.status = 'completed';
@@ -1791,7 +1797,7 @@ async function initializeRelayer() {
           });
           
         } catch (ethError: any) {
-          console.error('Γ¥î ETH transaction failed:', ethError);
+          logger.error({ err: ethError }, 'Γ¥î ETH transaction failed:');
           // ── Failure store + pipeline metrics ─────────────────────────────
           retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'failure' }, 0);
           droppedOrdersTotal.inc({ direction: 'xlm_to_eth', reason: 'eth_tx_failed' });
@@ -1817,11 +1823,11 @@ async function initializeRelayer() {
 
       // ETHΓåÆXLM: Send XLM to user
       if (isEthToXlm) {
-        console.log('≡ƒÆ░ ETHΓåÆXLM: Sending XLM to user...');
+        logger.info('≡ƒÆ░ ETHΓåÆXLM: Sending XLM to user...');
       
         // Dynamic import Stellar SDK with better error handling
         try {
-        console.log('≡ƒöù Loading Stellar SDK...');
+        logger.info('≡ƒöù Loading Stellar SDK...');
         const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
         
         // Setup Stellar server (dynamic network based on stored order)
@@ -1829,10 +1835,10 @@ async function initializeRelayer() {
         const stellarConfig = NETWORK_CONFIG[dynamicNetwork].stellar;
         const server = new Horizon.Server(stellarConfig.horizonUrl);
         
-        console.log(`≡ƒöù Using Stellar ${dynamicNetwork}:`, {
+        logger.info({
           horizonUrl: stellarConfig.horizonUrl,
           detectedFrom: storedOrder.contractType
-        });
+        }, `≡ƒöù Using Stellar ${dynamicNetwork}:`);
         
         // Relayer Stellar keys (from environment - network specific)
         const relayerSecretKey = dynamicNetwork === 'mainnet' 
@@ -1845,21 +1851,21 @@ async function initializeRelayer() {
         
         const relayerKeypair = Keypair.fromSecret(relayerSecretKey);
         
-        console.log(`≡ƒöù Connecting to Stellar ${dynamicNetwork}...`);
-        console.log(`≡ƒöæ Using relayer public key: ${relayerKeypair.publicKey()}`);
+        logger.info(`≡ƒöù Connecting to Stellar ${dynamicNetwork}...`);
+        logger.info(`≡ƒöæ Using relayer public key: ${relayerKeypair.publicKey()}`);
         const relayerAccount = await server.loadAccount(relayerKeypair.publicKey());
         
         const relayerBalance = relayerAccount.balances.find(b => b.asset_type === 'native')?.balance || '0';
-        console.log('≡ƒÆ░ Relayer XLM balance:', relayerBalance);
+        logger.info({ value: relayerBalance }, '≡ƒÆ░ Relayer XLM balance:');
 
         // Calculate XLM amount to send using real-time rate from frontend
         const exchangeRate = storedOrder?.exchangeRate || ETH_TO_XLM_RATE; // Use real rate if available
         // Convert wei to ETH first, then calculate XLM amount
         const ethAmount = parseFloat(ethers.formatEther(orderAmount || '1000000000000000')); // Convert wei to ETH
         const xlmAmount = (ethAmount * exchangeRate).toFixed(7);
-        console.log('≡ƒÆ▒ Using exchange rate:', exchangeRate, 'XLM per ETH');
-        console.log('≡ƒÄ» Sending to user address:', userStellarAddress);
-        console.log('≡ƒÆ░ XLM amount to send:', xlmAmount);
+        logger.info({ exchangeRate, direction: 'eth_to_xlm' }, '[orders/process] using exchange rate');
+        logger.info({ value: userStellarAddress }, '≡ƒÄ» Sending to user address:');
+        logger.info({ value: xlmAmount }, '≡ƒÆ░ XLM amount to send:');
         
         // Check if relayer has sufficient balance
         if (parseFloat(relayerBalance) < parseFloat(xlmAmount)) {
@@ -1886,14 +1892,14 @@ async function initializeRelayer() {
         
         // Sign transaction
         transaction.sign(relayerKeypair);
-        console.log('≡ƒô¥ Transaction signed');
-        console.log('≡ƒÆ½ Sending XLM to:', userStellarAddress);
+        logger.info('≡ƒô¥ Transaction signed');
+        logger.info({ value: userStellarAddress }, '≡ƒÆ½ Sending XLM to:');
         
         // Submit to network
         const result = await server.submitTransaction(transaction);
-        console.log('Γ£à Stellar transaction successful!');
-        console.log('≡ƒöì Transaction hash:', result.hash);
-        console.log('≡ƒîÉ View on StellarExpert: https://stellar.expert/explorer/' + 
+        logger.info('Γ£à Stellar transaction successful!');
+        logger.info({ value: result.hash }, '≡ƒöì Transaction hash:');
+        logger.info('≡ƒîÉ View on StellarExpert: https://stellar.expert/explorer/' + 
           (DEFAULT_NETWORK_MODE === 'mainnet' ? 'public' : 'testnet') + '/tx/' + result.hash);
         
         // Update order status
@@ -1921,8 +1927,8 @@ async function initializeRelayer() {
         });
 
       } catch (stellarError: any) {
-        console.error('Γ¥î Stellar transaction failed:', stellarError);
-        console.log('Error details:', stellarError.message);
+        logger.error({ err: stellarError }, 'Γ¥î Stellar transaction failed:');
+        logger.info({ value: stellarError.message }, 'Error details:');
 
         // Never fabricate a Stellar tx hash. Surface the real error so the
         // frontend can show "swap failed" and the user can initiate a
@@ -1944,7 +1950,7 @@ async function initializeRelayer() {
       } // End of ETHΓåÆXLM processing
 
     } catch (error: any) {
-      console.error('Γ¥î Order processing failed:', error);
+      logger.error({ err: error }, 'Γ¥î Order processing failed:');
       res.status(500).json({
         error: 'Order processing failed',
         details: error instanceof Error ? error.message : 'Unknown error'
@@ -1955,10 +1961,10 @@ async function initializeRelayer() {
   // POST /api/orders/xlm-to-eth - Dedicated XLMΓåÆETH processing endpoint  
   app.post('/api/orders/xlm-to-eth', async (req, res) => {
     try {
-      console.log('≡ƒöì DEBUG: XLMΓåÆETH endpoint received request body:', JSON.stringify(req.body, null, 2));
-      console.log('≡ƒöì DEBUG: Request headers:', JSON.stringify(req.headers, null, 2));
-      console.log('≡ƒöì DEBUG: Environment check - ETHEREUM_RPC_URL:', process.env.ETHEREUM_RPC_URL ? 'SET' : 'NOT SET');
-      console.log('≡ƒöì DEBUG: Environment check - RELAYER_PRIVATE_KEY:', process.env.RELAYER_PRIVATE_KEY ? 'SET' : 'NOT SET');
+      logger.debug({ body: req.body }, '[xlm-to-eth] request body');
+      logger.debug({ headers: req.headers }, '[xlm-to-eth] request headers');
+      logger.debug({ envSet: !!process.env.ETHEREUM_RPC_URL }, '[xlm-to-eth] ETHEREUM_RPC_URL env check');
+      logger.debug({ envSet: !!process.env.RELAYER_PRIVATE_KEY }, '[xlm-to-eth] RELAYER_PRIVATE_KEY env check');
       
       // ── Pipeline metric: submission latency for xlm-to-eth ────────────
       const xlmToEthTimer = submissionLatencySeconds.startTimer({ direction: 'xlm_to_eth' });
@@ -1973,15 +1979,15 @@ async function initializeRelayer() {
                             (req.query.network as string) || 
                             DEFAULT_NETWORK_MODE;
       
-      console.log('≡ƒîÉ XLMΓåÆETH Endpoint Network Detection:', {
+      logger.info({
         bodyNetworkMode: networkMode,
         queryNetwork: req.query.network,
         defaultMode: DEFAULT_NETWORK_MODE,
         finalDecision: requestNetwork.toUpperCase()
-      });
+      }, '≡ƒîÉ XLMΓåÆETH Endpoint Network Detection:');
       
       if (!orderId || !stellarTxHash || !ethAddress) {
-        console.log('Γ¥î Missing required fields:', { orderId: !!orderId, stellarTxHash: !!stellarTxHash, ethAddress: !!ethAddress });
+        logger.info({ orderId: !!orderId, stellarTxHash: !!stellarTxHash, ethAddress: !!ethAddress }, 'Γ¥î Missing required fields:');
         return res.status(400).json({
           error: 'Missing required fields: orderId, stellarTxHash, ethAddress, stellarAddress',
         });
@@ -1999,7 +2005,7 @@ async function initializeRelayer() {
         });
       }
 
-      console.log('≡ƒÆ░ XLMΓåÆETH: Processing dedicated endpoint...', { orderId, stellarTxHash, stellarAddress, ethAddress });
+      logger.info({ orderId, stellarTxHash, stellarAddress, ethAddress }, '≡ƒÆ░ XLMΓåÆETH: Processing dedicated endpoint...');
       
       // Get stored order - BYPASSED FOR NOW (in-memory data lost on restart)
       let storedOrder = activeOrders.get(orderId);
@@ -2032,7 +2038,7 @@ async function initializeRelayer() {
       if (stellarAddress) storedOrder.stellarAddress = stellarAddress;
       storedOrder.networkMode = storedOrder.networkMode ?? requestNetwork;
       
-      console.log('≡ƒÄ» XLMΓåÆETH: Sending ETH to user...', { userEthAddress, orderAmount });
+      logger.info({ userEthAddress, orderAmount }, '≡ƒÄ» XLMΓåÆETH: Sending ETH to user...');
       
       {
         // Γ£à NETWORK-AWARE: Use request network first, fallback to stored order
@@ -2040,7 +2046,7 @@ async function initializeRelayer() {
         const rpcUrl = resolveEthereumRpcUrl(orderNetworkMode === 'testnet' ? 'testnet' : 'mainnet');
         const privateKey = process.env.RELAYER_PRIVATE_KEY;
         
-        console.log(`≡ƒîÉ XLMΓåÆETH Network Detection (2nd endpoint): ${orderNetworkMode.toUpperCase()}`);
+        logger.info(`≡ƒîÉ XLMΓåÆETH Network Detection (2nd endpoint): ${orderNetworkMode.toUpperCase()}`);
         
         if (!privateKey) {
           throw new Error('RELAYER_PRIVATE_KEY environment variable is required');
@@ -2148,9 +2154,9 @@ async function initializeRelayer() {
       }
 
       try {
-        console.log('≡ƒÆ░ REAL MODE: Sending actual ETH transaction');
-        console.log('≡ƒöù RPC URL:', rpcUrl);
-        console.log('≡ƒöæ Using relayer key: [REDACTED]');
+        logger.info('≡ƒÆ░ REAL MODE: Sending actual ETH transaction');
+        logger.info({ value: rpcUrl }, '≡ƒöù RPC URL:');
+        logger.info('≡ƒöæ Using relayer key: [REDACTED]');
 
         // ── Settlement-permission check (settle / ethereum) ───────────────
         //
@@ -2165,7 +2171,7 @@ async function initializeRelayer() {
           { command: 'settle', direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' }
         );
         if (!settleAuth.authorized) {
-          console.warn(
+          logger.warn(
             `🚫 Settlement permission denied [${settleAuth.code}]: ${settleAuth.reason}`,
             formatAuthorizationLog(settleAuth)
           );
@@ -2177,7 +2183,7 @@ async function initializeRelayer() {
             chain: settleAuth.chain,
           });
         }
-        console.log(
+        logger.info(
           '✅ Settlement permission granted',
           formatAuthorizationLog(settleAuth)
         );
@@ -2185,10 +2191,10 @@ async function initializeRelayer() {
         const provider = new ethers.JsonRpcProvider(rpcUrl);
         const relayerWallet = new ethers.Wallet(privateKey, provider);
 
-        console.log('≡ƒöæ Relayer ETH address:', relayerWallet.address);
+        logger.info({ value: relayerWallet.address }, '≡ƒöæ Relayer ETH address:');
 
         // ── Balance check (retried via RetryEngine) ───────────────────────
-        console.log('≡ƒöì Getting relayer balance...');
+        logger.info('≡ƒöì Getting relayer balance...');
         const balance = await runWithSettlementRetry(
           'eth-balance',
           ETH_BALANCE_RETRY,
@@ -2199,7 +2205,7 @@ async function initializeRelayer() {
           ),
           { orderId, direction: storedOrder?.direction ?? 'xlm_to_eth', chain: 'ethereum' },
         );
-        console.log('≡ƒÆ░ Relayer ETH balance:', ethers.formatEther(balance), 'ETH');
+        logger.info({ balance: ethers.formatEther(balance), chain: 'ethereum' }, '[xlm-to-eth] relayer ETH balance');
         
         // ── Derive ETH amount from the Horizon-verified XLM amount ────────────
         // All arithmetic is integer-based (bigint stroops → bigint wei).
@@ -2246,16 +2252,15 @@ async function initializeRelayer() {
           });
         }
 
-        process.stdout.write(JSON.stringify({
-          level: 'info',
-          msg: '[xlm-to-eth] amount calculation',
+        logger.info({
           orderId,
           verifiedXlmAmount: verifiedPayment.amount,
           xlmStroops: xlmStroops.toString(),
           exchangeRate,
           ethAmountWei: ethAmountWei.toString(),
           ethAmountFormatted: ethers.formatEther(ethAmountWei),
-        }) + '\n');
+          chain: 'ethereum', direction: 'xlm_to_eth',
+        }, '[xlm-to-eth] amount calculation');
         const tx = {
           to: userEthAddress,
           value: ethAmountWei,
@@ -2293,8 +2298,8 @@ async function initializeRelayer() {
         );
         // ── Retry histogram: eth_send ─────────────────────────────────────
         retryAttemptsHistogram.observe({ operation: 'eth_send', result: 'success' }, 0);
-        console.log('≡ƒôñ ETH transaction sent:', ethTxResponse.hash);
-        console.log('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxResponse.hash);
+        logger.info({ value: ethTxResponse.hash }, '≡ƒôñ ETH transaction sent:');
+        logger.info('≡ƒîÉ View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxResponse.hash);
         
         if (storedOrder) {
           storedOrder.status = 'eth_tx_sent';
@@ -2320,17 +2325,17 @@ async function initializeRelayer() {
           },
         });
         
-        console.log('≡ƒÄë XLMΓåÆETH broadcasted successfully');
+        logger.info('≡ƒÄë XLMΓåÆETH broadcasted successfully');
         
       } catch (ethError: any) {
-        console.error('Γ¥î ETH transaction failed:', ethError);
-        console.error('Γ¥î Full ETH error details:', {
+        logger.error({ err: ethError }, 'Γ¥î ETH transaction failed:');
+        logger.error({
           name: ethError.name,
           message: ethError.message,
           code: ethError.code,
           stack: ethError.stack,
           data: ethError.data
-        });
+        }, 'Γ¥î Full ETH error details:');
 
         // ≡ƒåÿ AUTOMATIC XLM REFUND: User sent XLM but we couldn't send ETH.
         // Refund the XLM back to the user to prevent fund loss.
@@ -2366,7 +2371,7 @@ async function initializeRelayer() {
               refundResult = { hash: refund.hash };
               storedOrder.status = 'refunded';
               storedOrder.refundTxHash = refund.hash;
-              console.log(`✅ Automatic XLM refund: ${refund.hash} (${refund.amount} XLM)`);
+              logger.info(`✅ Automatic XLM refund: ${refund.hash} (${refund.amount} XLM)`);
             } catch (refundErr: any) {
               if (refundErr instanceof HorizonTimeoutError) {
                 refundIsAmbiguous = true;
@@ -2378,12 +2383,12 @@ async function initializeRelayer() {
                 globalRefundLedger.release(orderId);
                 refundError = refundErr.message || 'Refund failed';
               }
-              console.error('❌ Automatic XLM refund failed:', refundErr?.message ?? refundErr);
+              logger.error({ err: refundErr?.message ?? refundErr }, '[xlm-to-eth] automatic XLM refund failed');
             }
           }
         } else {
           refundError = relayerSecretKey ? 'Missing stellarAddress for refund' : `Relayer Stellar secret not configured for ${orderNetworkMode}`;
-          console.error('❌ Cannot refund:', refundError);
+          logger.error({ err: refundError }, '[xlm-to-eth] cannot refund');
         }
 
         // ── Pipeline metrics: ETH send fatal failure (xlm-to-eth) ────────
@@ -2422,13 +2427,13 @@ async function initializeRelayer() {
       }
 
     } catch (error: any) {
-      console.error('Γ¥î XLMΓåÆETH processing failed:', error);
-      console.error('Γ¥î Error stack trace:', error.stack);
-      console.error('Γ¥î Error details:', {
+      logger.error({ err: error }, 'Γ¥î XLMΓåÆETH processing failed:');
+      logger.error({ stack: error.stack }, '[xlm-to-eth] error stack trace');
+      logger.error({
         message: error.message,
         name: error.name,
         code: error.code
-      });
+      }, 'Γ¥î Error details:');
       
       res.status(500).json({
         error: 'XLMΓåÆETH processing failed',
@@ -2463,7 +2468,7 @@ async function initializeRelayer() {
           return stellarTxHash; // worst-case: key by tx hash
         })();
 
-      console.log('🆘 Manual refund requested:', { stellarTxHash, stellarAddress, refundNetwork, orderId });
+      logger.info({ stellarTxHash, stellarAddress, refundNetwork, orderId }, '🆘 Manual refund requested:');
 
       // ── Idempotency check ─────────────────────────────────────────────
       const existing = globalRefundLedger.getEntry(orderId);
@@ -2526,7 +2531,7 @@ async function initializeRelayer() {
           });
         }
         verifiedAmount = paymentOp.amount;
-        console.log(`💰 Verified original payment: ${verifiedAmount} XLM`);
+        logger.info(`💰 Verified original payment: ${verifiedAmount} XLM`);
       } catch (lookupErr: any) {
         return res.status(404).json({
           error: 'Could not verify original transaction',
@@ -2567,7 +2572,7 @@ async function initializeRelayer() {
           storedOrder.refundedAt = Date.now();
         }
 
-        console.log('✅ Manual refund successful:', refund.hash);
+        logger.info({ value: refund.hash }, '✅ Manual refund successful:');
 
         return res.json({
           success: true,
@@ -2593,7 +2598,7 @@ async function initializeRelayer() {
 
         // Definitive failure — release so caller can retry
         globalRefundLedger.release(orderId);
-        console.error('❌ Manual refund failed:', refundErr);
+        logger.error({ err: refundErr }, '❌ Manual refund failed:');
         return res.status(500).json({
           error: 'Manual refund failed',
           details: refundErr.message,
@@ -2601,7 +2606,7 @@ async function initializeRelayer() {
         });
       }
     } catch (err: any) {
-      console.error('❌ Manual refund endpoint error:', err);
+      logger.error({ err: err }, '❌ Manual refund endpoint error:');
       res.status(500).json({
         error: 'Manual refund failed',
         details: err.message,
@@ -2610,11 +2615,11 @@ async function initializeRelayer() {
     }
   });
 
-  console.log('≡ƒôì DEBUG: Orders endpoints registered successfully');
+  logger.info('≡ƒôì DEBUG: Orders endpoints registered successfully');
 
   // Phase 6.5: EscrowFactory Event Listening (lazy ΓÇö first swap order only)
   startChainMonitoring = async () => {
-  console.log('≡ƒöù Chain monitoring starting (swap order in flight)...');
+  logger.info('≡ƒöù Chain monitoring starting (swap order in flight)...');
   
   // Setup EscrowFactory contract instance for event listening
   try {
@@ -2632,11 +2637,11 @@ async function initializeRelayer() {
     const relayerWallet = new ethers.Wallet(relayerPrivateKey, provider);
     const relayerAddress = relayerWallet.address;
     
-    console.log('≡ƒöæ Relayer address for proxy operations:', relayerAddress);
+    logger.info({ value: relayerAddress }, '≡ƒöæ Relayer address for proxy operations:');
     
     // Skip authorization check to reduce API calls and avoid spam
-    console.log('≡ƒÆí To authorize relayer: POST /api/admin/authorize-relayer');
-    console.log('ΓÜá∩╕Å  Skipping authorization check to reduce API rate limit issues');
+    logger.info('≡ƒÆí To authorize relayer: POST /api/admin/authorize-relayer');
+    logger.info('ΓÜá∩╕Å  Skipping authorization check to reduce API rate limit issues');
     
     // Monitor incoming ETH transfers to relayer ΓÇö only while an order
     // is waiting for the user's deposit. Uses prefetched block txs
@@ -2659,15 +2664,15 @@ async function initializeRelayer() {
         lastProcessedBlock = cursor;
 
         for (const payment of payments) {
-          console.log('≡ƒÆ░ Incoming ETH transfer detected:', {
+          logger.info({
             from: payment.from,
             value: ethers.formatEther(payment.value),
             hash: payment.hash,
-          });
+          }, '≡ƒÆ░ Incoming ETH transfer detected:');
 
           for (const [orderId, orderData] of activeOrders.entries()) {
             if (orderData.ethAddress === payment.from && orderData.status === 'pending_relayer_escrow') {
-              console.log(`Γ£à Matched transfer to order ${orderId}`);
+              logger.info(`Γ£à Matched transfer to order ${orderId}`);
               await createEscrowForOrder(orderData, orderId, escrowFactoryContract, relayerWallet);
               break;
             }
@@ -2677,7 +2682,7 @@ async function initializeRelayer() {
     }));
 
     // XLM Payment Monitoring for XLMΓåÆETH orders ΓÇö only while awaiting payment.
-    console.log('≡ƒîƒ Starting Stellar payment monitoring...');
+    logger.info('≡ƒîƒ Starting Stellar payment monitoring...');
     let lastProcessedStellarLedger = 0;
 
     chainPollers.push(startAdaptivePoll({
@@ -2699,7 +2704,7 @@ async function initializeRelayer() {
         
         if (lastProcessedStellarLedger === 0) {
           lastProcessedStellarLedger = currentLedger - 10;
-          console.log('≡ƒîƒ Stellar monitoring initialized, starting from ledger:', lastProcessedStellarLedger);
+          logger.info({ value: lastProcessedStellarLedger }, '≡ƒîƒ Stellar monitoring initialized, starting from ledger:');
           return;
         }
         
@@ -2712,31 +2717,31 @@ async function initializeRelayer() {
         
         for (const payment of paymentsResponse.records) {
           if (payment.type === 'payment' && payment.asset_type === 'native' && payment.to === relayerStellarPublic) {
-            console.log('≡ƒÆ░ XLM payment detected:', {
+            logger.info({
               from: payment.from,
               amount: payment.amount,
               txHash: payment.transaction_hash
-            });
+            }, '≡ƒÆ░ XLM payment detected:');
             
             const txResponse = await server.transactions().transaction(payment.transaction_hash).call();
             const memo = txResponse.memo;
             
             if (memo && memo.startsWith('XLM-ETH-')) {
               const orderPrefix = memo.replace('XLM-ETH-', '');
-              console.log('≡ƒöì Found XLMΓåÆETH payment with memo:', memo, 'Order prefix:', orderPrefix);
+              logger.info({ memo, orderPrefix }, '[stellar-monitor] found XLM-to-ETH payment');
               
               for (const [orderId, orderData] of activeOrders.entries()) {
                 if (orderId.includes(orderPrefix) && orderData.status === 'awaiting_xlm_payment') {
-                  console.log('Γ£à Matched XLM payment to order:', orderId);
+                  logger.info({ value: orderId }, 'Γ£à Matched XLM payment to order:');
                   
                   const expectedXLM = parseFloat(orderData.stellar.amount);
                   const receivedXLM = parseFloat(payment.amount);
                   
                   if (Math.abs(receivedXLM - expectedXLM) < 0.001) {
-                    console.log('≡ƒÆ░ XLM amount verified:', receivedXLM, 'Γëê', expectedXLM);
+                    logger.info({ receivedXLM, expectedXLM, chain: 'stellar' }, '[stellar-monitor] XLM amount verified');
                     await createETHHTLCForOrder(orderData, orderId);
                   } else {
-                    console.warn('ΓÜá∩╕Å XLM amount mismatch:', receivedXLM, 'vs expected:', expectedXLM);
+                    logger.warn({ receivedXLM, expectedXLM, chain: 'stellar' }, '[stellar-monitor] XLM amount mismatch');
                   }
                   break;
                 }
@@ -2751,7 +2756,7 @@ async function initializeRelayer() {
     
     // Function to create ETH HTLC after XLM payment received
     async function createETHHTLCForOrder(orderData: any, orderId: string) {
-      console.log('≡ƒÅ¡ Creating ETH HTLC for verified XLM payment:', orderId);
+      logger.info({ value: orderId }, '≡ƒÅ¡ Creating ETH HTLC for verified XLM payment:');
       
       try {
         const provider = new ethers.JsonRpcProvider(
@@ -2761,7 +2766,7 @@ async function initializeRelayer() {
         
         // Check relayer balance first
         const relayerBalance = await provider.getBalance(relayerWallet.address);
-        console.log('≡ƒÆ░ Relayer ETH balance:', ethers.formatEther(relayerBalance), 'ETH');
+        logger.info({ balance: ethers.formatEther(relayerBalance), chain: 'ethereum' }, '[chain-monitor] relayer ETH balance');
         
         const mainnetHTLCAddress = getHtlcBridgeAddress('mainnet');
         const mainnetHTLCContract = new ethers.Contract(mainnetHTLCAddress, [
@@ -2771,7 +2776,7 @@ async function initializeRelayer() {
         const ethAmountWei = BigInt(orderData.ethAmount);
         const timelockEth = Math.floor(Date.now() / 1000) + 7200; // 2 hours
         
-        console.log('≡ƒöó DETAILED ETH HTLC DEBUG:', {
+        logger.info({
           orderData_ethAmount: orderData.ethAmount,
           ethAmountWei_string: ethAmountWei.toString(),
           ethAmountWei_formatted: ethers.formatEther(ethAmountWei),
@@ -2780,19 +2785,19 @@ async function initializeRelayer() {
           relayerAddress: relayerWallet.address,
           relayerBalance_ETH: ethers.formatEther(relayerBalance),
           contractAddress: mainnetHTLCAddress
-        });
+        }, '≡ƒöó DETAILED ETH HTLC DEBUG:');
 
         // Check for insufficient balance
         const estimatedGasCost = ethers.parseEther("0.002"); // ~0.002 ETH for gas
         const totalRequired = ethAmountWei + estimatedGasCost;
         
-        console.log('≡ƒÆ░ Balance Check:', {
+        logger.info({
           required_ETH: ethers.formatEther(ethAmountWei),
           gas_estimate_ETH: ethers.formatEther(estimatedGasCost),
           total_required_ETH: ethers.formatEther(totalRequired),
           relayer_balance_ETH: ethers.formatEther(relayerBalance),
           has_sufficient_balance: relayerBalance >= totalRequired
-        });
+        }, '≡ƒÆ░ Balance Check:');
         
         if (relayerBalance < totalRequired) {
           throw new Error(`Γ¥î Insufficient relayer balance! Need ${ethers.formatEther(totalRequired)} ETH, have ${ethers.formatEther(relayerBalance)} ETH`);
@@ -2814,9 +2819,9 @@ async function initializeRelayer() {
           { orderId, direction: 'xlm_to_eth', chain: 'ethereum' },
         );
 
-        console.log('≡ƒô¥ ETH HTLC TX sent:', ethTx.hash);
+        logger.info({ value: ethTx.hash }, '≡ƒô¥ ETH HTLC TX sent:');
         const ethReceipt = await ethTx.wait();
-        console.log('Γ£à ETH HTLC created successfully for order:', orderId);
+        logger.info({ value: orderId }, 'Γ£à ETH HTLC created successfully for order:');
 
         // Update order status
         orderData.status = 'eth_htlc_created';
@@ -2826,10 +2831,10 @@ async function initializeRelayer() {
           contractAddress: mainnetHTLCAddress
         };
         
-        console.log('≡ƒÄë XLMΓåÆETH swap ready! User can now claim ETH (secret is stored server-side, not logged)');
+        logger.info('≡ƒÄë XLMΓåÆETH swap ready! User can now claim ETH (secret is stored server-side, not logged)');
         
       } catch (error) {
-        console.error('Γ¥î ETH HTLC creation failed for order:', orderId, error);
+        logger.error({ orderId, err: error, chain: 'ethereum' }, '[chain-monitor] ETH HTLC creation failed');
         orderData.status = 'eth_htlc_failed';
       }
     }
@@ -2837,7 +2842,7 @@ async function initializeRelayer() {
     // Function to create escrow for order
     async function createEscrowForOrder(orderData: any, orderId: string, contract: ethers.Contract, wallet: ethers.Wallet) {
       try {
-        console.log(`≡ƒÅ¡ Creating escrow for order ${orderId}...`);
+        logger.info(`≡ƒÅ¡ Creating escrow for order ${orderId}...`);
         
         // Calculate dynamic safety deposit for this escrow with network awareness
         const orderAmountBigInt = BigInt(orderData.amount);
@@ -2853,7 +2858,7 @@ async function initializeRelayer() {
         
         if (isMainnetRequest) {
                   // MAINNET: Use createDstEscrow (1inch cross-chain resolver pattern)
-        console.log('≡ƒÅ¡ MAINNET: Using createDstEscrow method (1inch pattern)...');
+        logger.info('≡ƒÅ¡ MAINNET: Using createDstEscrow method (1inch pattern)...');
           
           // Generate order hash
           const orderHash = orderData.orderHash || ethers.keccak256(
@@ -2890,12 +2895,12 @@ async function initializeRelayer() {
           };
           
                   // Call createDstEscrow method
-        console.log('≡ƒÜÇ Calling createDstEscrow with parameters:', {
+        logger.info({
             srcChainId,
             orderHash: orderHash.substring(0, 10) + '...',
             makingAmount: ethers.formatEther(order.makingAmount),
             safetyDeposit: ethers.formatEther(actualSafetyDeposit)
-          });
+          }, '≡ƒÜÇ Calling createDstEscrow with parameters:');
           
           // Use createDstEscrow method
           tx = await contractWithSigner.createDstEscrow(
@@ -2911,7 +2916,7 @@ async function initializeRelayer() {
           );
         } else {
           // TESTNET: Use createEscrow
-          console.log('≡ƒÅ¡ TESTNET: Using createEscrow...');
+          logger.info('≡ƒÅ¡ TESTNET: Using createEscrow...');
           
           const escrowConfig = {
             token: '0x0000000000000000000000000000000000000000', // ETH
@@ -2932,16 +2937,16 @@ async function initializeRelayer() {
           });
         }
         
-        console.log(`≡ƒô¥ Escrow creation tx sent: ${tx.hash}`);
+        logger.info(`≡ƒô¥ Escrow creation tx sent: ${tx.hash}`);
         const receipt = await tx.wait();
-        console.log(`Γ£à Escrow created successfully for order ${orderId}`);
+        logger.info(`Γ£à Escrow created successfully for order ${orderId}`);
         
         // Update order status
         orderData.status = 'escrow_created_by_relayer';
         orderData.escrowTxHash = tx.hash;
         
       } catch (error) {
-        console.error(`Γ¥î Failed to create escrow for order ${orderId}:`, error);
+        logger.error({ err: error }, `Γ¥î Failed to create escrow for order ${orderId}:`);
         orderData.status = 'escrow_creation_failed';
       }
     }
@@ -2960,19 +2965,19 @@ async function initializeRelayer() {
     if (isMainnetContract) {
       // MAINNET: Ger├ºek 1inch events
       escrowFactoryEventBindings.push({ eventName: 'SrcEscrowCreated', handler: async (srcImmutables, dstImmutablesComplement, event) => {
-        console.log('≡ƒÅ¡ MAINNET SrcEscrowCreated Event:', {
+        logger.info({
           orderHash: srcImmutables.orderHash,
           hashlock: srcImmutables.hashlock,
           maker: srcImmutables.maker.toString(),
           taker: srcImmutables.taker.toString(),
           amount: ethers.formatEther(srcImmutables.amount),
           safetyDeposit: ethers.formatEther(srcImmutables.safetyDeposit)
-        });
+        }, '≡ƒÅ¡ MAINNET SrcEscrowCreated Event:');
         
         // Find related order and update status
         for (const [orderId, orderData] of activeOrders.entries()) {
           if (orderData.hashLock === srcImmutables.hashlock) {
-            console.log(`Γ£à Matched src escrow ${srcImmutables.orderHash} with order ${orderId}`);
+            logger.info(`Γ£à Matched src escrow ${srcImmutables.orderHash} with order ${orderId}`);
             orderData.orderHash = srcImmutables.orderHash;
             orderData.status = 'src_escrow_created';
             break;
@@ -2981,16 +2986,16 @@ async function initializeRelayer() {
       }});
 
       escrowFactoryEventBindings.push({ eventName: 'DstEscrowCreated', handler: async (escrowAddress, hashlock, taker, event) => {
-        console.log('≡ƒÅ¡ MAINNET DstEscrowCreated Event:', {
+        logger.info({
           escrowAddress,
           hashlock,
           taker: taker.toString()
-        });
+        }, '≡ƒÅ¡ MAINNET DstEscrowCreated Event:');
 
         // Find related order and update status
         for (const [orderId, orderData] of activeOrders.entries()) {
           if (orderData.hashLock === hashlock) {
-            console.log(`Γ£à Matched dst escrow ${escrowAddress} with order ${orderId}`);
+            logger.info(`Γ£à Matched dst escrow ${escrowAddress} with order ${orderId}`);
             orderData.escrowAddress = escrowAddress;
             orderData.status = 'dst_escrow_created';
             break;
@@ -3000,7 +3005,7 @@ async function initializeRelayer() {
     } else {
       // TESTNET: Bizim custom events
       escrowFactoryEventBindings.push({ eventName: 'EscrowCreated', handler: async (escrowId, escrowAddress, resolver, token, amount, hashLock, timelock, safetyDeposit, chainId, event) => {
-        console.log('≡ƒÅ¡ TESTNET EscrowCreated Event:', {
+        logger.info({
           escrowId: escrowId.toString(),
           escrowAddress,
           resolver,
@@ -3009,12 +3014,12 @@ async function initializeRelayer() {
           hashLock,
           chainId: chainId.toString(),
           safetyDeposit: ethers.formatEther(safetyDeposit)
-        });
+        }, '≡ƒÅ¡ TESTNET EscrowCreated Event:');
 
         // Find related order and update status
         for (const [orderId, orderData] of activeOrders.entries()) {
           if (orderData.hashLock === hashLock) {
-            console.log(`Γ£à Matched escrow ${escrowId} with order ${orderId}`);
+            logger.info(`Γ£à Matched escrow ${escrowId} with order ${orderId}`);
             orderData.escrowId = escrowId.toString();
             orderData.escrowAddress = escrowAddress;
             orderData.status = 'escrow_active';
@@ -3025,17 +3030,17 @@ async function initializeRelayer() {
 
       // Testnet EscrowFunded event
       escrowFactoryEventBindings.push({ eventName: 'EscrowFunded', handler: async (escrowId, funder, amount, safetyDeposit, event) => {
-        console.log('≡ƒÆ░ TESTNET EscrowFunded Event:', {
+        logger.info({
           escrowId: escrowId.toString(),
           funder,
           amount: ethers.formatEther(amount),
           safetyDeposit: ethers.formatEther(safetyDeposit)
-        });
+        }, '≡ƒÆ░ TESTNET EscrowFunded Event:');
 
         // Update related order status
         for (const [orderId, orderData] of activeOrders.entries()) {
           if (orderData.escrowId === escrowId.toString()) {
-            console.log(`Γ£à Escrow ${escrowId} funded for order ${orderId}`);
+            logger.info(`Γ£à Escrow ${escrowId} funded for order ${orderId}`);
             orderData.status = 'escrow_funded';
             break;
           }
@@ -3058,10 +3063,10 @@ async function initializeRelayer() {
       );
     }
 
-    console.log('Γ£à EscrowFactory event listeners set up successfully');
+    logger.info('Γ£à EscrowFactory event listeners set up successfully');
 
     if (DEFAULT_NETWORK_MODE !== 'mainnet') {
-      console.log('≡ƒöä Starting EthereumEventListener for HTLCBridge monitoring');
+      logger.info('≡ƒöä Starting EthereumEventListener for HTLCBridge monitoring');
       ethereumListener.configurePolling({
         isActive: () => needsChainMonitoring(activeOrders),
         isAttentive: () => hasRecentVisitor(),
@@ -3069,7 +3074,7 @@ async function initializeRelayer() {
       await ethereumListener.startListening();
     }
   } catch (error) {
-    console.error('Γ¥î Failed to setup EscrowFactory events:', error);
+    logger.error({ err: error }, 'Γ¥î Failed to setup EscrowFactory events:');
     throw error;
   }
   };
@@ -3079,7 +3084,7 @@ async function initializeRelayer() {
   // Admin endpoint to authorize relayer
   app.post('/api/admin/authorize-relayer', requireAdminAuth(), async (req, res) => {
     try {
-      console.log('≡ƒöÉ Authorizing relayer as resolver...');
+      logger.info('≡ƒöÉ Authorizing relayer as resolver...');
       
       // Admin private key MUST come from the server environment, never from
       // the request body. Accepting secrets over the wire would expose them
@@ -3111,9 +3116,9 @@ async function initializeRelayer() {
       const contractWithSigner = escrowFactoryContract as any;
       const tx = await contractWithSigner.authorizeResolver(relayerAddress);
       
-      console.log(`≡ƒô¥ Authorization tx sent: ${tx.hash}`);
+      logger.info(`≡ƒô¥ Authorization tx sent: ${tx.hash}`);
       const receipt = await tx.wait();
-      console.log(`Γ£à Relayer ${relayerAddress} authorized successfully`);
+      logger.info(`Γ£à Relayer ${relayerAddress} authorized successfully`);
       
       res.json({
         success: true,
@@ -3123,7 +3128,7 @@ async function initializeRelayer() {
       });
       
     } catch (error) {
-      console.error('Γ¥î Failed to authorize relayer:', error);
+      logger.error({ err: error }, 'Γ¥î Failed to authorize relayer:');
       res.status(500).json({
         success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -3161,7 +3166,7 @@ async function initializeRelayer() {
       });
       
     } catch (error) {
-      console.error('Γ¥î Failed to check relayer status:', error);
+      logger.error({ err: error }, 'Γ¥î Failed to check relayer status:');
       res.status(500).json({
         success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -3204,7 +3209,7 @@ async function initializeRelayer() {
         resolvers: results
       });
     } catch (error) {
-      console.error('Γ¥î Failed to list resolvers:', error);
+      logger.error({ err: error }, 'Γ¥î Failed to list resolvers:');
       res.status(500).json({
         success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -3213,7 +3218,7 @@ async function initializeRelayer() {
     }
   });
 
-  console.log('Γ£à Admin endpoints registered');
+  logger.info('Γ£à Admin endpoints registered');
 
   // ── GET /api/admin/settlement-failures ───────────────────────────────────
   //
@@ -3267,7 +3272,7 @@ async function initializeRelayer() {
         })),
       });
     } catch (err: any) {
-      console.error('Γ¥î /api/admin/settlement-failures failed:', err);
+      logger.error({ err: err }, 'Γ¥î /api/admin/settlement-failures failed:');
       res.status(500).json({ error: 'Failed to retrieve settlement failures', details: err.message });
     }
   });
@@ -3287,12 +3292,12 @@ async function initializeRelayer() {
       }
       res.json({ record });
     } catch (err: any) {
-      console.error('Γ¥î /api/admin/settlement-failures/:orderId failed:', err);
+      logger.error({ err: err }, 'Γ¥î /api/admin/settlement-failures/:orderId failed:');
       res.status(500).json({ error: 'Failed to retrieve failure record', details: err.message });
     }
   });
 
-  console.log('Γ£à Settlement failures endpoint registered');
+  logger.info('Γ£à Settlement failures endpoint registered');
 
   // ═══════════════════════════════════════════════════════════════════════════════════════
             // 1INCH ESCROW FACTORY ENDPOINTS - Using createDstEscrow approach
@@ -3301,7 +3306,7 @@ async function initializeRelayer() {
   // Get escrow factory information
   app.get('/api/escrow/info', async (req, res) => {
     try {
-      console.log('≡ƒÅ¡ Getting 1inch Escrow Factory info...');
+      logger.info('≡ƒÅ¡ Getting 1inch Escrow Factory info...');
       
       const escrowFactoryAddress = getEscrowFactoryAddress('mainnet');
       
@@ -3313,7 +3318,7 @@ async function initializeRelayer() {
       });
       
     } catch (error: any) {
-      console.error('Γ¥î Failed to get escrow info:', error);
+      logger.error({ err: error }, 'Γ¥î Failed to get escrow info:');
       res.status(500).json({
         success: false,
         error: error.message
@@ -3321,7 +3326,7 @@ async function initializeRelayer() {
     }
   });
 
-  console.log('Γ£à Escrow Factory endpoints registered');
+  logger.info('Γ£à Escrow Factory endpoints registered');
 
   // ≡ƒ¢í∩╕Å Refund watchdog: rescue stuck XLMΓåÆETH orders that the request
   // loop failed to refund (e.g. user closed the tab, RPC outage past
@@ -3344,33 +3349,33 @@ async function initializeRelayer() {
         activeOrders,
       });
     } else {
-      console.warn('ΓÜá∩╕Å Refund watchdog disabled: RELAYER_STELLAR_SECRET not configured.');
+      logger.warn('ΓÜá∩╕Å Refund watchdog disabled: RELAYER_STELLAR_SECRET not configured.');
     }
   } catch (watchdogErr) {
-    console.error('Γ¥î Failed to start refund watchdog:', watchdogErr);
+    logger.error({ err: watchdogErr }, 'Γ¥î Failed to start refund watchdog:');
   }
 
   // Start HTTP server
   const server = app.listen(RELAYER_CONFIG.port, () => {
-    console.log(`≡ƒîÉ HTTP server started on port ${RELAYER_CONFIG.port}`);
+    logger.info(`≡ƒîÉ HTTP server started on port ${RELAYER_CONFIG.port}`);
   });
   
-  console.log('Γ£à Relayer service initialized successfully');
-  console.log('≡ƒÄ» Ready to process cross-chain swaps');
+  logger.info('Γ£à Relayer service initialized successfully');
+  logger.info('≡ƒÄ» Ready to process cross-chain swaps');
 }
 
 // Graceful shutdown handler
 async function gracefulShutdown() {
-  console.log('\n≡ƒ¢æ Shutting down relayer service...');
+  logger.info('\n≡ƒ¢æ Shutting down relayer service...');
   
   try {
     await ethereumListener.stopListening();
-    console.log('Γ£à Ethereum listener stopped');
+    logger.info('Γ£à Ethereum listener stopped');
   } catch (error) {
-    console.error('Γ¥î Error stopping Ethereum listener:', error);
+    logger.error({ err: error }, 'Γ¥î Error stopping Ethereum listener:');
   }
   
-  console.log('≡ƒæï Relayer service shutdown complete');
+  logger.info('≡ƒæï Relayer service shutdown complete');
   process.exit(0);
 }
 
@@ -3389,7 +3394,7 @@ app.get('/metrics', (req, res) => {
     const metrics = monitor.getMetrics();
     res.json(metrics);
   } catch (error) {
-    console.error('Γ¥î Metrics fetch failed:', error);
+    logger.error({ err: error }, 'Γ¥î Metrics fetch failed:');
     res.status(500).json({
       error: 'Failed to fetch metrics',
       message: error instanceof Error ? error.message : 'Unknown error'
@@ -3409,7 +3414,7 @@ app.get('/uptime', (req, res) => {
       status: monitor.getSystemStatus()
     });
   } catch (error) {
-    console.error('Γ¥î Uptime check failed:', error);
+    logger.error({ err: error }, 'Γ¥î Uptime check failed:');
     res.status(500).json({
       error: 'Failed to fetch uptime',
       message: error instanceof Error ? error.message : 'Unknown error'
@@ -3424,7 +3429,7 @@ app.get('/uptime', (req, res) => {
 
 // Function to process Escrow deployment and send XLM to user
 async function processEscrowToStellar(orderId: string, storedOrder: any) {
-  console.log(`≡ƒöä Processing Escrow ΓåÆ Stellar transfer for order ${orderId}...`);
+  logger.info(`≡ƒöä Processing Escrow ΓåÆ Stellar transfer for order ${orderId}...`);
   
   try {
     // Dynamic import Stellar SDK
@@ -3435,7 +3440,7 @@ async function processEscrowToStellar(orderId: string, storedOrder: any) {
     const stellarConfig = NETWORK_CONFIG.mainnet.stellar;
     const server = new Horizon.Server(stellarConfig.horizonUrl);
     
-    console.log('≡ƒöù Using Stellar Mainnet for escrow completion');
+    logger.info('≡ƒöù Using Stellar Mainnet for escrow completion');
     
     // Relayer Stellar keys (mainnet specific)
     const relayerSecretKey = process.env.RELAYER_STELLAR_SECRET_MAINNET || process.env.RELAYER_STELLAR_SECRET;
@@ -3446,19 +3451,19 @@ async function processEscrowToStellar(orderId: string, storedOrder: any) {
     
     const relayerKeypair = Keypair.fromSecret(relayerSecretKey);
     
-    console.log(`≡ƒöæ Using relayer public key (mainnet): ${relayerKeypair.publicKey()}`);
+    logger.info(`≡ƒöæ Using relayer public key (mainnet): ${relayerKeypair.publicKey()}`);
     const relayerAccount = await server.loadAccount(relayerKeypair.publicKey());
     
     const relayerBalance = relayerAccount.balances.find(b => b.asset_type === 'native')?.balance || '0';
-    console.log('≡ƒÆ░ Relayer XLM balance:', relayerBalance);
+    logger.info({ value: relayerBalance }, '≡ƒÆ░ Relayer XLM balance:');
     
     // Calculate XLM amount based on exchange rate
     const exchangeRate = storedOrder.exchangeRate || ETH_TO_XLM_RATE;
     const xlmAmount = (parseFloat(storedOrder.amount) * exchangeRate).toFixed(7);
     
-    console.log('≡ƒÆ▒ Exchange rate:', exchangeRate, 'XLM per ETH');
-    console.log('≡ƒÄ» Sending XLM to:', storedOrder.stellarAddress);
-    console.log('≡ƒÆ░ XLM amount:', xlmAmount);
+    logger.info({ exchangeRate, direction: 'eth_to_xlm' }, '[escrow-to-stellar] exchange rate');
+    logger.info({ value: storedOrder.stellarAddress }, '≡ƒÄ» Sending XLM to:');
+    logger.info({ value: xlmAmount }, '≡ƒÆ░ XLM amount:');
     
     // Check if relayer has sufficient balance
     if (parseFloat(relayerBalance) < parseFloat(xlmAmount)) {
@@ -3486,18 +3491,18 @@ async function processEscrowToStellar(orderId: string, storedOrder: any) {
     transaction.sign(relayerKeypair);
     const result = await server.submitTransaction(transaction);
     
-    console.log('Γ£à XLM payment sent:', result.hash);
-    console.log('≡ƒîÉ View on Stellar Explorer:', `https://stellarchain.io/transactions/${result.hash}`);
+    logger.info({ value: result.hash }, 'Γ£à XLM payment sent:');
+    logger.info({ txHash: result.hash, explorerUrl: `https://stellarchain.io/transactions/${result.hash}` }, '[escrow-to-stellar] view on explorer');
     
     // Update order status
     storedOrder.status = 'completed';
     storedOrder.stellarTxHash = result.hash;
     storedOrder.completedAt = new Date().toISOString();
     
-    console.log(`≡ƒÄë Escrow bridge completed for order ${orderId}!`);
+    logger.info(`≡ƒÄë Escrow bridge completed for order ${orderId}!`);
     
   } catch (error) {
-    console.error(`Γ¥î Failed to process Escrow ΓåÆ Stellar transfer:`, error);
+    logger.error({ err: error }, `Γ¥î Failed to process Escrow ΓåÆ Stellar transfer:`);
     
     // Update order status to error
     storedOrder.status = 'stellar_transfer_failed';
@@ -3507,10 +3512,10 @@ async function processEscrowToStellar(orderId: string, storedOrder: any) {
 
 // Start relayer (always initialize when module loads)
   initializeRelayer().catch(error => {
-    console.error('Γ¥î Failed to initialize relayer:', error);
+    logger.error({ err: error }, 'Γ¥î Failed to initialize relayer:');
     process.exit(1);
   });
 
-console.log('≡ƒöä Relayer service configured and ready');
+logger.info('≡ƒöä Relayer service configured and ready');
 
 export default { RELAYER_CONFIG, initializeRelayer }; 

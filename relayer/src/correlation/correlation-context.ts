@@ -54,6 +54,7 @@ import {
   correlationOpDurationSeconds,
   correlationRetryHopsTotal,
 } from '../metrics.js';
+import { getLogger } from '../logger.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -174,13 +175,19 @@ function createContext(opts: {
     addCheckpoint(name: RelayCheckpoint): void {
       checkpoints.push({ name, at: Date.now() });
       correlationCheckpointsTotal.inc({ checkpoint: name, route: ctx.route });
-      _structuredLog('info', `[correlation] checkpoint: ${name}`, ctx);
+      getLogger().info(
+        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, checkpoint: name },
+        '[correlation] checkpoint'
+      );
     },
 
     incrementRetry(reason: string): void {
       ctx.retryCount++;
       correlationRetryHopsTotal.inc({ route: ctx.route, reason });
-      _structuredLog('info', `[correlation] retry #${ctx.retryCount}`, ctx, { reason });
+      getLogger().info(
+        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, retryCount: ctx.retryCount, reason },
+        '[correlation] retry'
+      );
     },
 
     elapsedMs(): number {
@@ -227,25 +234,27 @@ export async function withCorrelation<T>(
 
   return _store.run(ctx, async () => {
     ctx.addCheckpoint('relay_started');
-    _structuredLog('info', '[correlation] operation started', ctx);
+    getLogger().info(
+      { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route },
+      '[correlation] operation started'
+    );
 
     try {
       const result = await fn(ctx);
       ctx.addCheckpoint('relay_complete');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'success' });
-      _structuredLog('info', '[correlation] operation succeeded', ctx, {
-        elapsedMs: ctx.elapsedMs(),
-        retries: ctx.retryCount,
-      });
+      getLogger().info(
+        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, elapsedMs: ctx.elapsedMs(), retries: ctx.retryCount },
+        '[correlation] operation succeeded'
+      );
       return result;
     } catch (err: unknown) {
       ctx.addCheckpoint('terminal_failure');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'failure' });
-      _structuredLog('error', '[correlation] operation failed', ctx, {
-        elapsedMs: ctx.elapsedMs(),
-        retries: ctx.retryCount,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      getLogger().error(
+        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, elapsedMs: ctx.elapsedMs(), retries: ctx.retryCount, err },
+        '[correlation] operation failed'
+      );
       throw err;
     } finally {
       endTimer();
@@ -255,7 +264,8 @@ export async function withCorrelation<T>(
 
 /**
  * Stamp the current correlation ID into an arbitrary log record and emit it.
- * When called outside a correlation scope the `correlationId` field is omitted.
+ * When called outside a correlation scope the `correlationId` field is omitted
+ * (the mixin in logger.ts handles this automatically).
  *
  * @param level   Severity: 'info' | 'warn' | 'error'.
  * @param msg     Human-readable message.
@@ -267,7 +277,15 @@ export function correlationLog(
   extra?: Record<string, unknown>
 ): void {
   const ctx = _store.getStore();
-  _structuredLog(level, msg, ctx, extra);
+  const fields: Record<string, unknown> = extra ? { ...extra } : {};
+  if (ctx) {
+    fields.correlationId = ctx.correlationId;
+    fields.orderId = ctx.orderId;
+    fields.route = ctx.route;
+    fields.retryCount = ctx.retryCount;
+    fields.elapsedMs = ctx.elapsedMs();
+  }
+  getLogger()[level](fields, msg);
 }
 
 /**
@@ -303,32 +321,3 @@ export async function continueCorrelation<T>(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-function _structuredLog(
-  level: 'info' | 'warn' | 'error',
-  msg: string,
-  ctx: CorrelationContext | undefined,
-  extra?: Record<string, unknown>
-): void {
-  const record: Record<string, unknown> = {
-    level,
-    msg,
-    ts: new Date().toISOString(),
-    ...extra,
-  };
-
-  if (ctx) {
-    record.correlationId = ctx.correlationId;
-    record.orderId = ctx.orderId;
-    record.route = ctx.route;
-    record.retryCount = ctx.retryCount;
-    record.elapsedMs = ctx.elapsedMs();
-  }
-
-  const line = JSON.stringify(record) + '\n';
-  if (level === 'error') {
-    process.stderr.write(line);
-  } else {
-    process.stdout.write(line);
-  }
-}
