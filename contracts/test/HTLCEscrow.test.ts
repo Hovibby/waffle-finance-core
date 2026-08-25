@@ -300,6 +300,46 @@ describe("HTLCEscrow v2", () => {
         )
       ).to.be.revertedWithCustomError(escrow, "InvalidValue");
     });
+
+    it("rejects zero beneficiary address before any state change", async () => {
+      const [sender] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const escrowAddr = await escrow.getAddress();
+      await expect(
+        escrow.connect(sender).createOrder(
+          ZERO_ADDR,
+          sender.address,
+          ZERO_ADDR,
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          randomBytes32(),
+          TIMELOCK,
+          { value: AMOUNT + SAFETY_DEPOSIT }
+        )
+      ).to.be.revertedWithCustomError(escrow, "InvalidAmount");
+      expect(await escrow.nextOrderId()).to.equal(1n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
+
+    it("rejects zero refundAddress before any state change", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const escrowAddr = await escrow.getAddress();
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          ZERO_ADDR,
+          ZERO_ADDR,
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          randomBytes32(),
+          TIMELOCK,
+          { value: AMOUNT + SAFETY_DEPOSIT }
+        )
+      ).to.be.revertedWithCustomError(escrow, "InvalidAmount");
+      expect(await escrow.nextOrderId()).to.equal(1n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
   });
 
   describe("claimOrder", () => {
