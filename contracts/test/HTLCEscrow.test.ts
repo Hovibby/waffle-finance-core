@@ -107,6 +107,7 @@ describe("HTLCEscrow v2", () => {
           { value: AMOUNT + SAFETY_DEPOSIT }
         )
       ).to.be.revertedWithCustomError(escrow, "InvalidHashlock");
+      expect(await escrow.nextOrderId()).to.equal(1n);
     });
 
     it("rejects timelock below MIN_TIMELOCK and above MAX_TIMELOCK", async () => {
