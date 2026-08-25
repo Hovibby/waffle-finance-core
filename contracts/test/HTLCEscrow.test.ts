@@ -334,6 +334,26 @@ describe("HTLCEscrow v2", () => {
       ).to.not.be.reverted;
     });
 
+    it("rejects MAX_TIMELOCK + 1 and leaves escrow balance and order count unchanged", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const escrowAddr = await escrow.getAddress();
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          ZERO_ADDR,
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          ethers.sha256(randomBytes32()),
+          24 * 60 * 60 + 1,
+          { value: AMOUNT + SAFETY_DEPOSIT }
+        )
+      ).to.be.revertedWithCustomError(escrow, "InvalidTimelock");
+      expect(await escrow.nextOrderId()).to.equal(1n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
+
     it("rejects zero beneficiary address before any state change", async () => {
       const [sender] = await ethers.getSigners();
       const escrow = await deployEscrow();
