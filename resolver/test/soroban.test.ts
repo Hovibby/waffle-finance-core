@@ -840,6 +840,65 @@ describe("SorobanListener stale-cursor / history-window overflow", () => {
     listener.stop();
   });
 
+  it("classifies a circular-reference thrown value without throwing", async () => {
+    // Build a circular object — JSON.stringify would throw on this.
+    const circular: Record<string, unknown> = {};
+    circular["self"] = circular;
+
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+    store.save("test-circular", "0000000000000001");
+
+    let callCount = 0;
+    const getEventsImpl = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Throw the circular object directly (not wrapped in Error).
+        // eslint-disable-next-line @typescript-eslint/no-throw-literal
+        throw circular;
+      }
+      return { events: [], cursor: "0000000000000999" };
+    };
+    const server = {
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 1000 }),
+      getEvents: vi.fn().mockImplementation(getEventsImpl),
+    };
+    const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
+      cursorStore: store, cursorLabel: "test-circular",
+    });
+    injectServer(listener, server);
+
+    // Must resolve without throwing — the circular object should be handled
+    // gracefully and treated as a non-history-window error (rethrown), but
+    // safeErrorString itself must not throw during classification.
+    await expect(
+      listener.start(noopHandlers).then(() => new Promise((r) => setTimeout(r, 50)))
+    ).resolves.toBeUndefined();
+
+    // Cursor must NOT have been cleared — circular object is not a
+    // history-window error, so it propagates as a normal poll failure.
+    expect(listener.getCursor()).toBe("0000000000000001");
+    listener.stop();
+  });
+
+  it("classifies a plain Error as a non-history-window error and does not clear cursor", async () => {
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+    store.save("test-plain-error", "0000000000000005");
+
+    const server = {
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 100 }),
+      getEvents: vi.fn().mockRejectedValue(new Error("network timeout")),
+    };
+    const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
+      cursorStore: store, cursorLabel: "test-plain-error",
+    });
+    injectServer(listener, server);
+    await listener.start(noopHandlers);
+    await new Promise((r) => setTimeout(r, 50));
+    // Cursor must NOT be cleared — generic errors are not history-window errors.
+    expect(listener.getCursor()).toBe("0000000000000005");
+    listener.stop();
+  });
+
   it("clamps to latest-1 ledger after history-window overflow", async () => {
     const store = new SorobanCursorStore({ storageDir: TEST_DIR });
     store.save("test-clamp-ledger", "0000000000000001");
