@@ -65,6 +65,12 @@ export class CursorStore {
       const raw = readFileSync(fpath, 'utf-8');
       const record: CursorRecord = JSON.parse(raw);
       if (record && typeof record.cursor === 'number') {
+        // Guard against a file copied from another listener: reject records
+        // whose label doesn't match the one requested by the caller so the
+        // wrong stream is never silently advanced.
+        if (record.label !== label) {
+          return null;
+        }
         this.cache.set(label, record.cursor);
         return record.cursor;
       }
