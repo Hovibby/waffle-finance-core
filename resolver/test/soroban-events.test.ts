@@ -146,6 +146,19 @@ describe("decodeSorobanHtlcEvent — claimed", () => {
       decodeSorobanHtlcEvent(claimedTopics(), badValue, META),
     ).toThrow(SorobanEventDecodeError);
   });
+
+  it("throws SorobanEventDecodeError when preimage is zero-length bytes", () => {
+    // A zero-length Bytes value is structurally valid XDR but semantically
+    // impossible for HTLC: sha256("") cannot equal any real on-chain hashlock,
+    // so the decoder must reject it to prevent downstream claim handlers from
+    // receiving an empty preimage string as though it were valid.
+    const emptyPreimageValue = b64(
+      vec(u64(1n), addrSender(), byts(Buffer.alloc(0)), i128(1000n), i128(50n)),
+    );
+    expect(() =>
+      decodeSorobanHtlcEvent(claimedTopics(), emptyPreimageValue, META),
+    ).toThrow(SorobanEventDecodeError);
+  });
 });
 
 // ── "refunded" ───────────────────────────────────────────────────────────────

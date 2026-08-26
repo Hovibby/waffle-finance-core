@@ -144,6 +144,21 @@ function toHex(raw: unknown): string {
 }
 
 /**
+ * Like {@link toHex} but additionally rejects a zero-length byte sequence.
+ * Used exclusively for the HTLC preimage field: a zero-length preimage is
+ * structurally valid XDR yet semantically impossible — sha256("") can never
+ * equal any real hashlock stored on-chain — so forwarding it would silently
+ * corrupt downstream claim handling.
+ */
+function toNonEmptyHex(raw: unknown, field: string): string {
+  const hex = toHex(raw);
+  if (hex.length === 0) {
+    throw new TypeError(`${field}: preimage must be non-empty bytes`);
+  }
+  return hex;
+}
+
+/**
  * Ensure a native value is BigInt; coerce from number for robustness.
  * Soroban u64 / i128 both decode to BigInt with scValToNative.
  */
@@ -296,7 +311,7 @@ function decodeClaimed(
       ...meta,
       orderId: toBigInt(val[0], "order_id"),
       caller: toStr(val[1], "caller"),
-      preimage: toHex(val[2]),
+      preimage: toNonEmptyHex(val[2], "preimage"),
       amount: toBigInt(val[3], "amount"),
       safetyDeposit: toBigInt(val[4], "safety_deposit"),
       beneficiary,
