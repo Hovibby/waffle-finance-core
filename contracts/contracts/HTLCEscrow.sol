@@ -245,7 +245,7 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
             if (order.amount == 0) revert OrderNotFound();
             revert OrderNotClaimable();
         }
-        if (block.timestamp > order.timelock) revert Expired();
+        if (block.timestamp >= order.timelock) revert Expired();
 
         // Verify hashlock. We accept both sha256 and keccak256 digests
         // so that a Soroban-side counterpart (sha256) and a classic EVM
