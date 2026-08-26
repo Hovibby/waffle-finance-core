@@ -94,9 +94,45 @@ function ensureEvmContext() {
   return { cfg, log, account, publicClient, walletClient };
 }
 
+/**
+ * Validate that `input` is a strict non-negative decimal representation before
+ * handing it to `parseUnits`. `parseUnits` (and the underlying JS coercion it
+ * builds on) silently drops trailing alphabetic suffixes — e.g. "10abc"
+ * becomes 10, "1e2" is interpreted as scientific notation — so we gate on an
+ * explicit allow-list first.
+ *
+ * A leading minus sign is rejected at this point (rather than after the RPC
+ * reads that establish the token decimals) so that negative amounts surface
+ * immediately with a clear, targeted error message.
+ *
+ * Accepted: one or more digits, an optional single decimal point followed by
+ * one or more digits.  Nothing else.
+ */
+function parseStrictDecimal(input: string): string {
+  // Negative values get a targeted message distinct from "not a decimal".
+  if (input.startsWith("-")) {
+    throw new Error(
+      `stake argument must be a non-negative amount (got "${input}")`
+    );
+  }
+  if (!/^\d+(\.\d+)?$/.test(input)) {
+    throw new Error(
+      `stake argument "${input}" is not a valid decimal number — ` +
+        `provide a plain decimal value such as "100" or "1.5"`
+    );
+  }
+  return input;
+}
+
 export async function registerCommand(amountInput?: string): Promise<void> {
   const { cfg, log, account, publicClient, walletClient } = ensureEvmContext();
   const registry = cfg.ethereum.resolverRegistry as Address;
+
+  // Validate the raw text input before any network call so a typo is caught
+  // immediately with a clear message pointing at the stake argument.
+  if (amountInput !== undefined) {
+    parseStrictDecimal(amountInput);
+  }
 
   return runResolverCommand({ operation: "register", chain: CHAIN_ETH, log }, async () => {
     // Reads are safe to retry on transient RPC failure — they have no
