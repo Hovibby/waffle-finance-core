@@ -212,6 +212,7 @@ INSERT INTO … ON CONFLICT DO NOTHING;
 | 005b    | `005_schema_migrations.sql`    | Creates `schema_migrations` audit table                      |
 | 006     | `006_stale_cleanup.sql`        | Adds `archived_at` column for soft-delete of stale orders    |
 | 007     | `007_audit_log.sql`            | Creates append-only `audit_log` table for lifecycle forensics |
+| 011     | `011_order_ledger_cursors.sql` | Per-order reconciler ledger cursors on `orders`               |
 
 ---
 

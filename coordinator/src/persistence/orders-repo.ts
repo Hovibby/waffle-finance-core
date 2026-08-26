@@ -91,6 +91,9 @@ export interface OrderRow {
   preimageEncVersion: number | null;
   secretRevealedTx: string | null;
   resolverAddress: string | null;
+  lastEthBlock: number | null;
+  lastSorobanLedger: number | null;
+  lastSolanaSlot: number | null;
   createdAt: number;
   updatedAt: number;
   archivedAt: number | null;
@@ -147,6 +150,9 @@ interface OrderDbRow {
   preimage_enc_version: number | null;
   secret_revealed_tx: string | null;
   resolver_address: string | null;
+  last_eth_block: number | null;
+  last_soroban_ledger: number | null;
+  last_solana_slot: number | null;
   created_at: number;
   updated_at: number;
   archived_at: number | null;
@@ -180,6 +186,9 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     preimageEncVersion: r.preimage_enc_version ?? null,
     secretRevealedTx: r.secret_revealed_tx,
     resolverAddress: r.resolver_address,
+    lastEthBlock: r.last_eth_block ?? null,
+    lastSorobanLedger: r.last_soroban_ledger ?? null,
+    lastSolanaSlot: r.last_solana_slot ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     archivedAt: r.archived_at ?? null
@@ -973,6 +982,140 @@ export class OrdersRepository {
       srcOrderId: r.src_order_id,
       hashlock: r.hashlock,
       status: r.status,
+    }));
+  }
+
+  // ── Per-order ledger cursors ──────────────────────────────────────────────
+
+  async getOrderLedgerCursor(publicId: string): Promise<{
+    lastEthBlock: number | null;
+    lastSorobanLedger: number | null;
+    lastSolanaSlot: number | null;
+  } | null> {
+    const row = await this.get<{
+      last_eth_block: number | null;
+      last_soroban_ledger: number | null;
+      last_solana_slot: number | null;
+    }>(
+      this.db.prepare(`
+        SELECT last_eth_block, last_soroban_ledger, last_solana_slot
+        FROM orders WHERE public_id = ?
+      `),
+      publicId
+    );
+    if (!row) return null;
+    return {
+      lastEthBlock: row.last_eth_block ?? null,
+      lastSorobanLedger: row.last_soroban_ledger ?? null,
+      lastSolanaSlot: row.last_solana_slot ?? null,
+    };
+  }
+
+  /**
+   * Advance one or more per-order ledger cursors forward-only.
+   * Positions less than or equal to the stored value are ignored.
+   */
+  async advanceOrderLedgerCursor(
+    publicId: string,
+    update: {
+      lastEthBlock?: number;
+      lastSorobanLedger?: number;
+      lastSolanaSlot?: number;
+    }
+  ): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (update.lastEthBlock != null && update.lastEthBlock > 0) {
+      sets.push(
+        "last_eth_block = CASE WHEN last_eth_block IS NULL THEN ? ELSE MAX(last_eth_block, ?) END"
+      );
+      params.push(update.lastEthBlock, update.lastEthBlock);
+    }
+    if (update.lastSorobanLedger != null && update.lastSorobanLedger > 0) {
+      sets.push(
+        "last_soroban_ledger = CASE WHEN last_soroban_ledger IS NULL THEN ? ELSE MAX(last_soroban_ledger, ?) END"
+      );
+      params.push(update.lastSorobanLedger, update.lastSorobanLedger);
+    }
+    if (update.lastSolanaSlot != null && update.lastSolanaSlot > 0) {
+      sets.push(
+        "last_solana_slot = CASE WHEN last_solana_slot IS NULL THEN ? ELSE MAX(last_solana_slot, ?) END"
+      );
+      params.push(update.lastSolanaSlot, update.lastSolanaSlot);
+    }
+
+    if (sets.length === 0) return;
+
+    sets.push("updated_at = CAST(strftime('%s','now') AS INTEGER)");
+    params.push(publicId);
+
+    await this.run(
+      this.db.prepare(`
+        UPDATE orders SET ${sets.join(", ")}
+        WHERE public_id = ?
+      `),
+      ...params
+    );
+  }
+
+  async listOrderLedgerCursors(limit = 200): Promise<
+    Array<{
+      publicId: string;
+      status: OrderStatus;
+      lastEthBlock: number | null;
+      lastSorobanLedger: number | null;
+      lastSolanaSlot: number | null;
+      updatedAt: number;
+    }>
+  > {
+    const rows = await this.all<{
+      public_id: string;
+      status: OrderStatus;
+      last_eth_block: number | null;
+      last_soroban_ledger: number | null;
+      last_solana_slot: number | null;
+      updated_at: number;
+    }>(
+      this.db.prepare(`
+        SELECT public_id, status, last_eth_block, last_soroban_ledger, last_solana_slot, updated_at
+        FROM orders
+        WHERE archived_at IS NULL
+          AND (
+            last_eth_block IS NOT NULL
+            OR last_soroban_ledger IS NOT NULL
+            OR last_solana_slot IS NOT NULL
+          )
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `),
+      Math.min(Math.max(limit, 1), 1000)
+    );
+
+    return rows.map((r) => ({
+      publicId: r.public_id,
+      status: r.status,
+      lastEthBlock: r.last_eth_block ?? null,
+      lastSorobanLedger: r.last_soroban_ledger ?? null,
+      lastSolanaSlot: r.last_solana_slot ?? null,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  async listChainCursors(): Promise<
+    Array<{ chain: Chain; position: number; updatedAt: number }>
+  > {
+    const rows = await this.all<{
+      chain: Chain;
+      position: number;
+      updated_at: number;
+    }>(
+      this.db.prepare("SELECT chain, position, updated_at FROM chain_cursors ORDER BY chain")
+    );
+    return rows.map((r) => ({
+      chain: r.chain,
+      position: Number(r.position),
+      updatedAt: Number(r.updated_at),
     }));
   }
 }
