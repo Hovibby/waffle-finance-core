@@ -697,3 +697,23 @@ export const chainDelayGauge = new Gauge({
   labelNames: ['chain'] as const,
   registers: [registry],
 });
+
+// ---------------------------------------------------------------------------
+// Pipeline metrics bundle
+// ---------------------------------------------------------------------------
+
+/**
+ * Convenience bundle that groups all eight pipeline observability metrics.
+ * Used by the pipeline-metrics test to verify the bundle is exported and
+ * contains the correct metric instances.
+ */
+export const pipelineMetrics = {
+  ingestionTotal:    orderIngestionTotal,
+  queueDepth:        orderQueueDepth,
+  relayDecisionTotal,
+  submissionLatency: submissionLatencySeconds,
+  receiptLatency:    receiptLatencySeconds,
+  retryAttempts:     retryAttemptsHistogram,
+  droppedOrders:     droppedOrdersTotal,
+  chainDelay:        chainDelayGauge,
+} as const;
