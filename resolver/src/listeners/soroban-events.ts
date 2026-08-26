@@ -127,8 +127,15 @@ export class SorobanEventDecodeError extends Error {
  * JS value via `scValToNative`.
  */
 function decodeScVal(base64: string): unknown {
-  const val = xdr.ScVal.fromXDR(base64, "base64");
-  return scValToNative(val);
+  try {
+    const val = xdr.ScVal.fromXDR(base64, "base64");
+    return scValToNative(val);
+  } catch {
+    throw new SorobanEventDecodeError(
+      "unknown",
+      "invalid base64-encoded XDR ScVal",
+    );
+  }
 }
 
 /**

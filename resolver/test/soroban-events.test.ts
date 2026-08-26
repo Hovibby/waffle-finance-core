@@ -210,6 +210,41 @@ describe("decodeSorobanHtlcEvent — unknown events", () => {
   });
 });
 
+// ── Malformed base64 / XDR payloads ──────────────────────────────────────────
+describe("decodeSorobanHtlcEvent — invalid base64 / XDR", () => {
+  it("throws SorobanEventDecodeError on garbage base64 topic", () => {
+    const goodTopics = createdTopics();
+    const badTopics = [goodTopics[0]!, "!!!not-base64!!!", goodTopics[2]!, goodTopics[3]!];
+    expect(() =>
+      decodeSorobanHtlcEvent(badTopics, createdValue(), META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("throws SorobanEventDecodeError on garbage base64 value", () => {
+    expect(() =>
+      decodeSorobanHtlcEvent(createdTopics(), "!!!not-base64!!!", META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("throws SorobanEventDecodeError on valid base64 that is not XDR", () => {
+    const notXdr = Buffer.from("this is not xdr data at all").toString("base64");
+    expect(() =>
+      decodeSorobanHtlcEvent(createdTopics(), notXdr, META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("does not include raw payload in the error message", () => {
+    const badPayload = "!!!not-base64!!!";
+    try {
+      decodeSorobanHtlcEvent(createdTopics(), badPayload, META);
+    } catch (e: unknown) {
+      if (e instanceof SorobanEventDecodeError) {
+        expect(e.message).not.toContain(badPayload);
+      }
+    }
+  });
+});
+
 // ── SorobanEventDecodeError identity ─────────────────────────────────────────
 describe("SorobanEventDecodeError", () => {
   it("carries eventName, reason, and correct .name on the thrown error", () => {
