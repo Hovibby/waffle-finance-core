@@ -588,16 +588,20 @@ describe("ResolverRegistry", () => {
       expect(await registry.minStake()).to.equal(newMin);
     });
 
-    it("setSlashBeneficiary emits and updates the beneficiary", async () => {
+    it("setSlashBeneficiary emits SlashBeneficiaryUpdated with old and new addresses in correct order", async () => {
       const [, , newBen] = await ethers.getSigners();
       const { owner, beneficiary, registry } = await deploy();
 
+      // Both indexed args must be present and in documented order:
+      // (oldBeneficiary, newBeneficiary).  A swap would make the old
+      // address appear as the new one, breaking off-chain indexers.
       await expect(
         registry.connect(owner).setSlashBeneficiary(newBen.address)
       )
         .to.emit(registry, "SlashBeneficiaryUpdated")
         .withArgs(beneficiary.address, newBen.address);
 
+      // Storage reflects the replacement (not the old value).
       expect(await registry.slashBeneficiary()).to.equal(newBen.address);
     });
 
