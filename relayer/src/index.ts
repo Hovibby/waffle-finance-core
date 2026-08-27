@@ -797,33 +797,63 @@ async function initializeRelayer() {
 
       logger.info({ orderId, stellarTxHash, stellarAddress, refundNet }, 'Manual refund requested');
 
-      const existing = globalRefundLedger.getEntry(orderId);
-      if (existing?.state.phase === 'committed') return res.json({ success: true, refundTxHash: existing.state.txHash, amount: existing.state.amount, destination: stellarAddress, network: refundNet, fromCache: true });
-      if (existing?.state.phase === 'in_flight' || existing?.state.phase === 'ambiguous') return res.status(409).json({ error: `Refund already ${existing.state.phase}`, orderId, stellarTxHash });
+      // ── Idempotency: return early for any already-terminal state ────────────
+      // Check before the Horizon round-trip so duplicate requests are cheap
+      // and a concurrent claim race cannot produce two Horizon submissions.
+      const existingPre = globalRefundLedger.getEntry(orderId);
+      if (existingPre?.state.phase === 'committed') {
+        return res.json({ success: true, refundTxHash: existingPre.state.txHash, amount: existingPre.state.amount, destination: stellarAddress, network: refundNet, fromCache: true });
+      }
+      if (existingPre?.state.phase === 'in_flight' || existingPre?.state.phase === 'ambiguous') {
+        return res.status(409).json({ error: `Refund already ${existingPre.state.phase}`, orderId, stellarTxHash });
+      }
+
+      // ── Claim the idempotency lock before any network I/O ──────────────────
+      // Moving claim() here means two concurrent requests for the same orderId
+      // cannot both pass the getEntry() check above and then race to Horizon.
+      // Only the first caller gets true; the second gets 409 immediately.
+      if (!globalRefundLedger.claim(orderId)) {
+        // Another concurrent request claimed it just now.  Read the entry
+        // again — if it committed during our race, return the cached result.
+        const raceEntry = globalRefundLedger.getEntry(orderId);
+        if (raceEntry?.state.phase === 'committed') {
+          return res.json({ success: true, refundTxHash: raceEntry.state.txHash, amount: raceEntry.state.amount, destination: stellarAddress, network: refundNet, fromCache: true });
+        }
+        return res.status(409).json({ error: 'Refund already in progress', orderId, stellarTxHash });
+      }
 
       const horizonUrl = NETWORK_CONFIG[refundNet].stellar.horizonUrl;
       const relayerSecret = refundNet === 'mainnet' ? (process.env.RELAYER_STELLAR_SECRET_MAINNET ?? process.env.RELAYER_STELLAR_SECRET) : (process.env.RELAYER_STELLAR_SECRET_TESTNET ?? process.env.RELAYER_STELLAR_SECRET);
-      if (!relayerSecret) return res.status(500).json({ error: 'Relayer Stellar secret not configured', network: refundNet });
-
-      const { Horizon, Keypair } = await import('@stellar/stellar-sdk');
-      const server = new Horizon.Server(horizonUrl);
-      const relayerPubkey = Keypair.fromSecret(relayerSecret).publicKey();
-
-      let verifiedAmount: string;
-      try {
-        const ops = await server.operations().forTransaction(stellarTxHash).call();
-        const paymentOp = (ops.records as unknown as Record<string, unknown>[]).find((op) => op.type === 'payment' && op.to === relayerPubkey && op.asset_type === 'native' && op.from === stellarAddress);
-        if (!paymentOp) return res.status(400).json({ error: 'Original tx does not match a payment to the relayer from this address' });
-        verifiedAmount = paymentOp.amount as string;
-        logger.info({ orderId, amount: verifiedAmount }, 'Verified original payment for manual refund');
-      } catch (lookupErr: unknown) {
-        return res.status(404).json({ error: 'Could not verify original transaction', details: lookupErr instanceof Error ? lookupErr.message : String(lookupErr) });
+      if (!relayerSecret) {
+        globalRefundLedger.release(orderId);
+        return res.status(500).json({ error: 'Relayer Stellar secret not configured', network: refundNet });
       }
 
-      if (!globalRefundLedger.claim(orderId)) return res.status(409).json({ error: 'Refund already in progress', orderId });
+      const { Keypair } = await import('@stellar/stellar-sdk');
+      const relayerPubkey = Keypair.fromSecret(relayerSecret).publicKey();
+
+      // ── Verify the original payment via the shared typed verifier ──────────
+      // verifyIncomingStellarPayment enforces: tx succeeded, native XLM
+      // payment to the relayer, AND (because we pass expectedSourceAccount)
+      // that the payment came FROM the address the user claims to own.
+      let verifiedPayment: Awaited<ReturnType<typeof verifyIncomingStellarPayment>>;
+      try {
+        verifiedPayment = await verifyIncomingStellarPayment(stellarTxHash, {
+          horizonUrl,
+          relayerPublicKey: relayerPubkey,
+          expectedSourceAccount: stellarAddress,
+        });
+        logger.info({ orderId, amount: verifiedPayment.amount }, 'Verified original payment for manual refund');
+      } catch (vErr: unknown) {
+        globalRefundLedger.release(orderId);
+        if (vErr instanceof StellarTxNotFoundError) return res.status(404).json({ error: 'Stellar tx not found', stellarTxHash });
+        if (vErr instanceof StellarTxFailedError) return res.status(400).json({ error: 'Stellar tx failed on-chain', stellarTxHash });
+        if (vErr instanceof StellarPaymentMismatch) return res.status(400).json({ error: 'Original tx does not match a payment to the relayer from this address', details: (vErr as Error).message, stellarTxHash });
+        return res.status(404).json({ error: 'Could not verify original transaction', details: vErr instanceof Error ? vErr.message : String(vErr) });
+      }
 
       try {
-        const refund = await refundXlmToUser({ orderId, stellarAddress, stellarTxHash, networkMode: refundNet, horizonUrl, refundSecret: relayerSecret, fallbackStroops: verifiedAmount, ledger: globalRefundLedger, maxRetries: 2 });
+        const refund = await refundXlmToUser({ orderId, stellarAddress, stellarTxHash, networkMode: refundNet, horizonUrl, refundSecret: relayerSecret, fallbackStroops: verifiedPayment.amount, ledger: globalRefundLedger, maxRetries: 2 });
         const order = activeOrders.get(orderId);
         if (order) { order.status = 'refunded'; order.refundTxHash = refund.hash; }
         logger.info({ orderId, refundTxHash: refund.hash, amount: refund.amount }, 'Manual refund successful');

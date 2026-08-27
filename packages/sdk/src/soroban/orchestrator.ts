@@ -143,6 +143,34 @@ export async function orchestrateTransaction({
   _buildFeeBumpTransaction = TransactionBuilder.buildFeeBumpTransaction.bind(TransactionBuilder),
 }: OrchestrateOptions): Promise<OrchestratedResult> {
   const cfg = { ...DEFAULTS, ...configIn };
+
+  // ── Validate fee-bump configuration ────────────────────────────────────────
+  // feeBumpMultiplier must be a finite number > 1.  Values ≤ 1 would never
+  // increase the fee (or would decrease it), so tx_insufficient_fee could
+  // never be resolved and the retry loop would exhaust its budget pointlessly.
+  // NaN / Infinity would corrupt the fee arithmetic and bypass the cap check.
+  if (
+    !Number.isFinite(cfg.feeBumpMultiplier) ||
+    cfg.feeBumpMultiplier <= 1
+  ) {
+    throw makeError(
+      "tx_rejected",
+      `Invalid feeBumpMultiplier (${cfg.feeBumpMultiplier}): must be a finite number greater than 1.`,
+      false,
+      { attempts: 0, feeBumpHistory: [], lastHash: undefined },
+    );
+  }
+  // feeBumpCap must be a positive number — a zero or negative cap would
+  // immediately abort the first bump attempt regardless of the actual fee.
+  if (!Number.isFinite(cfg.feeBumpCap) || cfg.feeBumpCap <= 0) {
+    throw makeError(
+      "tx_rejected",
+      `Invalid feeBumpCap (${cfg.feeBumpCap}): must be a finite positive number of stroops.`,
+      false,
+      { attempts: 0, feeBumpHistory: [], lastHash: undefined },
+    );
+  }
+
   const feeBumpHistory: number[] = [];
   let lastHash: string | undefined;
 

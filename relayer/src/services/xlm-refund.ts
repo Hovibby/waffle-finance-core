@@ -243,6 +243,17 @@ export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmRes
     feeBumpCapStroops = DEFAULT_FEE_BUMP_CAP_STROOPS,
   } = args;
 
+  // ── Validate feeBumpCapStroops ─────────────────────────────────────────
+  // A cap of 0 would cause the very first fee-bump to exceed it and abort
+  // immediately. A negative cap (not possible with bigint, but guard anyway)
+  // would be nonsensical. Reject early so callers get a clear error.
+  if (feeBumpCapStroops <= 0n) {
+    throw new HorizonTerminalError(
+      `[xlm-refund] Invalid feeBumpCapStroops=${feeBumpCapStroops}: must be a positive bigint (> 0 stroops).`,
+      'invalid_fee_bump_cap'
+    );
+  }
+
   // ── Idempotency fast-path ──────────────────────────────────────────────
   if (ledger) {
     const existing = ledger.getEntry(orderId);
