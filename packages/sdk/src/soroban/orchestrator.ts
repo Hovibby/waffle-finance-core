@@ -255,7 +255,24 @@ export async function orchestrateTransaction({
     }
 
     const signedTx = _fromXDR(signedXdr, networkPassphrase) as Transaction;
-    let currentBaseFee = parseInt(signedTx.fee, 10);
+    // Parse the assembled fee as a bigint to avoid IEEE-754 precision loss on
+    // large multi-operation fees that could exceed Number.MAX_SAFE_INTEGER.
+    // All subsequent fee-bump arithmetic stays in the number domain (which is
+    // safe while values remain below the cap of 1_000_000 stroops), but we
+    // validate the initial value is exactly representable before converting.
+    const rawFeeStr = signedTx.fee;
+    const rawFeeBig = BigInt(rawFeeStr);
+    if (rawFeeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw makeError(
+        "tx_rejected",
+        `Assembled transaction fee (${rawFeeStr} stroops) exceeds ` +
+          `Number.MAX_SAFE_INTEGER and cannot be safely used in fee-bump ` +
+          `arithmetic. Reduce the number of operations or raise the fee cap.`,
+        false,
+        snap(0),
+      );
+    }
+    let currentBaseFee = Number(rawFeeBig);
     let txToSubmit: Transaction | FeeBumpTransaction = signedTx;
 
     // ── Step 5: Submit (with inline fee-bump escalation) ──────────────────────

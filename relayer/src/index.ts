@@ -193,7 +193,22 @@ async function processEscrowToStellar(orderId: string, order: Record<string, unk
     const account = await server.loadAccount(kp.publicKey());
     const balance = account.balances.find((b) => b.asset_type === 'native')?.balance ?? '0';
     const rate = (order.exchangeRate as number) ?? 10000;
-    const xlm = (parseFloat(order.amount as string) * rate).toFixed(7);
+    // Convert wei → XLM using pure integer arithmetic to avoid IEEE-754 overflow.
+    // order.amount is stored as a wei string (e.g. "100000000000000000" for 0.1 ETH).
+    // rate is the ETH/XLM exchange rate (stroops-per-ETH equivalent).
+    // Formula: xlmStroops = (weiAmount * rate * STROOPS_PER_XLM) / WEI_PER_ETH
+    //          xlmString  = (xlmStroops / STROOPS_PER_XLM) formatted to 7 decimals
+    const weiAmountBig = BigInt(order.amount as string);
+    const rateRounded = Math.round(rate);
+    if (!Number.isSafeInteger(rateRounded)) {
+      throw new RangeError(
+        `[processEscrowToStellar] exchangeRate ${rate} exceeds Number.MAX_SAFE_INTEGER`
+      );
+    }
+    const xlmStroops = (weiAmountBig * BigInt(rateRounded)) / 1_000_000_000_000_000_000n;
+    const xlmIntPart = xlmStroops / 10_000_000n;
+    const xlmFracPart = xlmStroops % 10_000_000n;
+    const xlm = `${xlmIntPart}.${xlmFracPart.toString().padStart(7, '0')}`;
     if (parseFloat(balance) < parseFloat(xlm)) throw new Error(`Insufficient XLM: ${balance} < ${xlm}`);
     const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
       .addOperation(Operation.payment({ destination: order.stellarAddress as string, asset: Asset.native(), amount: xlm }))
@@ -448,7 +463,7 @@ async function initializeRelayer() {
         crypto.getRandomValues(secretBytes);
         const secret = `0x${Array.from(secretBytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`;
         const hashLock = `0x${Array.from(crypto.getRandomValues(new Uint8Array(32))).map((b) => b.toString(16).padStart(2, '0')).join('')}`;
-        const orderData = { orderId, token: '0x0000000000000000000000000000000000000000', amount: (parseFloat(amount) * 1e18).toString(), hashLock, timelock: Math.floor(Date.now() / 1000) + 7201, feeRate: 100, beneficiary: stellarAddress, refundAddress: normalizedEth, destinationChainId: 1, stellarTxHash: null as string | null, partialFillEnabled: false, secret, created: new Date().toISOString(), status: 'pending_direct_escrow', ethAddress: normalizedEth, stellarAddress, exchangeRate: exchangeRate ?? 10000, networkMode: reqNet };
+        const orderData = { orderId, token: '0x0000000000000000000000000000000000000000', amount: ethers.parseEther(amount).toString(), hashLock, timelock: Math.floor(Date.now() / 1000) + 7201, feeRate: 100, beneficiary: stellarAddress, refundAddress: normalizedEth, destinationChainId: 1, stellarTxHash: null as string | null, partialFillEnabled: false, secret, created: new Date().toISOString(), status: 'pending_direct_escrow', ethAddress: normalizedEth, stellarAddress, exchangeRate: exchangeRate ?? 10000, networkMode: reqNet };
         await storeActiveOrder(orderId, orderData);
 
         const orderAmtBig = BigInt(orderData.amount);
@@ -469,9 +484,11 @@ async function initializeRelayer() {
         const hashLock = ethers.keccak256(secret).substring(2);
 
         if (RELAYER_CONFIG.enableMockMode) {
-          const orderData = { orderId, direction: 'xlm_to_eth', stellarAmount: (xlmAmt * 1e7).toString(), ethAmount: (ethAmt * 1e18).toString(), ethAddress, stellarAddress, exchangeRate: ethToXlmRate, secret, hashLock, created: new Date().toISOString(), status: 'mock_htlc_created', contractType: 'MOCK_DUAL_HTLC' };
-          await storeActiveOrder(orderId, orderData);
-          return res.json({ success: true, orderId, orderData, message: 'MOCK: XLM→ETH HTLCs created', stellar: { amount: xlmAmt + ' XLM', hashLock }, ethereum: { contractAddress: getHtlcBridgeAddress('mainnet', 'mainnet'), ethAmount: ethAmt.toFixed(6) + ' ETH', hashLock: '0x' + hashLock } });
+          // Use integer stroop conversion for mock path too — avoids float drift on display values.
+          const stellarAmountStroops = BigInt(Math.round(xlmAmt * 1e7));
+          const mockOrderData = { orderId, direction: 'xlm_to_eth', stellarAmount: stellarAmountStroops.toString(), ethAmount: (ethAmt * 1e18).toString(), ethAddress, stellarAddress, exchangeRate: ethToXlmRate, secret, hashLock, created: new Date().toISOString(), status: 'mock_htlc_created', contractType: 'MOCK_DUAL_HTLC' };
+          await storeActiveOrder(orderId, mockOrderData);
+          return res.json({ success: true, orderId, orderData: mockOrderData, message: 'MOCK: XLM→ETH HTLCs created', stellar: { amount: xlmAmt + ' XLM', hashLock }, ethereum: { contractAddress: getHtlcBridgeAddress('mainnet', 'mainnet'), ethAmount: ethAmt.toFixed(6) + ' ETH', hashLock: '0x' + hashLock } });
         }
 
         const safeEth = Math.min(Math.max(ethAmt, 0.000001), 10.0);
@@ -479,11 +496,16 @@ async function initializeRelayer() {
         try { ethAmountWei = ethers.parseEther((Math.round(safeEth * 1e6) / 1e6).toString()); }
         catch { ethAmountWei = ethers.parseEther('0.001'); }
 
+        // Convert XLM float amount to stroops using integer arithmetic to avoid
+        // IEEE-754 drift. e.g. 0.1 XLM * 1e7 = 999999.9999... in float → 1000000 stroops.
+        // Math.round is safe here because xlmAmt is clamped from parseFloat(amount)
+        // where amount is user input validated ≥ 0.000001 and ≤ 10 XLM via safeEth clamp logic.
+        const stellarAmountStroops = BigInt(Math.round(xlmAmt * 1e7));
         const relayerStellar = process.env.RELAYER_STELLAR_PUBLIC ?? 'YOUR_STELLAR_PUBLIC_KEY_HERE';
-        const orderData = { orderId, direction: 'xlm_to_eth', stellarAmount: (xlmAmt * 1e7).toString(), ethAmount: ethAmountWei.toString(), ethAddress, stellarAddress, exchangeRate: ethToXlmRate, secret, hashLock, created: new Date().toISOString(), status: 'awaiting_xlm_payment', contractType: 'XLM_TO_ETH_PENDING', stellar: { paymentAddress: relayerStellar, amount: xlmAmt.toString(), memo: `XLM-ETH-${orderId.substring(0, 8)}` }, ethereum: { pendingAmount: ethAmountWei.toString(), beneficiary: ethAddress } };
+        const orderData = { orderId, direction: 'xlm_to_eth', stellarAmount: stellarAmountStroops.toString(), ethAmount: ethAmountWei.toString(), ethAddress, stellarAddress, exchangeRate: ethToXlmRate, secret, hashLock, created: new Date().toISOString(), status: 'awaiting_xlm_payment', contractType: 'XLM_TO_ETH_PENDING', stellar: { paymentAddress: relayerStellar, amount: xlmAmt.toString(), memo: `XLM-ETH-${orderId.substring(0, 8)}` }, ethereum: { pendingAmount: ethAmountWei.toString(), beneficiary: ethAddress } };
         await storeActiveOrder(orderId, orderData);
         logger.info({ orderId, stellarPaymentAddress: relayerStellar }, 'XLM→ETH order created — awaiting XLM payment');
-        return res.json({ success: true, orderId, message: 'XLM→ETH: Order created — Please send XLM to complete swap', orderData: { stellarAmount: (xlmAmt * 1e7).toString(), stellarAddress: relayerStellar, memo: `XLM-ETH-${orderId.substring(0, 8)}`, expectedEthAmount: ethAmountWei.toString(), status: 'awaiting_xlm_payment', instructions: `Send ${xlmAmt} XLM to ${relayerStellar} with memo: XLM-ETH-${orderId.substring(0, 8)}` } });
+        return res.json({ success: true, orderId, message: 'XLM→ETH: Order created — Please send XLM to complete swap', orderData: { stellarAmount: stellarAmountStroops.toString(), stellarAddress: relayerStellar, memo: `XLM-ETH-${orderId.substring(0, 8)}`, expectedEthAmount: ethAmountWei.toString(), status: 'awaiting_xlm_payment', instructions: `Send ${xlmAmt} XLM to ${relayerStellar} with memo: XLM-ETH-${orderId.substring(0, 8)}` } });
       } else {
         throw new Error('Invalid direction specified');
       }
@@ -570,7 +592,14 @@ async function initializeRelayer() {
           if (!xRate || isNaN(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
           const [iPart, fPart = ''] = verifiedPayment.amount.split('.');
           const stroops = BigInt(iPart ?? '0') * 10_000_000n + BigInt(fPart.padEnd(7, '0').substring(0, 7));
-          const rateBig = BigInt(Math.round(Number(xRate)));
+          // Guard: exchange rate must be a safe integer before we convert to bigint.
+          // Number(xRate) for a float like 29166.666… is exact as a 64-bit float, but
+          // Math.round() of a value > MAX_SAFE_INTEGER would produce a silently wrong integer.
+          const xRateNum = Number(xRate);
+          if (!Number.isSafeInteger(Math.round(xRateNum))) {
+            return res.status(400).json({ error: 'Exchange rate is too large to convert safely', orderId });
+          }
+          const rateBig = BigInt(Math.round(xRateNum));
           if (rateBig === 0n) return res.status(400).json({ error: 'Exchange rate rounds to zero', orderId });
           const ethAmountWei = (stroops * 1_000_000_000_000_000_000n) / (rateBig * 10_000_000n);
           if (ethAmountWei === 0n) return res.status(400).json({ error: 'XLM too small to release ETH', orderId });
@@ -715,7 +744,12 @@ async function initializeRelayer() {
         if (!xRate || isNaN(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
         const [iPart, fPart = ''] = verifiedPayment.amount.split('.');
         const stroops = BigInt(iPart ?? '0') * 10_000_000n + BigInt(fPart.padEnd(7, '0').substring(0, 7));
-        const rateBig = BigInt(Math.round(Number(xRate)));
+        // Guard: exchange rate must be a safe integer before we convert to bigint.
+        const xRateNum = Number(xRate);
+        if (!Number.isSafeInteger(Math.round(xRateNum))) {
+          return res.status(400).json({ error: 'Exchange rate is too large to convert safely', orderId });
+        }
+        const rateBig = BigInt(Math.round(xRateNum));
         if (rateBig === 0n) return res.status(400).json({ error: 'Exchange rate rounds to zero', orderId });
         const ethAmountWei = (stroops * 1_000_000_000_000_000_000n) / (rateBig * 10_000_000n);
         if (ethAmountWei === 0n) return res.status(400).json({ error: 'XLM too small to release ETH', orderId });

@@ -689,7 +689,19 @@ export function stroopsToXlmString(stroops: bigint): string {
 export function parseFallbackStroops(value: string | number): bigint {
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || value <= 0) return 0n;
-    if (value >= 1e7) return BigInt(Math.round(value));
+    if (value >= 1e7) {
+      // Guard against silent precision loss: values above Number.MAX_SAFE_INTEGER
+      // cannot be exactly represented as integers before BigInt() sees them, so
+      // Math.round() would silently produce a wrong stroop count.
+      if (!Number.isSafeInteger(Math.round(value))) {
+        throw new RangeError(
+          `[xlm-refund] parseFallbackStroops: value ${value} exceeds ` +
+          `Number.MAX_SAFE_INTEGER (${Number.MAX_SAFE_INTEGER}) and cannot be ` +
+          `converted to a precise stroop count. Pass a string instead.`
+        );
+      }
+      return BigInt(Math.round(value));
+    }
     // Treat as XLM decimal.
     return xlmStringToStroops(value.toFixed(7));
   }
