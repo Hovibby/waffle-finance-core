@@ -175,7 +175,10 @@ export class ClientSubscriptionManager {
    */
   unregisterClient(clientId: string): boolean {
     const client = this.clients.get(clientId);
-    if (!client) return false;
+    if (!client) {
+      console.warn(`👤 Unknown client unregistration attempted: ${clientId}`);
+      return false;
+    }
 
     // Remove client's subscription
     if (client.subscription) {
@@ -208,12 +211,18 @@ export class ClientSubscriptionManager {
       throw new Error('Subscription limit exceeded');
     }
 
+    // Reject empty event-type sets
+    const resolvedEventTypes = eventTypes ?? [];
+    if (resolvedEventTypes.length === 0) {
+      throw new Error('At least one event type is required');
+    }
+
     // Create subscription
     const subscriptionId = this.generateId();
     const subscription: ClientSubscription = {
       id: subscriptionId,
       clientId,
-      eventTypes: new Set(eventTypes || []),
+      eventTypes: new Set(resolvedEventTypes),
       filters: {
         orderHashes: filters?.orderHashes ? new Set(filters.orderHashes) : undefined,
         resolvers: filters?.resolvers ? new Set(filters.resolvers) : undefined,
