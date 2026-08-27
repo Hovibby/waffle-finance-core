@@ -920,6 +920,46 @@ describe("HTLCEscrow v2", () => {
       expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
     });
 
+    it("withdraw reverts atomically when the recipient reverts — accounting is intact and funds remain recoverable", async () => {
+      // Issue #524: a reverting native recipient must not leave accounting
+      // in an inconsistent state.  The withdraw() follows CEI order:
+      //   1. Zeroes the credit (effect)
+      //   2. Attempts the transfer (interaction)
+      //   3. Restores the credit and reverts if the transfer fails
+      // After the failed withdraw the full amount is still pending and a
+      // subsequent attempt (once the receiver can accept ETH) succeeds.
+      const [, , relayer] = await ethers.getSigners();
+      const receiver = await deployReceiver();
+      const recvAddr = await receiver.getAddress();
+
+      // Fund the contract and trigger deferral via a rejecting recipient.
+      await receiver.setMode(MODE_REJECT);
+      const { escrow, preimage } = await setupOrder(recvAddr);
+      const escrowAddr = await escrow.getAddress();
+      await escrow.connect(relayer).claimOrder(1, preimage);
+
+      // Sanity: amount is credited, not burned.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(AMOUNT);
+
+      // withdraw() reverts — receiver still rejects ETH.
+      await expect(receiver.pull(escrowAddr)).to.be.revertedWithCustomError(
+        escrow,
+        "NativeTransferFailed"
+      );
+
+      // Accounting is atomically restored: credit and contract balance are unchanged.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(AMOUNT);
+
+      // Once the receiver can accept ETH the funds are fully recoverable.
+      await receiver.setMode(MODE_ACCEPT);
+      await receiver.pull(escrowAddr);
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
+
     it("a beneficiary that can never accept ETH keeps the amount safely credited (nothing lost)", async () => {
       const [, , relayer] = await ethers.getSigners();
       const receiver = await deployNoFallbackReceiver();
