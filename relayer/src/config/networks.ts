@@ -114,14 +114,22 @@ export const TESTNET_ESCROW_FACTORY_ABI = [
 
 /**
  * Return the full network configuration for the given mode.
- * Falls back to DEFAULT_NETWORK_MODE when `networkMode` is undefined.
+ * Throws when `networkMode` is explicitly provided but not a known value.
+ * Falls back to `defaultMode` only when `networkMode` is omitted.
  */
 export function getNetworkConfig(
   networkMode?: string,
   defaultMode: NetworkMode = 'testnet'
 ): NetworkConfig {
-  const selected = (networkMode as NetworkMode) ?? defaultMode;
-  return NETWORK_CONFIG[selected] ?? NETWORK_CONFIG[defaultMode];
+  if (networkMode !== undefined) {
+    if (networkMode !== 'testnet' && networkMode !== 'mainnet') {
+      throw new Error(
+        `Unknown network mode "${networkMode}". Valid values are "testnet" or "mainnet".`
+      );
+    }
+    return NETWORK_CONFIG[networkMode];
+  }
+  return NETWORK_CONFIG[defaultMode];
 }
 
 /**
