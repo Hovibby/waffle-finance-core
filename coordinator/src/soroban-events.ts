@@ -270,6 +270,9 @@ export function decodeHtlcEvent(
     if (!isBytes(preimageRaw)) {
       return malformed(eventKind, "data_type_mismatch", "data[2] (preimage) is not Bytes");
     }
+    if ((preimageRaw as Uint8Array).length === 0) {
+      return malformed(eventKind, "data_type_mismatch", "data[2] (preimage) is zero-length; a valid HTLC preimage must be non-empty");
+    }
     if (typeof amount !== "bigint") {
       return malformed(eventKind, "data_type_mismatch", "data[3] (amount) is not bigint");
     }

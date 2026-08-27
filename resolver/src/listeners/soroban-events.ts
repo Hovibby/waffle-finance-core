@@ -127,8 +127,15 @@ export class SorobanEventDecodeError extends Error {
  * JS value via `scValToNative`.
  */
 function decodeScVal(base64: string): unknown {
-  const val = xdr.ScVal.fromXDR(base64, "base64");
-  return scValToNative(val);
+  try {
+    const val = xdr.ScVal.fromXDR(base64, "base64");
+    return scValToNative(val);
+  } catch {
+    throw new SorobanEventDecodeError(
+      "unknown",
+      "invalid base64-encoded XDR ScVal",
+    );
+  }
 }
 
 /**
@@ -141,6 +148,21 @@ function toHex(raw: unknown): string {
     return Buffer.from(raw).toString("hex");
   }
   throw new TypeError(`expected bytes, got ${typeof raw}`);
+}
+
+/**
+ * Like {@link toHex} but additionally rejects a zero-length byte sequence.
+ * Used exclusively for the HTLC preimage field: a zero-length preimage is
+ * structurally valid XDR yet semantically impossible — sha256("") can never
+ * equal any real hashlock stored on-chain — so forwarding it would silently
+ * corrupt downstream claim handling.
+ */
+function toNonEmptyHex(raw: unknown, field: string): string {
+  const hex = toHex(raw);
+  if (hex.length === 0) {
+    throw new TypeError(`${field}: preimage must be non-empty bytes`);
+  }
+  return hex;
 }
 
 /**
@@ -296,7 +318,7 @@ function decodeClaimed(
       ...meta,
       orderId: toBigInt(val[0], "order_id"),
       caller: toStr(val[1], "caller"),
-      preimage: toHex(val[2]),
+      preimage: toNonEmptyHex(val[2], "preimage"),
       amount: toBigInt(val[3], "amount"),
       safetyDeposit: toBigInt(val[4], "safety_deposit"),
       beneficiary,

@@ -1066,3 +1066,115 @@ describe('stroop math: round-trip and fee deduction', () => {
     }
   });
 });
+
+// ===========================================================================
+// refundXlmToUser — maxRetries = 0 semantics
+//
+// Zero retries means "no second chances" — but the function must still make
+// its one and only initial attempt.  The loop invariant is:
+//
+//   attempt = 0; while (attempt <= maxRetries) { ... attempt++; }
+//
+// With maxRetries=0 the body executes exactly once (attempt 0 ≤ 0), then
+// attempt becomes 1 and the condition fails.  These tests document that
+// contract with actual side-effect checks rather than configuration inspection.
+// ===========================================================================
+
+describe('refundXlmToUser: maxRetries = 0 — one attempt is always made', () => {
+  it('succeeds on the single attempt when Horizon accepts the transaction', async () => {
+    const server = makeHorizonServer({
+      submitResponse: { hash: '0xzero-retry-success', ledger: 77 },
+      paymentAmount: '5.0000000',
+    });
+    vi.resetModules();
+    vi.doMock('@stellar/stellar-sdk', () => makeSDKStub(server));
+    const { refundXlmToUser: fn } = await import('../src/services/xlm-refund.js');
+
+    const result = await fn({
+      orderId: 'order-zero-ok',
+      stellarAddress: 'GDEST',
+      stellarTxHash: '0xoriginal',
+      networkMode: 'testnet',
+      horizonUrl: 'https://horizon-testnet.stellar.org',
+      refundSecret: 'SRELAYER',
+      maxRetries: 0,
+    });
+
+    // The one attempt must have reached Horizon.
+    expect(server.submitTransaction).toHaveBeenCalledTimes(1);
+    expect(result.hash).toBe('0xzero-retry-success');
+    expect(result.ledger).toBe(77);
+    vi.doUnmock('@stellar/stellar-sdk');
+  });
+
+  it('surfaces the error immediately on failure — no retry attempt', async () => {
+    // Use a transient (5xx) error so that with maxRetries > 0 the engine
+    // would normally retry.  With maxRetries = 0 it must NOT.
+    const transientError = Object.assign(new Error('service unavailable'), {
+      response: { status: 503, data: {} },
+    });
+    const server = makeHorizonServer({ submitError: transientError });
+    vi.resetModules();
+    vi.doMock('@stellar/stellar-sdk', () => makeSDKStub(server));
+    const { refundXlmToUser: fn } = await import('../src/services/xlm-refund.js');
+
+    await expect(
+      fn({
+        orderId: 'order-zero-fail',
+        stellarAddress: 'GDEST',
+        networkMode: 'testnet',
+        horizonUrl: 'https://horizon-testnet.stellar.org',
+        refundSecret: 'SRELAYER',
+        fallbackStroops: '10000000',
+        maxRetries: 0,
+      }),
+    ).rejects.toBeDefined();
+
+    // Exactly one submit call — zero retries means no second attempt.
+    expect(server.submitTransaction).toHaveBeenCalledTimes(1);
+    vi.doUnmock('@stellar/stellar-sdk');
+  });
+
+  it('does not enter an off-by-one second attempt compared to maxRetries = 1', async () => {
+    // With maxRetries=1 a transient error on attempt 0 triggers one retry
+    // (attempt 1).  With maxRetries=0 there is no retry — submit is called
+    // exactly once regardless of the error type.
+    const transientError = Object.assign(new Error('internal server error'), {
+      response: { status: 500, data: {} },
+    });
+
+    // --- maxRetries = 0: exactly 1 call ---
+    const server0 = makeHorizonServer({ submitError: transientError });
+    vi.resetModules();
+    vi.doMock('@stellar/stellar-sdk', () => makeSDKStub(server0));
+    const { refundXlmToUser: fn0 } = await import('../src/services/xlm-refund.js');
+    await fn0({
+      orderId: 'order-zero-cmp',
+      stellarAddress: 'GDEST',
+      networkMode: 'testnet',
+      horizonUrl: 'https://horizon-testnet.stellar.org',
+      refundSecret: 'SRELAYER',
+      fallbackStroops: '10000000',
+      maxRetries: 0,
+    }).catch(() => {});
+    expect(server0.submitTransaction).toHaveBeenCalledTimes(1);
+    vi.doUnmock('@stellar/stellar-sdk');
+
+    // --- maxRetries = 1: exactly 2 calls (initial + 1 retry) ---
+    const server1 = makeHorizonServer({ submitError: transientError });
+    vi.resetModules();
+    vi.doMock('@stellar/stellar-sdk', () => makeSDKStub(server1));
+    const { refundXlmToUser: fn1 } = await import('../src/services/xlm-refund.js');
+    await fn1({
+      orderId: 'order-one-cmp',
+      stellarAddress: 'GDEST',
+      networkMode: 'testnet',
+      horizonUrl: 'https://horizon-testnet.stellar.org',
+      refundSecret: 'SRELAYER',
+      fallbackStroops: '10000000',
+      maxRetries: 1,
+    }).catch(() => {});
+    expect(server1.submitTransaction).toHaveBeenCalledTimes(2);
+    vi.doUnmock('@stellar/stellar-sdk');
+  });
+});

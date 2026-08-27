@@ -146,6 +146,19 @@ describe("decodeSorobanHtlcEvent — claimed", () => {
       decodeSorobanHtlcEvent(claimedTopics(), badValue, META),
     ).toThrow(SorobanEventDecodeError);
   });
+
+  it("throws SorobanEventDecodeError when preimage is zero-length bytes", () => {
+    // A zero-length Bytes value is structurally valid XDR but semantically
+    // impossible for HTLC: sha256("") cannot equal any real on-chain hashlock,
+    // so the decoder must reject it to prevent downstream claim handlers from
+    // receiving an empty preimage string as though it were valid.
+    const emptyPreimageValue = b64(
+      vec(u64(1n), addrSender(), byts(Buffer.alloc(0)), i128(1000n), i128(50n)),
+    );
+    expect(() =>
+      decodeSorobanHtlcEvent(claimedTopics(), emptyPreimageValue, META),
+    ).toThrow(SorobanEventDecodeError);
+  });
 });
 
 // ── "refunded" ───────────────────────────────────────────────────────────────
@@ -207,6 +220,137 @@ describe("decodeSorobanHtlcEvent — unknown events", () => {
   it("returns null when the first topic is raw bytes (not a symbol)", () => {
     const bytesFirst = [b64(byts(Buffer.from("notasymbol")))];
     expect(decodeSorobanHtlcEvent(bytesFirst, createdValue(), META)).toBeNull();
+  });
+
+  // ── Near-miss names: confirms exact string matching, not prefix/substring ──
+
+  it("returns null for a truncated name that is a prefix of 'created' (creat)", () => {
+    // "creat" is not "created" — the switch must not match it
+    expect(
+      decodeSorobanHtlcEvent([b64(sym("creat"))], createdValue(), META),
+    ).toBeNull();
+  });
+
+  it("returns null for a name that contains 'created' as a substring (order_created)", () => {
+    expect(
+      decodeSorobanHtlcEvent([b64(sym("order_created"))], createdValue(), META),
+    ).toBeNull();
+  });
+
+  it("returns null for a mixed-case variant of a known name (Created)", () => {
+    // The switch is case-sensitive; 'Created' must not match 'created'
+    expect(
+      decodeSorobanHtlcEvent([b64(sym("Created"))], createdValue(), META),
+    ).toBeNull();
+  });
+
+  it("returns null for a mixed-case variant of 'claimed' (CLAIMED)", () => {
+    expect(
+      decodeSorobanHtlcEvent([b64(sym("CLAIMED"))], claimedValue(), META),
+    ).toBeNull();
+  });
+
+  it("returns null for a mixed-case variant of 'refunded' (Refunded)", () => {
+    expect(
+      decodeSorobanHtlcEvent([b64(sym("Refunded"))], refundedValue(), META),
+    ).toBeNull();
+  });
+
+  // ── No side-effects: valid events still decode correctly after unknown ones ──
+
+  it("does not corrupt state — 'created' decodes correctly after an unknown event call", () => {
+    // First call: unknown event — must return null without throwing or mutating state
+    const unknownResult = decodeSorobanHtlcEvent(
+      [b64(sym("xyzzy"))],
+      createdValue(),
+      META,
+    );
+    expect(unknownResult).toBeNull();
+
+    // Second call: valid created event — must still decode correctly
+    const createdResult = decodeSorobanHtlcEvent(
+      createdTopics(),
+      createdValue(),
+      META,
+    );
+    expect(createdResult).not.toBeNull();
+    expect(createdResult!.type).toBe("created");
+  });
+
+  it("does not corrupt state — 'claimed' decodes correctly after an unknown event call", () => {
+    const unknownResult = decodeSorobanHtlcEvent(
+      [b64(sym("adm_xfer"))],
+      claimedValue(),
+      META,
+    );
+    expect(unknownResult).toBeNull();
+
+    const claimedResult = decodeSorobanHtlcEvent(
+      claimedTopics(),
+      claimedValue(),
+      META,
+    );
+    expect(claimedResult).not.toBeNull();
+    expect(claimedResult!.type).toBe("claimed");
+  });
+
+  it("does not corrupt state — 'refunded' decodes correctly after an unknown event call", () => {
+    const unknownResult = decodeSorobanHtlcEvent(
+      [b64(sym("cfg"))],
+      refundedValue(),
+      META,
+    );
+    expect(unknownResult).toBeNull();
+
+    const refundedResult = decodeSorobanHtlcEvent(
+      refundedTopics(),
+      refundedValue(),
+      META,
+    );
+    expect(refundedResult).not.toBeNull();
+    expect(refundedResult!.type).toBe("refunded");
+  });
+
+  it("returns null for a u64 ScVal as the first topic (not a symbol at all)", () => {
+    // A numeric ScVal should be soft-skipped, not throw
+    expect(
+      decodeSorobanHtlcEvent([b64(u64(42n))], createdValue(), META),
+    ).toBeNull();
+  });
+});
+
+// ── Malformed base64 / XDR payloads ──────────────────────────────────────────
+describe("decodeSorobanHtlcEvent — invalid base64 / XDR", () => {
+  it("throws SorobanEventDecodeError on garbage base64 topic", () => {
+    const goodTopics = createdTopics();
+    const badTopics = [goodTopics[0]!, "!!!not-base64!!!", goodTopics[2]!, goodTopics[3]!];
+    expect(() =>
+      decodeSorobanHtlcEvent(badTopics, createdValue(), META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("throws SorobanEventDecodeError on garbage base64 value", () => {
+    expect(() =>
+      decodeSorobanHtlcEvent(createdTopics(), "!!!not-base64!!!", META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("throws SorobanEventDecodeError on valid base64 that is not XDR", () => {
+    const notXdr = Buffer.from("this is not xdr data at all").toString("base64");
+    expect(() =>
+      decodeSorobanHtlcEvent(createdTopics(), notXdr, META),
+    ).toThrow(SorobanEventDecodeError);
+  });
+
+  it("does not include raw payload in the error message", () => {
+    const badPayload = "!!!not-base64!!!";
+    try {
+      decodeSorobanHtlcEvent(createdTopics(), badPayload, META);
+    } catch (e: unknown) {
+      if (e instanceof SorobanEventDecodeError) {
+        expect(e.message).not.toContain(badPayload);
+      }
+    }
   });
 });
 
