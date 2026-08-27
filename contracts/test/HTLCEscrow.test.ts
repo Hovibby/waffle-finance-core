@@ -395,6 +395,60 @@ describe("HTLCEscrow v2", () => {
     });
   });
 
+  describe("setResolverRegistry", () => {
+    it("rejects the zero address — a zero registry would silently disable the sybil gate without an explicit deployment decision", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      await expect(
+        escrow.connect(owner).setResolverRegistry(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(escrow, "InvalidAddress");
+    });
+
+    it("accepts a non-zero registry and emits ResolverRegistryUpdated with correct old and new addresses", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg1 = await MockRegistry.deploy();
+      const reg1Addr = await reg1.getAddress();
+
+      const previousRegistry = await escrow.resolverRegistry();
+
+      await expect(escrow.connect(owner).setResolverRegistry(reg1Addr))
+        .to.emit(escrow, "ResolverRegistryUpdated")
+        .withArgs(previousRegistry, reg1Addr);
+
+      expect(await escrow.resolverRegistry()).to.equal(reg1Addr);
+    });
+
+    it("can replace the registry a second time and preserves the old address as previousRegistry", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg1 = await MockRegistry.deploy();
+      const reg2 = await MockRegistry.deploy();
+      const reg1Addr = await reg1.getAddress();
+      const reg2Addr = await reg2.getAddress();
+
+      await escrow.connect(owner).setResolverRegistry(reg1Addr);
+
+      await expect(escrow.connect(owner).setResolverRegistry(reg2Addr))
+        .to.emit(escrow, "ResolverRegistryUpdated")
+        .withArgs(reg1Addr, reg2Addr);
+
+      expect(await escrow.resolverRegistry()).to.equal(reg2Addr);
+    });
+
+    it("reverts when a non-owner calls setResolverRegistry", async () => {
+      const [, nonOwner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg = await MockRegistry.deploy();
+      await expect(
+        escrow.connect(nonOwner).setResolverRegistry(await reg.getAddress())
+      ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
+    });
+  });
+
   describe("claimOrder", () => {
     it("pays beneficiary on correct sha256 preimage and pays caller the safety deposit", async () => {
       const [sender, beneficiary, relayer] = await ethers.getSigners();

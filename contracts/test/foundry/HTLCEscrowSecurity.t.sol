@@ -797,15 +797,16 @@ contract HTLCEscrowSecurityTest is Test {
         assertFalse(ok, "receive() should reject stray ETH");
     }
 
-    // 7c. No admin escape hatches exist on the contract.
+    // 7c. No dangerous admin escape hatches exist on the contract.
+    //     emergencyWithdraw and pause must not exist; transferOwnership and
+    //     setResolverRegistry are intentional owner-only admin functions that
+    //     cannot move locked order funds.
     function test_nonCustodial_noAdminEscapeHatchSelectors() public {
         // emergencyWithdraw(): 0xdb2e21bc
         // pause():             0x8456cb59
-        // transferOwnership(): 0xf2fde38b
-        bytes4[3] memory forbidden = [
+        bytes4[2] memory forbidden = [
             bytes4(0xdb2e21bc),
-            bytes4(0x8456cb59),
-            bytes4(0xf2fde38b)
+            bytes4(0x8456cb59)
         ];
         for (uint256 i = 0; i < forbidden.length; i++) {
             (bool ok, ) = address(htlcOpen).staticcall(
