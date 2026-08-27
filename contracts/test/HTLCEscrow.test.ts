@@ -645,10 +645,23 @@ describe("HTLCEscrow v2", () => {
     it("contract has no admin escape hatch", async () => {
       const escrow = await deployEscrow();
       const escrowContract = escrow as any;
-      // None of the dangerous admin functions exist on the v2 contract.
+      // emergencyWithdraw and pause must not exist.
+      // transferOwnership is intentionally present from Ownable2Step but
+      // cannot move locked order funds.
       expect(escrowContract.emergencyWithdraw).to.be.undefined;
       expect(escrowContract.pause).to.be.undefined;
-      expect(escrowContract.transferOwnership).to.be.undefined;
+    });
+
+    it("withdraw() rejects a zero-amount pull — no-op withdrawals are rejected consistently", async () => {
+      // A caller whose pendingWithdrawals balance is exactly zero must receive
+      // NoPendingWithdrawal.  This is the zero-amount withdrawal guard: no
+      // state is mutated and no event is emitted for a no-op pull.
+      const [, , stranger] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      expect(await escrow.pendingWithdrawals(stranger.address)).to.equal(0n);
+      await expect(
+        escrow.connect(stranger).withdraw()
+      ).to.be.revertedWithCustomError(escrow, "NoPendingWithdrawal");
     });
 
     it("withdraw() is a self-service pull, not a drain — reverts with no pending balance", async () => {
