@@ -541,10 +541,18 @@ async function initializeRelayer() {
           const { Keypair: PK } = await import('@stellar/stellar-sdk');
           const relayerPubkey = PK.fromSecret(relayerSecret).publicKey();
 
+          // Source-account check is mandatory — if we don't know the user's
+          // Stellar address we cannot prove the payment came from them, so we
+          // must refuse rather than skip the check and accept any payment.
+          if (!userStellar) {
+            settlementVerificationTotal.inc({ result: 'payment_mismatch', network_mode: orderNet });
+            return res.status(400).json({ error: 'Cannot verify payment: user Stellar address is unknown for this order', orderId });
+          }
+
           let verifiedPayment: Awaited<ReturnType<typeof verifyIncomingStellarPayment>>;
           try {
             const rt = receiptLatencySeconds.startTimer();
-            verifiedPayment = await verifyIncomingStellarPayment(stellarTxHash, { horizonUrl, relayerPublicKey: relayerPubkey, expectedSourceAccount: userStellar ?? undefined });
+            verifiedPayment = await verifyIncomingStellarPayment(stellarTxHash, { horizonUrl, relayerPublicKey: relayerPubkey, expectedSourceAccount: userStellar });
             rt({ result: 'success' });
             settlementVerificationTotal.inc({ result: 'success', network_mode: orderNet });
           } catch (vErr: unknown) {
