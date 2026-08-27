@@ -873,4 +873,194 @@ describe("HTLCEscrow v2", () => {
       expect(await ethers.provider.getBalance(escrowAddr)).to.equal(AMOUNT);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #519 — overlong preimage rejection
+  // ---------------------------------------------------------------------------
+  describe("claimOrder — overlong preimage (#519)", () => {
+    it("rejects a 33-byte preimage with InvalidPreimage and leaves the order claimable", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32(); // valid 32-byte secret
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // A 33-byte value is distinct from any wrong 32-byte value: the length
+      // check fires before the digest comparison, so it is rejected regardless
+      // of what bytes it contains.
+      const overlongPreimage = ethers.hexlify(ethers.randomBytes(33));
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, overlongPreimage)
+      ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
+
+      // Order must still be in Funded state — no funds were released.
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(0); // Funded
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        AMOUNT + SAFETY_DEPOSIT
+      );
+
+      // Confirm the order is still claimable with the correct preimage.
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.not.be.reverted;
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #520 — permissionless refund from unrelated caller
+  // ---------------------------------------------------------------------------
+  describe("refundOrder — permissionless from unrelated caller (#520)", () => {
+    it("allows an unrelated account to trigger the refund after expiry", async () => {
+      // signers[3] is unrelated: not the sender, beneficiary, or refundAddress.
+      const [sender, beneficiary, , unrelated] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      // Use a fresh random address as the designated refund recipient so it is
+      // clearly distinct from both `sender` and `unrelated`.
+      const refundAddr = ethers.Wallet.createRandom().address;
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        refundAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+
+      const refundBefore = await ethers.provider.getBalance(refundAddr);
+      const unrelatedBefore = await ethers.provider.getBalance(unrelated.address);
+
+      // The unrelated caller submits the refund — no caller restriction.
+      const tx = await escrow.connect(unrelated).refundOrder(1);
+      const receipt = await tx.wait();
+      const gas = BigInt(receipt!.gasUsed) * BigInt(receipt!.gasPrice ?? 0n);
+
+      // Principal goes to the designated refundAddress, not to the caller.
+      expect(await ethers.provider.getBalance(refundAddr)).to.equal(
+        refundBefore + AMOUNT
+      );
+      // Safety deposit is the caller's incentive.
+      expect(
+        await ethers.provider.getBalance(unrelated.address) + gas
+      ).to.equal(unrelatedBefore + SAFETY_DEPOSIT);
+
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(2); // Refunded
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #521 — refund rejection one second before expiry
+  // ---------------------------------------------------------------------------
+  describe("refundOrder — rejected at timelock - 1 (#521)", () => {
+    it("reverts with NotExpired when called exactly one second before the deadline", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      // Anchor the order creation to a deterministic timestamp so that
+      // `timelock - 1` is meaningful.
+      const createTx = await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      const createReceipt = await createTx.wait();
+      const createBlock = await ethers.provider.getBlock(createReceipt!.blockNumber);
+      const absoluteTimelock = createBlock!.timestamp + TIMELOCK;
+
+      // Advance to exactly one second before the deadline.
+      await time.setNextBlockTimestamp(absoluteTimelock - 1);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(
+        escrow.connect(sender).refundOrder(1)
+      ).to.be.revertedWithCustomError(escrow, "NotExpired");
+
+      // Order and balances are unchanged after the failed refund attempt.
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(0); // still Funded
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        AMOUNT + SAFETY_DEPOSIT
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #522 — safety-deposit recipient verification on refund
+  // ---------------------------------------------------------------------------
+  describe("refundOrder — safety-deposit goes to refund caller, not refund address (#522)", () => {
+    it("credits safety deposit to the caller and principal to refundAddress independently", async () => {
+      // Three distinct roles: sender creates; refundAddr is the designated
+      // recovery wallet; caller is whoever submits the refund transaction.
+      const [sender, beneficiary, caller] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      // Fresh address with no prior balance — makes delta assertions unambiguous.
+      const refundAddr = ethers.Wallet.createRandom().address;
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        refundAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+
+      const refundAddrBefore = await ethers.provider.getBalance(refundAddr);
+      const callerBefore = await ethers.provider.getBalance(caller.address);
+      const beneficiaryBefore = await ethers.provider.getBalance(beneficiary.address);
+
+      const tx = await escrow.connect(caller).refundOrder(1);
+      const receipt = await tx.wait();
+      const gas = BigInt(receipt!.gasUsed) * BigInt(receipt!.gasPrice ?? 0n);
+
+      // Principal → refundAddress (not the caller, not the beneficiary).
+      expect(await ethers.provider.getBalance(refundAddr)).to.equal(
+        refundAddrBefore + AMOUNT
+      );
+      // Safety deposit → caller (whoever submitted the transaction).
+      expect(
+        await ethers.provider.getBalance(caller.address) + gas
+      ).to.equal(callerBefore + SAFETY_DEPOSIT);
+      // Beneficiary is completely unaffected.
+      expect(await ethers.provider.getBalance(beneficiary.address)).to.equal(
+        beneficiaryBefore
+      );
+
+      // Order is finalised exactly once.
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(2); // Refunded
+      expect(order.finalisedAt).to.be.greaterThan(0);
+    });
+  });
 });
