@@ -124,6 +124,14 @@ export async function startContractEventPoller(
       const fromBlock = lastProcessed + 1;
       const toBlock = Math.min(head, fromBlock + maxWindow - 1);
 
+      // Inverted range can occur after cursor rollback or a short chain
+      // reorganization.  Return an empty poll rather than feeding a
+      // negative window into the provider.
+      if (fromBlock > toBlock) {
+        console.warn(`[${label}] inverted range (${fromBlock} > ${toBlock}), skipping`);
+        return;
+      }
+
       for (const binding of bindings) {
         const filterFactory = contract.filters[binding.eventName];
         if (typeof filterFactory !== 'function') {
