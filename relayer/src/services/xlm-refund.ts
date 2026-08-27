@@ -243,6 +243,13 @@ export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmRes
     feeBumpCapStroops = DEFAULT_FEE_BUMP_CAP_STROOPS,
   } = args;
 
+  // ── Validate fee-bump cap ─────────────────────────────────────────────
+  if (feeBumpCapStroops <= 0n) {
+    throw new TypeError(
+      `[xlm-refund] feeBumpCapStroops must be a positive integer, got ${feeBumpCapStroops}`
+    );
+  }
+
   // ── Idempotency fast-path ──────────────────────────────────────────────
   if (ledger) {
     const existing = ledger.getEntry(orderId);
