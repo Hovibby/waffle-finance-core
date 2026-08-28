@@ -693,6 +693,7 @@ describe("Replay fidelity — audit stream matches actual repo transitions", () 
 
     // Second batch — new transitions happen after the first replay
     await orders.recordDstLock({ publicId: order.publicId, ...DST_LOCK });
+    await orders.recordSecret(order.publicId, "0xpreimage", "0xsecrettx");
     await orders.markStatus(order.publicId, "completed");
     await new Promise((r) => setTimeout(r, 20));
 
