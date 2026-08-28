@@ -354,3 +354,55 @@ describe("OrdersRepository — transition event trail", () => {
     expect(events).toHaveLength(0);
   });
 });
+
+describe("OrdersRepository per-order cursors (TD-043)", () => {
+  it("updates and retrieves per-order cursors correctly", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+
+    expect(order.lastEthBlock).toBeNull();
+    expect(order.lastSorobanLedger).toBeNull();
+    expect(order.lastSolanaSlot).toBeNull();
+
+    await repo.updateOrderCursor(order.publicId, "ethereum", 100);
+    await repo.updateOrderCursor(order.publicId, "stellar", 500);
+    await repo.updateOrderCursor(order.publicId, "solana", 1200);
+
+    const updated = await repo.findByPublicId(order.publicId);
+    expect(updated!.lastEthBlock).toBe(100);
+    expect(updated!.lastSorobanLedger).toBe(500);
+    expect(updated!.lastSolanaSlot).toBe(1200);
+  });
+
+  it("only advances per-order cursor forward (monotonic)", async () => {
+    const repo = await freshRepo();
+    const order = await announce(repo);
+
+    await repo.updateOrderCursor(order.publicId, "ethereum", 200);
+    await repo.updateOrderCursor(order.publicId, "ethereum", 150); // lower value ignored
+
+    const updated = await repo.findByPublicId(order.publicId);
+    expect(updated!.lastEthBlock).toBe(200);
+  });
+
+  it("computes min active order cursor across active orders and ignores terminal orders", async () => {
+    const repo = await freshRepo();
+    const o1 = await repo.announce(BASE_ORDER);
+    const o2 = await repo.announce({
+      ...BASE_ORDER,
+      hashlock: "0x" + "c".repeat(64)
+    });
+
+    await repo.updateOrderCursor(o1.publicId, "ethereum", 100);
+    await repo.updateOrderCursor(o2.publicId, "ethereum", 150);
+
+    let min = await repo.getMinActiveOrderCursor("ethereum");
+    expect(min).toBe(100);
+
+    // Mark o1 as completed (terminal)
+    await repo.setStatus(o1.publicId, "completed");
+
+    min = await repo.getMinActiveOrderCursor("ethereum");
+    expect(min).toBe(150);
+  });
+});
