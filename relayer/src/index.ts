@@ -589,7 +589,7 @@ async function initializeRelayer() {
           if (!consumed) { settlementProofReplaysTotal.inc({ network_mode: orderNet }); return res.status(409).json({ error: 'Stellar tx consumed by concurrent request', stellarTxHash }); }
 
           const xRate = storedOrder.exchangeRate;
-          if (!xRate || isNaN(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
+          if (!xRate || !Number.isFinite(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
           const [iPart, fPart = ''] = verifiedPayment.amount.split('.');
           const stroops = BigInt(iPart ?? '0') * 10_000_000n + BigInt(fPart.padEnd(7, '0').substring(0, 7));
           // Guard: exchange rate must be a safe integer before we convert to bigint.
@@ -741,7 +741,7 @@ async function initializeRelayer() {
         const balance = await runWithSettlementRetry('eth-balance', ETH_BALANCE_RETRY, () => withTimeout(provider.getBalance(wallet.address), RELAYER_CONFIG.rpcTimeoutMs, 'getBalance timeout'), { orderId, direction: (storedOrder.direction as string) ?? 'xlm_to_eth', chain: 'ethereum' });
 
         const xRate = storedOrder.exchangeRate;
-        if (!xRate || isNaN(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
+        if (!xRate || !Number.isFinite(Number(xRate)) || Number(xRate) <= 0) return res.status(400).json({ error: 'Missing valid exchange rate', orderId });
         const [iPart, fPart = ''] = verifiedPayment.amount.split('.');
         const stroops = BigInt(iPart ?? '0') * 10_000_000n + BigInt(fPart.padEnd(7, '0').substring(0, 7));
         // Guard: exchange rate must be a safe integer before we convert to bigint.

@@ -89,6 +89,8 @@ async function fetchPricesFromCoinGecko(): Promise<PriceSnapshot> {
     if (
       typeof xlmUsdPrice !== 'number' ||
       typeof ethUsdPrice !== 'number' ||
+      !Number.isFinite(xlmUsdPrice) ||
+      !Number.isFinite(ethUsdPrice) ||
       xlmUsdPrice <= 0 ||
       ethUsdPrice <= 0
     ) {
