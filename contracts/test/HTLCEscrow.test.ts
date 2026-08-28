@@ -416,6 +416,42 @@ describe("HTLCEscrow v2", () => {
       expect(await escrow.nextOrderId()).to.equal(1n);
       expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
     });
+
+    it("propagates registry revert and leaves no partial order state", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const mockReg = await MockRegistry.deploy(true);
+
+      const HTLCEscrowFactory = await ethers.getContractFactory("HTLCEscrow");
+      const escrow = (await HTLCEscrowFactory.deploy(
+        await mockReg.getAddress(),
+        0
+      )) as unknown as HTLCEscrow;
+      const escrowAddr = await escrow.getAddress();
+
+      // Force the registry to revert on any isActive() call.
+      await mockReg.setShouldRevert(true);
+
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          ZERO_ADDR,
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: AMOUNT + SAFETY_DEPOSIT }
+        )
+      ).to.be.revertedWith("MockRegistry: registry reverted");
+
+      // No partial state: no order stored, no ETH trapped.
+      expect(await escrow.nextOrderId()).to.equal(1n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
   });
 
   describe("setResolverRegistry", () => {
