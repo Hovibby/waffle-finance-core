@@ -452,22 +452,66 @@ export class SettlementFailureStore {
       );
     } catch { return; }
 
+    const VALID_RECOVERY_STATUSES = new Set<string>([
+      'pending', 'recovering', 'recovered', 'failed', 'requires_review',
+    ]);
+
     for (const file of files) {
       const fpath = join(this.storageDir, file);
       try {
         const raw = readFileSync(fpath, 'utf-8');
         const parsed = JSON.parse(raw) as (OrderFailureRecord & { savedAt?: number });
-        if (
-          parsed &&
-          typeof parsed.orderId === 'string' &&
-          typeof parsed.recoveryStatus === 'string' &&
-          !this.records.has(parsed.orderId)
-        ) {
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          const { savedAt: _s, ...record } = parsed;
-          this.records.set(record.orderId, record as OrderFailureRecord);
+
+        // ── Structural validation ───────────────────────────────────────────
+        // Reject records missing any field that downstream code assumes is
+        // present. A silent skip with a warning is far safer than loading a
+        // half-formed record that will throw at call-time.
+        const malformed = (
+          !parsed ||
+          typeof parsed !== 'object' ||
+          typeof parsed.orderId !== 'string' || parsed.orderId.length === 0 ||
+          typeof parsed.direction !== 'string' ||
+          typeof parsed.recoveryStatus !== 'string' ||
+          !VALID_RECOVERY_STATUSES.has(parsed.recoveryStatus) ||
+          typeof parsed.failureCount !== 'number' ||
+          typeof parsed.recoveryAttempts !== 'number' ||
+          typeof parsed.firstFailedAt !== 'number' ||
+          typeof parsed.lastUpdatedAt !== 'number' ||
+          !Array.isArray(parsed.events) ||
+          this.records.has(parsed.orderId)
+        );
+
+        if (malformed) {
+          this._log('warn', '[settlement-failure-store] skipping malformed persisted record', {
+            file,
+            orderId: typeof parsed?.orderId === 'string' ? parsed.orderId : undefined,
+            reason: !parsed || typeof parsed !== 'object'
+              ? 'not an object'
+              : typeof parsed.orderId !== 'string' || parsed.orderId.length === 0
+                ? 'missing or empty orderId'
+                : typeof parsed.direction !== 'string'
+                  ? 'missing direction'
+                  : !VALID_RECOVERY_STATUSES.has(String(parsed.recoveryStatus))
+                    ? `invalid recoveryStatus: ${parsed.recoveryStatus}`
+                    : typeof parsed.failureCount !== 'number'
+                      ? 'missing failureCount'
+                      : typeof parsed.recoveryAttempts !== 'number'
+                        ? 'missing recoveryAttempts'
+                        : typeof parsed.firstFailedAt !== 'number'
+                          ? 'missing firstFailedAt'
+                          : typeof parsed.lastUpdatedAt !== 'number'
+                            ? 'missing lastUpdatedAt'
+                            : !Array.isArray(parsed.events)
+                              ? 'events is not an array'
+                              : 'duplicate orderId',
+          });
+          continue;
         }
-      } catch { /* corrupted — skip */ }
+
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { savedAt: _s, ...record } = parsed;
+        this.records.set(record.orderId, record as OrderFailureRecord);
+      } catch { /* JSON parse error or I/O error — skip silently */ }
     }
   }
 }

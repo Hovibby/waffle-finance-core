@@ -289,11 +289,16 @@ export class GasPriceTracker {
   }
 
   /**
-   * Get congestion multiplier for gas price adjustment
+   * Get congestion multiplier for gas price adjustment.
+   *
+   * Validates the congestion level before applying it. An unrecognised level
+   * (e.g. produced by a future API change or a stale cache) logs a warning
+   * and falls back to the neutral multiplier (1.0) rather than silently
+   * under- or over-pricing gas.
    */
   private getCongestionMultiplier(): number {
     const congestion = this.congestionData;
-    
+
     switch (congestion.level) {
       case 'low':
         return 0.9;
@@ -303,8 +308,18 @@ export class GasPriceTracker {
         return 1.2;
       case 'extreme':
         return 1.5;
-      default:
+      default: {
+        // Unrecognised level — log and refuse to apply an unknown multiplier.
+        process.stderr.write(
+          JSON.stringify({
+            level: 'warn',
+            msg: '[gas-tracker] Unrecognised congestion level — falling back to neutral multiplier (1.0)',
+            congestionLevel: (congestion as { level: unknown }).level,
+            ts: new Date().toISOString(),
+          }) + '\n'
+        );
         return 1.0;
+      }
     }
   }
 
