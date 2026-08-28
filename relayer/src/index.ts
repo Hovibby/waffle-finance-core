@@ -945,17 +945,10 @@ async function initializeRelayer() {
 }
 
 // ── Graceful shutdown ──────────────────────────────────────────────────────
+// Logic lives in shutdown.ts so it can be unit-tested without booting the
+// full relayer entry-point.
 
-async function gracefulShutdown() {
-  logger.info('Shutting down relayer service');
-  try {
-    const { ethereumListener } = await import('./listeners/ethereum-listener.js');
-    await ethereumListener.stopListening();
-    logger.info('Ethereum listener stopped');
-  } catch (err) { logger.error({ err }, 'Error stopping Ethereum listener'); }
-  logger.info('Relayer shutdown complete');
-  process.exit(0);
-}
+import { gracefulShutdown } from './shutdown.js';
 
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
