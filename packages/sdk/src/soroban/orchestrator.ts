@@ -143,6 +143,34 @@ export async function orchestrateTransaction({
   _buildFeeBumpTransaction = TransactionBuilder.buildFeeBumpTransaction.bind(TransactionBuilder),
 }: OrchestrateOptions): Promise<OrchestratedResult> {
   const cfg = { ...DEFAULTS, ...configIn };
+
+  // ── Validate fee-bump configuration ────────────────────────────────────────
+  // feeBumpMultiplier must be a finite number > 1.  Values ≤ 1 would never
+  // increase the fee (or would decrease it), so tx_insufficient_fee could
+  // never be resolved and the retry loop would exhaust its budget pointlessly.
+  // NaN / Infinity would corrupt the fee arithmetic and bypass the cap check.
+  if (
+    !Number.isFinite(cfg.feeBumpMultiplier) ||
+    cfg.feeBumpMultiplier <= 1
+  ) {
+    throw makeError(
+      "tx_rejected",
+      `Invalid feeBumpMultiplier (${cfg.feeBumpMultiplier}): must be a finite number greater than 1.`,
+      false,
+      { attempts: 0, feeBumpHistory: [], lastHash: undefined },
+    );
+  }
+  // feeBumpCap must be a positive number — a zero or negative cap would
+  // immediately abort the first bump attempt regardless of the actual fee.
+  if (!Number.isFinite(cfg.feeBumpCap) || cfg.feeBumpCap <= 0) {
+    throw makeError(
+      "tx_rejected",
+      `Invalid feeBumpCap (${cfg.feeBumpCap}): must be a finite positive number of stroops.`,
+      false,
+      { attempts: 0, feeBumpHistory: [], lastHash: undefined },
+    );
+  }
+
   const feeBumpHistory: number[] = [];
   let lastHash: string | undefined;
 
@@ -227,7 +255,24 @@ export async function orchestrateTransaction({
     }
 
     const signedTx = _fromXDR(signedXdr, networkPassphrase) as Transaction;
-    let currentBaseFee = parseInt(signedTx.fee, 10);
+    // Parse the assembled fee as a bigint to avoid IEEE-754 precision loss on
+    // large multi-operation fees that could exceed Number.MAX_SAFE_INTEGER.
+    // All subsequent fee-bump arithmetic stays in the number domain (which is
+    // safe while values remain below the cap of 1_000_000 stroops), but we
+    // validate the initial value is exactly representable before converting.
+    const rawFeeStr = signedTx.fee;
+    const rawFeeBig = BigInt(rawFeeStr);
+    if (rawFeeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw makeError(
+        "tx_rejected",
+        `Assembled transaction fee (${rawFeeStr} stroops) exceeds ` +
+          `Number.MAX_SAFE_INTEGER and cannot be safely used in fee-bump ` +
+          `arithmetic. Reduce the number of operations or raise the fee cap.`,
+        false,
+        snap(0),
+      );
+    }
+    let currentBaseFee = Number(rawFeeBig);
     let txToSubmit: Transaction | FeeBumpTransaction = signedTx;
 
     // ── Step 5: Submit (with inline fee-bump escalation) ──────────────────────

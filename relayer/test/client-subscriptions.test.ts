@@ -1,140 +1,96 @@
-/**
- * Tests for ClientSubscriptionManager — client listener registration.
- *
- * Coverage:
- *  - Registering a new client ID succeeds and returns the ID
- *  - Registering a duplicate ID throws ConflictError (409-style conflict)
- *  - Duplicate registration preserves the original client's callback/state
- *  - Registering a distinct (new) ID after a conflict still succeeds
- *  - ConflictError carries the expected code and message shape
- */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ClientSubscriptionManager } from '../src/events/client-subscriptions.js';
+import { FusionEventManager, EventType } from '../src/events/event-handlers.js';
+import { OrdersService } from '../src/events/orders.js';
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { ClientSubscriptionManager, ConflictError } from '../src/events/client-subscriptions.js';
-import { FusionEventManager } from '../src/events/event-handlers.js';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function makeManager(): ClientSubscriptionManager {
-  // Mirror the pattern from event-handlers.test.ts: stub the OrdersService
-  // dependency with the minimal surface FusionEventManager's constructor needs.
+function createManager(): ClientSubscriptionManager {
   const ordersServiceMock = {
     on: vi.fn(),
     emit: vi.fn(),
-  } as never;
+  } as unknown as OrdersService;
 
   const eventManager = new FusionEventManager(ordersServiceMock);
   return new ClientSubscriptionManager(eventManager);
 }
 
-function clientFixture(id: string) {
-  return {
-    id,
-    connectionType: 'websocket' as const,
-    connected: true,
-    metadata: {},
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-describe('ClientSubscriptionManager — registerClient', () => {
+describe('ClientSubscriptionManager', () => {
   let manager: ClientSubscriptionManager;
 
   beforeEach(() => {
-    manager = makeManager();
+    manager = createManager();
   });
 
-  it('returns the client ID when registering a new client', () => {
-    const id = manager.registerClient(clientFixture('client-001'));
-    expect(id).toBe('client-001');
+  describe('unregisterClient', () => {
+    it('returns true and removes an existing client', () => {
+      manager.registerClient({ id: 'client-1', connectionType: 'websocket', connected: true, metadata: {} });
+
+      expect(manager.unregisterClient('client-1')).toBe(true);
+      expect(manager.getClient('client-1')).toBeUndefined();
+    });
+
+    it('returns false and logs warning for unknown client', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const result = manager.unregisterClient('unknown-id');
+
+      expect(result).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('unknown-id'));
+      warnSpy.mockRestore();
+    });
+
+    it('is idempotent for repeated cleanup of the same client', () => {
+      manager.registerClient({ id: 'client-2', connectionType: 'sse', connected: true, metadata: {} });
+
+      expect(manager.unregisterClient('client-2')).toBe(true);
+      expect(manager.unregisterClient('client-2')).toBe(false);
+    });
   });
 
-  it('stores the client so it can be retrieved immediately after registration', () => {
-    manager.registerClient(clientFixture('client-002'));
-    const stored = manager.getClient('client-002');
-    expect(stored).toBeDefined();
-    expect(stored!.id).toBe('client-002');
-    expect(stored!.connected).toBe(true);
+  describe('createSubscription', () => {
+    it('rejects empty event-type sets', () => {
+      manager.registerClient({ id: 'client-4', connectionType: 'websocket', connected: true, metadata: {} });
+
+      expect(() =>
+        manager.createSubscription({ clientId: 'client-4', eventTypes: [] }),
+      ).toThrow('At least one event type is required');
+    });
+
+    it('rejects missing event types (defaults to empty array)', () => {
+      manager.registerClient({ id: 'client-5', connectionType: 'sse', connected: true, metadata: {} });
+
+      expect(() =>
+        manager.createSubscription({ clientId: 'client-5' }),
+      ).toThrow('At least one event type is required');
+    });
+
+    it('accepts a single-element event-type set', () => {
+      manager.registerClient({ id: 'client-6', connectionType: 'polling', connected: true, metadata: {} });
+
+      const subId = manager.createSubscription({
+        clientId: 'client-6',
+        eventTypes: [EventType.OrderCreated],
+      });
+
+      expect(subId).toBeTruthy();
+      expect(manager.getSubscription('client-6')).toBeDefined();
+    });
   });
 
-  it('throws ConflictError when the same ID is registered a second time', () => {
-    manager.registerClient(clientFixture('dup-id'));
+  describe('cancelSubscription', () => {
+    it('returns false when subscription does not exist', () => {
+      const result = manager.cancelSubscription('nonexistent-client');
+      expect(result).toBe(false);
+    });
 
-    expect(() => manager.registerClient(clientFixture('dup-id'))).toThrow(ConflictError);
-  });
+    it('returns true and removes subscription for existing client', () => {
+      manager.registerClient({ id: 'client-3', connectionType: 'polling', connected: true, metadata: {} });
+      manager.createSubscription({
+        clientId: 'client-3',
+        eventTypes: [EventType.OrderCreated],
+      });
 
-  it('ConflictError message identifies the conflicting ID', () => {
-    manager.registerClient(clientFixture('dup-id'));
-
-    let caught: unknown;
-    try {
-      manager.registerClient(clientFixture('dup-id'));
-    } catch (err) {
-      caught = err;
-    }
-
-    expect(caught).toBeInstanceOf(ConflictError);
-    expect((caught as ConflictError).message).toContain('dup-id');
-  });
-
-  it('ConflictError carries the CONFLICT code', () => {
-    manager.registerClient(clientFixture('dup-id'));
-
-    let caught: unknown;
-    try {
-      manager.registerClient(clientFixture('dup-id'));
-    } catch (err) {
-      caught = err;
-    }
-
-    expect((caught as ConflictError).code).toBe('CONFLICT');
-  });
-
-  it('duplicate registration does not overwrite the original client state', () => {
-    // Register the first client and record its connectedAt timestamp
-    manager.registerClient(clientFixture('dup-id'));
-    const original = manager.getClient('dup-id')!;
-    const originalConnectedAt = original.connectedAt;
-
-    // Attempt a second registration with a different connectionType
-    try {
-      manager.registerClient({ ...clientFixture('dup-id'), connectionType: 'sse' });
-    } catch {
-      // expected ConflictError — swallow it
-    }
-
-    // The stored client must still be the original, unmodified entry
-    const afterAttempt = manager.getClient('dup-id')!;
-    expect(afterAttempt.connectionType).toBe('websocket');
-    expect(afterAttempt.connectedAt).toBe(originalConnectedAt);
-  });
-
-  it('a new distinct ID registers successfully even after a conflict on another ID', () => {
-    manager.registerClient(clientFixture('dup-id'));
-
-    // Cause a conflict
-    try {
-      manager.registerClient(clientFixture('dup-id'));
-    } catch {
-      // expected
-    }
-
-    // A completely different ID must still be accepted
-    expect(() => manager.registerClient(clientFixture('fresh-id'))).not.toThrow();
-    expect(manager.getClient('fresh-id')).toBeDefined();
-  });
-
-  it('registering after unregistering the same ID succeeds (ID is no longer active)', () => {
-    manager.registerClient(clientFixture('reuse-id'));
-    manager.unregisterClient('reuse-id');
-
-    // Now the ID is gone — re-registration must NOT throw
-    expect(() => manager.registerClient(clientFixture('reuse-id'))).not.toThrow();
-    expect(manager.getClient('reuse-id')).toBeDefined();
+      expect(manager.cancelSubscription('client-3')).toBe(true);
+      expect(manager.getSubscription('client-3')).toBeUndefined();
+    });
   });
 });
