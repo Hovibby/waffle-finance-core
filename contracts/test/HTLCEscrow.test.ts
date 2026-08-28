@@ -418,6 +418,60 @@ describe("HTLCEscrow v2", () => {
     });
   });
 
+  describe("setResolverRegistry", () => {
+    it("rejects the zero address — a zero registry would silently disable the sybil gate without an explicit deployment decision", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      await expect(
+        escrow.connect(owner).setResolverRegistry(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(escrow, "InvalidAddress");
+    });
+
+    it("accepts a non-zero registry and emits ResolverRegistryUpdated with correct old and new addresses", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg1 = await MockRegistry.deploy();
+      const reg1Addr = await reg1.getAddress();
+
+      const previousRegistry = await escrow.resolverRegistry();
+
+      await expect(escrow.connect(owner).setResolverRegistry(reg1Addr))
+        .to.emit(escrow, "ResolverRegistryUpdated")
+        .withArgs(previousRegistry, reg1Addr);
+
+      expect(await escrow.resolverRegistry()).to.equal(reg1Addr);
+    });
+
+    it("can replace the registry a second time and preserves the old address as previousRegistry", async () => {
+      const [owner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg1 = await MockRegistry.deploy();
+      const reg2 = await MockRegistry.deploy();
+      const reg1Addr = await reg1.getAddress();
+      const reg2Addr = await reg2.getAddress();
+
+      await escrow.connect(owner).setResolverRegistry(reg1Addr);
+
+      await expect(escrow.connect(owner).setResolverRegistry(reg2Addr))
+        .to.emit(escrow, "ResolverRegistryUpdated")
+        .withArgs(reg1Addr, reg2Addr);
+
+      expect(await escrow.resolverRegistry()).to.equal(reg2Addr);
+    });
+
+    it("reverts when a non-owner calls setResolverRegistry", async () => {
+      const [, nonOwner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const MockRegistry = await ethers.getContractFactory("MockRegistry");
+      const reg = await MockRegistry.deploy();
+      await expect(
+        escrow.connect(nonOwner).setResolverRegistry(await reg.getAddress())
+      ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
+    });
+  });
+
   describe("claimOrder", () => {
     it("pays beneficiary on correct sha256 preimage and pays caller the safety deposit", async () => {
       const [sender, beneficiary, relayer] = await ethers.getSigners();
@@ -678,10 +732,23 @@ describe("HTLCEscrow v2", () => {
     it("contract has no admin escape hatch", async () => {
       const escrow = await deployEscrow();
       const escrowContract = escrow as any;
-      // None of the dangerous admin functions exist on the v2 contract.
+      // emergencyWithdraw and pause must not exist.
+      // transferOwnership is intentionally present from Ownable2Step but
+      // cannot move locked order funds.
       expect(escrowContract.emergencyWithdraw).to.be.undefined;
       expect(escrowContract.pause).to.be.undefined;
-      expect(escrowContract.transferOwnership).to.be.undefined;
+    });
+
+    it("withdraw() rejects a zero-amount pull — no-op withdrawals are rejected consistently", async () => {
+      // A caller whose pendingWithdrawals balance is exactly zero must receive
+      // NoPendingWithdrawal.  This is the zero-amount withdrawal guard: no
+      // state is mutated and no event is emitted for a no-op pull.
+      const [, , stranger] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      expect(await escrow.pendingWithdrawals(stranger.address)).to.equal(0n);
+      await expect(
+        escrow.connect(stranger).withdraw()
+      ).to.be.revertedWithCustomError(escrow, "NoPendingWithdrawal");
     });
 
     it("withdraw() is a self-service pull, not a drain — reverts with no pending balance", async () => {
@@ -957,6 +1024,46 @@ describe("HTLCEscrow v2", () => {
       await receiver.setMode(MODE_ACCEPT);
       await receiver.pull(await escrow.getAddress());
       expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+    });
+
+    it("withdraw reverts atomically when the recipient reverts — accounting is intact and funds remain recoverable", async () => {
+      // Issue #524: a reverting native recipient must not leave accounting
+      // in an inconsistent state.  The withdraw() follows CEI order:
+      //   1. Zeroes the credit (effect)
+      //   2. Attempts the transfer (interaction)
+      //   3. Restores the credit and reverts if the transfer fails
+      // After the failed withdraw the full amount is still pending and a
+      // subsequent attempt (once the receiver can accept ETH) succeeds.
+      const [, , relayer] = await ethers.getSigners();
+      const receiver = await deployReceiver();
+      const recvAddr = await receiver.getAddress();
+
+      // Fund the contract and trigger deferral via a rejecting recipient.
+      await receiver.setMode(MODE_REJECT);
+      const { escrow, preimage } = await setupOrder(recvAddr);
+      const escrowAddr = await escrow.getAddress();
+      await escrow.connect(relayer).claimOrder(1, preimage);
+
+      // Sanity: amount is credited, not burned.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(AMOUNT);
+
+      // withdraw() reverts — receiver still rejects ETH.
+      await expect(receiver.pull(escrowAddr)).to.be.revertedWithCustomError(
+        escrow,
+        "NativeTransferFailed"
+      );
+
+      // Accounting is atomically restored: credit and contract balance are unchanged.
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(AMOUNT);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(AMOUNT);
+
+      // Once the receiver can accept ETH the funds are fully recoverable.
+      await receiver.setMode(MODE_ACCEPT);
+      await receiver.pull(escrowAddr);
+      expect(await ethers.provider.getBalance(recvAddr)).to.equal(AMOUNT);
+      expect(await escrow.pendingWithdrawals(recvAddr)).to.equal(0n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
     });
 
     it("a beneficiary that can never accept ETH keeps the amount safely credited (nothing lost)", async () => {
