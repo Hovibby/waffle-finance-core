@@ -37,14 +37,18 @@ vi.mock("viem", async (importOriginal) => {
   };
 });
 
-vi.mock("@stellar/stellar-sdk", () => ({
-  rpc: {
-    Server: vi.fn(() => ({
-      getLatestLedger: vi.fn(async () => ({ sequence: 100_000 })),
-      getEvents: vi.fn(async () => ({ events: mockSorobanEvents, cursor: null }))
-    }))
-  }
-}));
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    rpc: {
+      Server: vi.fn(() => ({
+        getLatestLedger: vi.fn(async () => ({ sequence: 100_000 })),
+        getEvents: vi.fn(async () => ({ events: mockSorobanEvents, cursor: null }))
+      }))
+    }
+  };
+});
 
 vi.mock("@solana/web3.js", () => ({
   Connection: vi.fn(() => ({
@@ -338,7 +342,11 @@ describe("Reconciler — Soroban event replay", () => {
     mockSorobanEvents = [];
     vi.resetModules();
     vi.clearAllMocks();
-    reconciler = new Reconciler(BASE_CFG, orders, log);
+    const sorobanCfg = {
+      ...BASE_CFG,
+      soroban: { ...BASE_CFG.soroban, htlcContract: "C123456789" }
+    };
+    reconciler = new Reconciler(sorobanCfg, orders, log);
   });
 
   it("replays a missing Soroban created event and advances order to src_locked", async () => {
