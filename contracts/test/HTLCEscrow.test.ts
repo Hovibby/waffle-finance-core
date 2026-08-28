@@ -393,6 +393,29 @@ describe("HTLCEscrow v2", () => {
       expect(await escrow.nextOrderId()).to.equal(1n);
       expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
     });
+
+    it("reverts before any state change when amount and safetyDeposit sum overflows uint256", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const escrowAddr = await escrow.getAddress();
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(sender).createOrder(
+          beneficiary.address,
+          sender.address,
+          ZERO_ADDR,
+          ethers.MaxUint256,
+          1n,
+          hashlock,
+          TIMELOCK,
+          { value: 0n }
+        )
+      ).to.be.revertedWithPanic(0x11);
+
+      expect(await escrow.nextOrderId()).to.equal(1n);
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0n);
+    });
   });
 
   describe("claimOrder", () => {
@@ -517,6 +540,70 @@ describe("HTLCEscrow v2", () => {
       await expect(
         escrow.connect(beneficiary).claimOrder(1, preimage)
       ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
+    });
+
+    it("always pays the stored beneficiary regardless of who submits the claim", async () => {
+      const [sender, beneficiary, refundSigner, stranger] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        refundSigner.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      const beneficiaryBefore = await ethers.provider.getBalance(beneficiary.address);
+      const strangerBefore = await ethers.provider.getBalance(stranger.address);
+      const refundSignerBefore = await ethers.provider.getBalance(refundSigner.address);
+
+      const tx = await escrow.connect(stranger).claimOrder(1, preimage);
+      const receipt = await tx.wait();
+      const gas = BigInt(receipt!.gasUsed) * BigInt(receipt!.gasPrice ?? 0n);
+
+      expect(await ethers.provider.getBalance(beneficiary.address)).to.equal(
+        beneficiaryBefore + AMOUNT
+      );
+      expect(await ethers.provider.getBalance(stranger.address)).to.equal(
+        strangerBefore + SAFETY_DEPOSIT - gas
+      );
+      expect(await ethers.provider.getBalance(refundSigner.address)).to.equal(refundSignerBefore);
+
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(1); // Claimed
+    });
+
+    it("rejects a claim submitted exactly at the order timelock", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      const order = await escrow.getOrder(1);
+      await time.increaseTo(Number(order.timelock));
+
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "Expired");
+
+      expect((await escrow.getOrder(1)).status).to.equal(0); // Still Funded
     });
   });
 
@@ -676,6 +763,25 @@ describe("HTLCEscrow v2", () => {
 
       const order = await escrow.getOrder(1);
       expect(order.preimageKeccak).to.equal(ethers.keccak256(preimage));
+    });
+
+    it("rejects an empty preimage before transferring any funds", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await createSingleOrder(escrow, sender, beneficiary, hashlock);
+
+      const escrowAddr = await escrow.getAddress();
+      const balanceBefore = await ethers.provider.getBalance(escrowAddr);
+
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, "0x")
+      ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
+
+      expect(await ethers.provider.getBalance(escrowAddr)).to.equal(balanceBefore);
+      expect((await escrow.getOrder(1)).status).to.equal(0); // Still Funded
     });
 
     it("rejects a preimage that is not exactly 32 bytes", async () => {

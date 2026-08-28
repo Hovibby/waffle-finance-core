@@ -354,13 +354,14 @@ contract HTLCEscrowSecurityTest is Test {
         assertEq(uint8(htlcOpen.getOrder(id).status), uint8(IHTLCEscrow.OrderStatus.Refunded));
     }
 
-    // 3f. Claim boundary: at exactly timelock → claim still valid (not yet expired).
-    function test_claimOrder_atExactTimelock_succeeds() public {
+    // 3f. Claim boundary: at exactly timelock → Expired (>= semantics; equality is expired).
+    function test_claimOrder_atExactTimelock_reverts() public {
         bytes memory pre = _preimage(205);
         uint256 id = _createNative(htlcOpen, resolver, beneficiary, refundAddr, pre);
         vm.warp(htlcOpen.getOrder(id).timelock);
+        vm.expectRevert(HTLCEscrow.Expired.selector);
         htlcOpen.claimOrder(id, pre);
-        assertEq(uint8(htlcOpen.getOrder(id).status), uint8(IHTLCEscrow.OrderStatus.Claimed));
+        assertEq(uint8(htlcOpen.getOrder(id).status), uint8(IHTLCEscrow.OrderStatus.Funded));
     }
 
     // 3g. Claim boundary: one second after timelock → Expired.
