@@ -141,6 +141,7 @@ contract ResolverRegistry is IResolverRegistry, Ownable2Step, ReentrancyGuard {
     ///      and be rejected by the AlreadyRegistered guard, preventing a
     ///      double-registration.
     function register(uint256 stake) external nonReentrant {
+        if (msg.sender == address(0)) revert InvalidAddress();
         if (stake < minStake) revert StakeBelowMinimum();
         if (_resolverIndex[msg.sender] != 0) revert AlreadyRegistered();
 

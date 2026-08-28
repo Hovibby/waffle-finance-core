@@ -125,7 +125,14 @@ export class Reconciler {
    * large to fully cover, which we log as a warning).
    */
   private async computeEthFromBlock(latest: bigint): Promise<bigint> {
-    const cursor = await this.orders.getChainCursor("ethereum");
+    const chainCursor = await this.orders.getChainCursor("ethereum");
+    const minOrderCursor = await this.orders.getMinActiveOrderCursor("ethereum");
+
+    let cursor = chainCursor;
+    if (minOrderCursor !== null && minOrderCursor > 0) {
+      cursor = cursor > 0 ? Math.min(cursor, minOrderCursor) : minOrderCursor;
+    }
+
     const tip = Number(latest);
     const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
       cursor,
@@ -151,7 +158,14 @@ export class Reconciler {
   }
 
   private async computeSorobanFromLedger(latestSeq: number): Promise<number> {
-    const cursor = await this.orders.getChainCursor("stellar");
+    const chainCursor = await this.orders.getChainCursor("stellar");
+    const minOrderCursor = await this.orders.getMinActiveOrderCursor("stellar");
+
+    let cursor = chainCursor;
+    if (minOrderCursor !== null && minOrderCursor > 0) {
+      cursor = cursor > 0 ? Math.min(cursor, minOrderCursor) : minOrderCursor;
+    }
+
     const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
       cursor,
       latestSeq,
@@ -175,7 +189,14 @@ export class Reconciler {
   }
 
   private async computeSolanaFromSlot(tipSlot: number): Promise<number> {
-    const cursor = await this.orders.getChainCursor("solana");
+    const chainCursor = await this.orders.getChainCursor("solana");
+    const minOrderCursor = await this.orders.getMinActiveOrderCursor("solana");
+
+    let cursor = chainCursor;
+    if (minOrderCursor !== null && minOrderCursor > 0) {
+      cursor = cursor > 0 ? Math.min(cursor, minOrderCursor) : minOrderCursor;
+    }
+
     const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
       cursor,
       tipSlot,

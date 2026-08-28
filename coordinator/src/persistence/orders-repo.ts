@@ -97,6 +97,9 @@ export interface OrderRow {
   createdAt: number;
   updatedAt: number;
   archivedAt: number | null;
+  lastEthBlock: number | null;
+  lastSorobanLedger: number | null;
+  lastSolanaSlot: number | null;
 }
 
 export interface OrderHistoryResult {
@@ -156,6 +159,9 @@ interface OrderDbRow {
   created_at: number;
   updated_at: number;
   archived_at: number | null;
+  last_eth_block: number | null;
+  last_soroban_ledger: number | null;
+  last_solana_slot: number | null;
 }
 
 function rowToOrder(r: OrderDbRow): OrderRow {
@@ -191,7 +197,10 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     lastSolanaSlot: r.last_solana_slot ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
-    archivedAt: r.archived_at ?? null
+    archivedAt: r.archived_at ?? null,
+    lastEthBlock: r.last_eth_block ?? null,
+    lastSorobanLedger: r.last_soroban_ledger ?? null,
+    lastSolanaSlot: r.last_solana_slot ?? null
   };
 }
 
@@ -828,6 +837,54 @@ export class OrdersRepository {
       `),
       chain, position
     );
+  }
+
+  /**
+   * Update the per-order high-water mark cursor (last_eth_block, last_soroban_ledger,
+   * or last_solana_slot) for a given order and chain. Advances forward only.
+   */
+  async updateOrderCursor(publicId: string, chain: Chain, position: number): Promise<void> {
+    let col: string;
+    if (chain === "ethereum") col = "last_eth_block";
+    else if (chain === "stellar") col = "last_soroban_ledger";
+    else if (chain === "solana") col = "last_solana_slot";
+    else return;
+
+    await this.run(
+      this.db.prepare(`
+        UPDATE orders
+        SET ${col} = MAX(COALESCE(${col}, 0), ?),
+            updated_at = CAST(strftime('%s','now') AS INTEGER)
+        WHERE public_id = ?
+      `),
+      position,
+      publicId
+    );
+  }
+
+  /**
+   * Return the minimum per-order cursor position across active (non-terminal)
+   * orders for `chain`, or `null` if no active orders have recorded a cursor.
+   */
+  async getMinActiveOrderCursor(chain: Chain): Promise<number | null> {
+    let col: string;
+    if (chain === "ethereum") col = "last_eth_block";
+    else if (chain === "stellar") col = "last_soroban_ledger";
+    else if (chain === "solana") col = "last_solana_slot";
+    else return null;
+
+    const row = await this.get<{ min_cursor: number | null }>(
+      this.db.prepare(`
+        SELECT MIN(${col}) AS min_cursor
+        FROM orders
+        WHERE (src_chain = ? OR dst_chain = ?)
+          AND status NOT IN ('completed', 'refunded', 'failed', 'expired')
+          AND ${col} IS NOT NULL AND ${col} > 0
+      `),
+      chain,
+      chain
+    );
+    return row?.min_cursor ?? null;
   }
 
   // ── Soroban listener checkpoints ──────────────────────────────────────────
