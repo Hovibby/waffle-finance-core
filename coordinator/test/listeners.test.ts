@@ -1101,4 +1101,47 @@ describe("SolanaListener – reorg / fork awareness", () => {
     // don't accumulate indefinitely).
     expect(listener.getPendingSlotCount()).toBe(0);
   });
+
+  // ── Stop-during-backoff: stop() cancels the pending poll timer ──────────────
+  it("stops cleanly when called while the loop is waiting through a poll timer", async () => {
+    vi.useFakeTimers();
+
+    const conn = (listener as any).connection;
+    const realGetSlot = conn.getSlot;
+    const sigSpy = vi.spyOn(conn, "getSignaturesForAddress");
+    let slotCalls = 0;
+
+    try {
+      // Make every poll throw a recoverable RPC error until stop() is called,
+      // so the loop is permanently in the retry/backoff waiting phase.
+      conn.getSlot = vi.fn(async () => {
+        slotCalls++;
+        throw new Error("recoverable RPC failure");
+      });
+
+      listener.start();
+
+      // Let the poll loop run a few cycles: each poll fails, then the loop
+      // schedules a retry timer. slotCalls growing proves normal retry behavior
+      // (re-polling after a failure) works before stop.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(slotCalls).toBeGreaterThanOrEqual(1);
+      expect(vi.getTimerCount()).toBe(1); // exactly one pending retry timer
+
+      // Stop while the retry timer is still pending. stop() must cancel it.
+      listener.stop();
+      expect(vi.getTimerCount()).toBe(0); // no timer should remain after stop
+
+      // Advance far past pollIntervalMs. A cancelled timer cannot fire, so no
+      // subsequent poll may run.
+      const callsAfterStop = slotCalls;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(slotCalls).toBe(callsAfterStop); // no subsequent RPC polls
+      expect(sigSpy).not.toHaveBeenCalled();  // failed poll never reached RPC
+    } finally {
+      conn.getSlot = realGetSlot;
+      sigSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
