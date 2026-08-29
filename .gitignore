@@ -97,6 +97,10 @@ yarn.lock
 .coverage/
 junit.xml
 
+# Jest
+__snapshots__/
+*.snap
+
 # Miscellaneous
 .cache/
 .parcel-cache/
