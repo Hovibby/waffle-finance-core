@@ -237,15 +237,23 @@ describe("ResolverRegistry", () => {
       expect(info.stake).to.equal(MIN_STAKE * 2n);
     });
 
-    it("rejects zero additional amount", async () => {
+    it("rejects zero additional amount and leaves stake and token balances unchanged", async () => {
       const [, , , resolver] = await ethers.getSigners();
       const { token, registry } = await deploy();
       await fundAndApprove(token, registry, resolver, MIN_STAKE);
       await registry.connect(resolver).register(MIN_STAKE);
 
+      const stakeBefore = (await registry.get(resolver.address)).stake;
+      const resolverBalanceBefore = await token.balanceOf(resolver.address);
+      const registryBalanceBefore = await token.balanceOf(await registry.getAddress());
+
       await expect(
         registry.connect(resolver).increaseStake(0n)
       ).to.be.revertedWithCustomError(registry, "InvalidAmount");
+
+      expect((await registry.get(resolver.address)).stake).to.equal(stakeBefore);
+      expect(await token.balanceOf(resolver.address)).to.equal(resolverBalanceBefore);
+      expect(await token.balanceOf(await registry.getAddress())).to.equal(registryBalanceBefore);
     });
 
     it("rejects call from an unregistered address", async () => {
@@ -506,23 +514,23 @@ describe("ResolverRegistry", () => {
       expect(await registry.isActive(r1.address)).to.be.false;
     });
 
-    it("caps slash at the resolver's current stake (no underflow)", async () => {
+    it("rejects slash amount larger than the resolver's current stake with no state mutation", async () => {
       const [, beneficiary, , resolver] = await ethers.getSigners();
       const { token, registry } = await deploy();
       await fundAndApprove(token, registry, resolver, MIN_STAKE);
       await registry.connect(resolver).register(MIN_STAKE);
 
-      const benBefore = await token.balanceOf(beneficiary.address);
-      // Request more than the available stake.
-      await registry.slash(resolver.address, MIN_STAKE * 10n);
-      // Only MIN_STAKE transferred  no overflow.
-      expect(await token.balanceOf(beneficiary.address)).to.equal(
-        benBefore + MIN_STAKE
-      );
+      const beneficiaryBalanceBefore = await token.balanceOf(beneficiary.address);
 
+      await expect(
+        registry.slash(resolver.address, MIN_STAKE + 1n)
+      ).to.be.revertedWithCustomError(registry, "InvalidAmount");
+
+      expect(await token.balanceOf(beneficiary.address)).to.equal(beneficiaryBalanceBefore);
       const info = await registry.get(resolver.address);
-      expect(info.stake).to.equal(0n);
-      expect(info.totalSlashed).to.equal(MIN_STAKE);
+      expect(info.stake).to.equal(MIN_STAKE);
+      expect(info.active).to.be.true;
+      await assertInvariants(registry, [resolver.address]);
     });
 
     it("accumulates totalSlashed across multiple slashes", async () => {
@@ -548,15 +556,24 @@ describe("ResolverRegistry", () => {
       ).to.be.revertedWithCustomError(registry, "NotRegistered");
     });
 
-    it("rejects slash with zero amount", async () => {
-      const [, , , resolver] = await ethers.getSigners();
+    it("rejects slash with zero amount and leaves stake, status, and beneficiary balance unchanged", async () => {
+      const [, beneficiary, , resolver] = await ethers.getSigners();
       const { token, registry } = await deploy();
       await fundAndApprove(token, registry, resolver, MIN_STAKE);
       await registry.connect(resolver).register(MIN_STAKE);
 
+      const stakeBefore = (await registry.get(resolver.address)).stake;
+      const activeBefore = (await registry.get(resolver.address)).active;
+      const beneficiaryBalanceBefore = await token.balanceOf(beneficiary.address);
+
       await expect(
         registry.slash(resolver.address, 0n)
       ).to.be.revertedWithCustomError(registry, "InvalidAmount");
+
+      const infoAfter = await registry.get(resolver.address);
+      expect(infoAfter.stake).to.equal(stakeBefore);
+      expect(infoAfter.active).to.equal(activeBefore);
+      expect(await token.balanceOf(beneficiary.address)).to.equal(beneficiaryBalanceBefore);
     });
 
     it("only owner can slash", async () => {
@@ -568,6 +585,28 @@ describe("ResolverRegistry", () => {
       await expect(
         registry.connect(resolver).slash(resolver.address, 1n)
       ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
+    });
+
+    it("slashes exactly the current stake leaving zero stake, inactive status, and full beneficiary payout", async () => {
+      const [, beneficiary, , resolver] = await ethers.getSigners();
+      const { token, registry } = await deploy();
+      await fundAndApprove(token, registry, resolver, MIN_STAKE);
+      await registry.connect(resolver).register(MIN_STAKE);
+
+      const beneficiaryBalanceBefore = await token.balanceOf(beneficiary.address);
+
+      await expect(registry.slash(resolver.address, MIN_STAKE))
+        .to.emit(registry, "Slashed")
+        .withArgs(resolver.address, MIN_STAKE, beneficiary.address);
+
+      const info = await registry.get(resolver.address);
+      expect(info.stake).to.equal(0n);
+      expect(info.active).to.be.false;
+      expect(await token.balanceOf(beneficiary.address)).to.equal(
+        beneficiaryBalanceBefore + MIN_STAKE
+      );
+      // Slash does not remove the resolver from the list.
+      await assertInvariants(registry, [resolver.address]);
     });
   });
 
