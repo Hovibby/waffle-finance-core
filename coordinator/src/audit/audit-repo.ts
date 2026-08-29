@@ -25,15 +25,23 @@ interface AuditDbRow {
   created_at: number;
 }
 
+function assertFiniteInteger(value: unknown, field: string): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n !== Math.trunc(n)) {
+    throw new Error(`Malformed audit row: ${field} is not a finite integer (got ${String(value)})`);
+  }
+  return n;
+}
+
 function rowToEntry(r: AuditDbRow): AuditEntry {
   return {
-    id: Number(r.id),
+    id: assertFiniteInteger(r.id, 'id'),
     schemaVersion: r.schema_version as typeof AUDIT_SCHEMA_VERSION,
     eventType: r.event_type as AuditEntry['eventType'],
     orderId: r.order_id,
     requestId: r.request_id,
     payloadJson: r.payload_json,
-    createdAt: Number(r.created_at),
+    createdAt: assertFiniteInteger(r.created_at, 'created_at'),
   };
 }
 
@@ -154,6 +162,14 @@ export class AuditRepository {
     } catch (err) {
       await stmtRun(rollbackStmt).catch(() => {/* swallow rollback error */});
       throw err;
+    } finally {
+      // Release temporary statements so adapter resources are not held
+      // across repeated batch writes. SQLite's DatabaseSync requires
+      // explicit finalization; Postgres statements are stateless and
+      // safe to skip.
+      for (const s of [txStmt, commitStmt, rollbackStmt]) {
+        if (typeof (s as any).finalize === 'function') (s as any).finalize();
+      }
     }
 
     return ids;
