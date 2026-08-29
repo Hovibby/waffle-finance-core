@@ -534,6 +534,35 @@ export class OrderService {
     return this.repo.setChainCursor(chain, position);
   }
 
+  async advanceOrderLedgerCursor(
+    publicId: string,
+    update: {
+      lastEthBlock?: number;
+      lastSorobanLedger?: number;
+      lastSolanaSlot?: number;
+    }
+  ): Promise<void> {
+    return this.repo.advanceOrderLedgerCursor(publicId, update);
+  }
+
+  async getReconciliationCursorState(limit = 200): Promise<{
+    chainCursors: Array<{ chain: Chain; position: number; updatedAt: number }>;
+    orderCursors: Array<{
+      publicId: string;
+      status: string;
+      lastEthBlock: number | null;
+      lastSorobanLedger: number | null;
+      lastSolanaSlot: number | null;
+      updatedAt: number;
+    }>;
+  }> {
+    const [chainCursors, orderCursors] = await Promise.all([
+      this.repo.listChainCursors(),
+      this.repo.listOrderLedgerCursors(limit),
+    ]);
+    return { chainCursors, orderCursors };
+  }
+
   async updateOrderCursor(publicId: string, chain: Chain, position: number): Promise<void> {
     return this.repo.updateOrderCursor(publicId, chain, position);
   }

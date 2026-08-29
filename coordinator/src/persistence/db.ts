@@ -467,6 +467,9 @@ function openSqliteDatabase(url: string): Database {
   const incrementalAlters: string[] = [
     "ALTER TABLE orders ADD COLUMN preimage_enc_version INTEGER DEFAULT NULL",
     "ALTER TABLE orders ADD COLUMN archived_at INTEGER",
+    "ALTER TABLE orders ADD COLUMN last_eth_block INTEGER DEFAULT NULL",
+    "ALTER TABLE orders ADD COLUMN last_soroban_ledger INTEGER DEFAULT NULL",
+    "ALTER TABLE orders ADD COLUMN last_solana_slot INTEGER DEFAULT NULL",
   ];
   for (const alter of incrementalAlters) {
     try {
