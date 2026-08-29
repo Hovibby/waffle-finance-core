@@ -522,6 +522,21 @@ export class SorobanListener {
     ev: SorobanRpcEvent,
     path: WorkflowPath = "live"
   ): Promise<boolean> {
+    // ── Ledger metadata validation ────────────────────────────────────────
+    // The RPC delivers `ledger` as a raw Number.  A malformed or adversarial
+    // response can produce NaN, ±Infinity, or a value above MAX_SAFE_INTEGER.
+    // Any of those would silently corrupt the cursor (NaN comparisons always
+    // return false, unsafe integers lose precision).  Reject the event before
+    // it can advance the cursor or reach persistence.
+    if (!Number.isFinite(ev.ledger) || !Number.isSafeInteger(ev.ledger) || ev.ledger < 0) {
+      sorobanDecodeErrors.inc({ reason: "invalid_ledger_metadata" });
+      this.log.warn(
+        { ledger: ev.ledger, txHash: ev.txHash, path },
+        "Soroban event has invalid ledger metadata (NaN, Infinity, or unsafe integer) — rejecting without dispatch"
+      );
+      return false;
+    }
+
     const result = decodeHtlcEvent(ev.topic, ev.value);
 
     // ── Malformed payload ─────────────────────────────────────────────────
