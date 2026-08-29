@@ -714,3 +714,67 @@ describe("Replay fidelity — audit stream matches actual repo transitions", () 
     expect(run2.sort()).toEqual(newIds.sort());
   });
 });
+
+
+// ─── Boundary / validation tests added for bug fixes ─────────────────────────
+
+// ── (b) + (c): zero and negative limit in AuditRepository.query ──────────────
+
+describe("AuditRepository.query — limit boundary validation", () => {
+  it("throws RangeError for a zero limit", async () => {
+    const { auditRepo } = await freshSetup();
+    await expect(auditRepo.query({ limit: 0 })).rejects.toThrow(RangeError);
+    await expect(auditRepo.query({ limit: 0 })).rejects.toThrow(/limit must be a positive integer/i);
+  });
+
+  it("throws RangeError for a negative limit", async () => {
+    const { auditRepo } = await freshSetup();
+    await expect(auditRepo.query({ limit: -1 })).rejects.toThrow(RangeError);
+    await expect(auditRepo.query({ limit: -1 })).rejects.toThrow(/limit must be a positive integer/i);
+  });
+
+  it("accepts a positive limit without throwing", async () => {
+    const { auditRepo } = await freshSetup();
+    for (let i = 0; i < 3; i++) {
+      await auditRepo.append(buildSystemAuditEntry("system.startup", `e${i}`));
+    }
+    // Should resolve normally and return at most 2 entries
+    const page = await auditRepo.query({ limit: 2 });
+    expect(page.entries).toHaveLength(2);
+    expect(page.nextCursor).not.toBeNull();
+  });
+});
+
+// ── (d): malformed JSON payload in AuditRepository.append ────────────────────
+
+describe("AuditRepository.append — payload JSON validation", () => {
+  it("throws SyntaxError for malformed JSON and does not insert a row", async () => {
+    const { auditRepo } = await freshSetup();
+
+    const badEntry = {
+      eventType: "system.startup" as const,
+      orderId: null,
+      requestId: null,
+      payloadJson: "{not valid json",
+    };
+
+    await expect(auditRepo.append(badEntry)).rejects.toThrow(SyntaxError);
+    await expect(auditRepo.append(badEntry)).rejects.toThrow(/payloadJson is not valid JSON/i);
+
+    // Confirm nothing was written to the table
+    const page = await auditRepo.query({});
+    expect(page.entries).toHaveLength(0);
+  });
+
+  it("accepts a valid JSON payload and inserts the row", async () => {
+    const { auditRepo } = await freshSetup();
+    const id = await auditRepo.append(
+      buildSystemAuditEntry("system.startup", "valid entry"),
+    );
+    expect(typeof id).toBe("number");
+    expect(id).toBeGreaterThan(0);
+
+    const page = await auditRepo.query({});
+    expect(page.entries).toHaveLength(1);
+  });
+});
