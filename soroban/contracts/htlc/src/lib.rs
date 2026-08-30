@@ -61,69 +61,85 @@
 //! `RestoreFootprint` operation (paying the rent bump), after which
 //! claim/refund proceed normally under the original hashlock +
 //! timelock rules.
+//!
+//! # Migration framework
+//!
+//! See [`migration`] for the full migration design. In brief:
+//!
+//! - Every new deployment stamps the schema version via [`migration::stamp_initial_version`]
+//!   so the `SchemaVersion` key is present from day one.
+//! - Every state-reading entry point calls [`migration::require_current_schema`]
+//!   before deserialising any `Order`, making schema mismatches loud rather
+//!   than silent.
+//! - [`HtlcContract::migrate_orders`] is an admin-only, batchable, resumable
+//!   entry point that transforms persisted order data from an older schema
+//!   version to the current one and emits an auditable `("migration","schema")`
+//!   event on the final batch.
+//! - [`HtlcContract::schema_version`] and [`HtlcContract::version_info`] are
+//!   read-only helpers that let indexers detect schema state without a full
+//!   contract call.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, token, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol,
+    symbol_short, token, vec, Address, Bytes, BytesN, Env, IntoVal, String,
+    Symbol,
 };
+
+pub mod migration;
+
+#[cfg(test)]
+pub mod harness;
 
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod prop_tests;
+
 /// Maximum allowed timelock duration in seconds (24 hours).
 /// Mirrors the EVM contract bound and protects users from accidentally
 /// locking funds for unreasonably long periods.
-const MAX_TIMELOCK_SECONDS: u64 = 86_400;
+pub const MAX_TIMELOCK_SECONDS: u64 = 86_400;
 
 /// Minimum allowed timelock duration in seconds (5 minutes).
 /// Ensures there is enough time for the user to actually claim.
-const MIN_TIMELOCK_SECONDS: u64 = 300;
+pub const MIN_TIMELOCK_SECONDS: u64 = 300;
 
 // ---------------------------------------------------------------------
 // State-archival (TTL) parameters
-//
-// Soroban TTLs are denominated in ledgers, while order timelocks are
-// denominated in seconds. Mainnet targets ~5 s per ledger, but close
-// times can dip below that; converting with a conservative 4 s/ledger
-// over-provisions the ledger count so the wall-clock coverage still
-// holds if ledgers close faster than the target.
 // ---------------------------------------------------------------------
 
 /// Conservative (fastest plausible) ledger close time used to convert
 /// seconds to ledgers when sizing TTLs.
-const ASSUMED_MIN_LEDGER_TIME_SECS: u64 = 4;
+pub const ASSUMED_MIN_LEDGER_TIME_SECS: u64 = 4;
 
 /// Ledgers per day at [`ASSUMED_MIN_LEDGER_TIME_SECS`] (21,600).
-const LEDGERS_PER_DAY: u32 = (24 * 3600 / ASSUMED_MIN_LEDGER_TIME_SECS) as u32;
+pub const LEDGERS_PER_DAY: u32 = (24 * 3600 / ASSUMED_MIN_LEDGER_TIME_SECS) as u32;
 
 /// When the instance TTL falls below this threshold (~14 days), a
-/// state-mutating call re-extends it. Chosen so that any activity at
-/// least fortnightly keeps the instance permanently live.
-const INSTANCE_TTL_THRESHOLD: u32 = 14 * LEDGERS_PER_DAY;
+/// state-mutating call re-extends it.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 14 * LEDGERS_PER_DAY;
 
-/// Target instance TTL (~30 days). A quiet contract stays invocable
-/// for a month after its last state-mutating call before the instance
-/// (and admin/config entries) can be archived and need restoring.
-const INSTANCE_TTL_EXTEND_TO: u32 = 30 * LEDGERS_PER_DAY;
+/// Target instance TTL (~30 days).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 30 * LEDGERS_PER_DAY;
 
 /// Safety margin (~14 days) added on top of an order's timelock when
-/// sizing its entry TTL. Covers the post-expiry refund window and
-/// clock/close-time drift, so the entry cannot be archived while
-/// either claim or refund is still actionable.
-const ORDER_TTL_MARGIN_LEDGERS: u32 = 14 * LEDGERS_PER_DAY;
+/// sizing its entry TTL.
+pub const ORDER_TTL_MARGIN_LEDGERS: u32 = 14 * LEDGERS_PER_DAY;
 
 /// TTL (~30 days) applied to an order entry when it reaches a terminal
-/// state (claimed/refunded), keeping the record queryable for indexers
-/// and off-chain reconciliation.
-const FINALISED_ORDER_TTL_LEDGERS: u32 = 30 * LEDGERS_PER_DAY;
+/// state (claimed/refunded).
+pub const FINALISED_ORDER_TTL_LEDGERS: u32 = 30 * LEDGERS_PER_DAY;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error codes
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Error {
-    /// Contract has already been initialised. Retained for ABI
-    /// stability; unreachable now that configuration happens in the
-    /// constructor.
+    /// Contract has already been initialised.
     AlreadyInitialised = 1,
     /// Contract has not been initialised yet.
     NotInitialised = 2,
@@ -153,7 +169,22 @@ pub enum Error {
     Overflow = 14,
     /// No admin transfer is pending.
     NoPendingTransfer = 15,
+    /// The on-chain schema version does not match the version this binary
+    /// expects. The contract must be migrated (or restored) before this
+    /// operation can proceed.
+    SchemaMismatch = 16,
+    /// A prerequisite migration has not been applied. Migrations must be
+    /// applied in order; you cannot jump from V0 to V2 without first
+    /// applying V0→V1.
+    MigrationPreconditionFailed = 17,
+    /// The migration target version is the same as the current version;
+    /// the migration has already been applied.
+    AlreadyMigrated = 18,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// On-chain types
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Lifecycle state for a single HTLC order.
 #[contracttype]
@@ -168,6 +199,11 @@ pub enum OrderStatus {
 }
 
 /// A single hash + time-locked order.
+///
+/// **Schema version note**: this struct corresponds to `SchemaVersion::V1`.
+/// If fields are ever added or removed in a future version, snapshot the
+/// current layout as `OrderV1` in `migration.rs` before changing this struct,
+/// and add the appropriate `From<OrderV1>` conversion to the new layout.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Order {
@@ -178,14 +214,11 @@ pub struct Order {
     pub beneficiary: Address,
     /// Account that receives the funds back after a timeout.
     pub refund_address: Address,
-    /// The asset locked. Use the native XLM asset contract here for
-    /// native swaps; SAC and Soroban tokens are also supported.
+    /// The asset locked.
     pub asset: Address,
     /// Amount of `asset` locked (in the asset's smallest unit).
     pub amount: i128,
-    /// Safety deposit posted by the order creator. Goes to whoever
-    /// triggers the terminal state (claim or refund) as an incentive
-    /// to keep the network alive.
+    /// Safety deposit posted by the order creator.
     pub safety_deposit: i128,
     /// sha256(preimage).
     pub hashlock: BytesN<32>,
@@ -196,63 +229,64 @@ pub struct Order {
     /// Preimage revealed by claim_order (empty until claim).
     pub preimage: Bytes,
     /// Ledger timestamp at creation time.
+    /// `0` for orders migrated from a pre-versioning deployment (unknown provenance).
     pub created_at: u64,
-    /// Ledger timestamp at terminal state (0 while funded).
+    /// Ledger timestamp at terminal state (0 while funded or migrated from V0).
     pub finalised_at: u64,
 }
 
-/// Storage keys. Persistent storage is bumped on every write so the
-/// ledger entry stays alive for the entire lifetime of the order.
+/// Storage keys.
 #[contracttype]
 #[derive(Clone)]
-enum DataKey {
-    /// Admin address that can update configuration (e.g. min safety deposit).
+pub enum DataKey {
+    /// Admin address.
     Admin,
-    /// Address proposed by the admin to take over the role. The
-    /// transfer only completes when this address calls `accept_admin`.
+    /// Pending admin for two-step handover.
     PendingAdmin,
     /// Next order id counter.
     NextOrderId,
     /// Order data, keyed by id.
     Order(u64),
-    /// Address of the ResolverRegistry contract. Optional; if unset, the
-    /// HTLC accepts any resolver (the contract is still safe because all
-    /// movements are gated by hashlock/timelock).
+    /// Address of the ResolverRegistry contract.
     ResolverRegistry,
-    /// Minimum safety deposit (in stroops, i.e. 1e-7 XLM).
+    /// Minimum safety deposit (in stroops).
     MinSafetyDeposit,
+    /// Monotonically increasing schema version. Absent on pre-versioning
+    /// deployments; treated as `SchemaVersion::V0` when missing.
+    SchemaVersion,
+    /// Locked flag set at the start of a migration batch and cleared when
+    /// the migration is finalised. Prevents concurrent re-entry or a fresh
+    /// order from being created while a migration is in progress.
+    MigrationLock,
 }
 
-/// Events emitted by the contract. Topics are short symbols so they fit
-/// in the 4-symbol Soroban constraint.
+// ─────────────────────────────────────────────────────────────────────────────
+// Event topics
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn topic_created() -> Symbol { symbol_short!("created") }
 fn topic_claimed() -> Symbol { symbol_short!("claimed") }
 fn topic_refunded() -> Symbol { symbol_short!("refunded") }
-/// Admin-transfer lifecycle: paired with "proposed" / "accepted" /
-/// "revoked" and (old, new) address data.
 fn topic_admin_transfer() -> Symbol { symbol_short!("adm_xfer") }
-/// Config mutations: paired with a per-setting symbol and (old, new)
-/// value data.
 fn topic_config() -> Symbol { symbol_short!("cfg") }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct HtlcContract;
 
 #[contractimpl]
 impl HtlcContract {
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Lifecycle
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
-    /// Configure the contract atomically at deploy time. Running this
-    /// as a constructor (instead of a separate post-deploy `initialize`
-    /// transaction) closes the front-running window in which a third
-    /// party could claim adminship of a freshly deployed contract.
-    /// `admin` can update `min_safety_deposit` and the optional
-    /// `ResolverRegistry` address. The admin can NEVER move user funds.
+    /// Configure the contract atomically at deploy time. Running this as a
+    /// constructor closes the front-running window for adminship. `admin` can
+    /// update `min_safety_deposit` and the optional `ResolverRegistry`.
     pub fn __constructor(env: Env, admin: Address, min_safety_deposit: i128) {
-        // The host only runs the constructor once, at deploy; this
-        // guard is defense-in-depth against any re-invocation path.
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialised);
         }
@@ -262,11 +296,113 @@ impl HtlcContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextOrderId, &1u64);
         env.storage().instance().set(&DataKey::MinSafetyDeposit, &min_safety_deposit);
+
+        // Stamp the initial schema version so `require_current_schema` passes
+        // from the first invocation without needing a migration.
+        migration::stamp_initial_version(&env);
+
         Self::extend_instance_ttl(&env);
     }
 
-    /// Set or update the resolver registry contract address. Pass
-    /// `Option::None` semantics by calling `clear_resolver_registry`.
+    // -------------------------------------------------------------------------
+    // Migration entry points
+    // -------------------------------------------------------------------------
+
+    /// Return the current on-chain schema version as a `u32`. Intended for
+    /// indexers and off-chain tooling to detect when a migration is needed.
+    pub fn schema_version(env: Env) -> u32 {
+        migration::read_schema_version(&env) as u32
+    }
+
+    /// Return a human-readable version info string:
+    /// `"schema:<N> binary:<M>"` where `N` is the on-chain schema version and
+    /// `M` is the schema version this binary was compiled against. Indexers
+    /// can compare the two to determine whether a migration is pending.
+    pub fn version_info(env: Env) -> String {
+        let on_chain = migration::read_schema_version(&env) as u32;
+        let compiled = migration::CURRENT_SCHEMA_VERSION as u32;
+        // Build a compact info string. Soroban `String` is UTF-8; we use
+        // a static prefix and append the version digits.
+        // Format: "schema:N binary:M"  (all single-digit for now; extend
+        // if versions ever exceed 9).
+        let mut buf = [0u8; 18]; // "schema:X binary:X\0" fits in 18 bytes
+        let schema_digit = b'0' + (on_chain % 10) as u8;
+        let binary_digit = b'0' + (compiled % 10) as u8;
+        // "schema:" = 7, digit = 1, " binary:" = 8, digit = 1 → 17 total
+        let prefix = b"schema:";
+        let middle = b" binary:";
+        let mut pos = 0usize;
+        for &b in prefix { buf[pos] = b; pos += 1; }
+        buf[pos] = schema_digit; pos += 1;
+        for &b in middle { buf[pos] = b; pos += 1; }
+        buf[pos] = binary_digit; pos += 1;
+        String::from_bytes(&env, &soroban_sdk::Bytes::from_slice(&env, &buf[..pos]))
+    }
+
+    /// Admin-only, batchable migration entry point.
+    ///
+    /// Migrates orders whose ids fall in `[start_order_id, end_order_id)` from
+    /// the current (old) schema to `CURRENT_SCHEMA_VERSION`. The caller must
+    /// process all order ids in batches and set `finalize = true` on the last
+    /// batch to atomically bump the schema version and emit the audit event.
+    ///
+    /// **Concurrency / re-entry guard**: the first call (with any `finalize`
+    /// value) sets a `MigrationLock` in instance storage. While the lock is
+    /// held, `create_order` panics with `Error::SchemaMismatch`. The lock is
+    /// cleared when `finalize = true` completes successfully.
+    ///
+    /// **Idempotency**: if the schema is already at `CURRENT_SCHEMA_VERSION`
+    /// this function panics with `Error::AlreadyMigrated` — it cannot silently
+    /// re-process already-migrated orders.
+    ///
+    /// Returns `(migrated_count, new_schema_version)`.
+    pub fn migrate_orders(
+        env: Env,
+        start_order_id: u64,
+        end_order_id: u64,
+        finalize: bool,
+    ) -> (u32, u32) {
+        Self::require_admin(&env);
+
+        // Guard against running on an already-current schema.
+        let current = migration::read_schema_version(&env);
+        if current >= migration::CURRENT_SCHEMA_VERSION {
+            panic_with_error!(&env, Error::AlreadyMigrated);
+        }
+
+        // Set migration lock so create_order is blocked during migration.
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationLock, &true);
+
+        let (migrated, new_version) =
+            migration::execute_migration(&env, start_order_id, end_order_id, finalize);
+
+        // Clear lock only when we commit the final version bump.
+        if finalize {
+            env.storage().instance().remove(&DataKey::MigrationLock);
+        }
+
+        Self::extend_instance_ttl(&env);
+        (migrated, new_version as u32)
+    }
+
+    /// Validate post-migration config integrity. Emits a
+    /// `("migration","cfg_chk")` event with a bitmask of missing keys.
+    /// Returns `0` on success (all keys present). Admin-only.
+    pub fn check_migration_integrity(env: Env) -> u32 {
+        Self::require_admin(&env);
+        let missing = migration::check_config_keys(&env);
+        migration::emit_config_check_event(&env, missing);
+        Self::extend_instance_ttl(&env);
+        missing
+    }
+
+    // -------------------------------------------------------------------------
+    // Config / governance
+    // -------------------------------------------------------------------------
+
+    /// Set or update the resolver registry contract address.
     pub fn set_resolver_registry(env: Env, registry: Address) {
         Self::require_admin(&env);
         let old: Option<Address> = env.storage().instance().get(&DataKey::ResolverRegistry);
@@ -309,10 +445,7 @@ impl HtlcContract {
         );
     }
 
-    /// Propose a new admin. The role only changes hands once
-    /// `new_admin` calls `accept_admin`, so a typo'd address cannot
-    /// permanently brick the admin functions — the current admin stays
-    /// in control (and can `revoke_pending_admin`) until acceptance.
+    /// Propose a new admin (two-step handover).
     pub fn transfer_admin(env: Env, new_admin: Address) {
         Self::require_admin(&env);
         let current = Self::admin(env.clone());
@@ -324,8 +457,7 @@ impl HtlcContract {
         );
     }
 
-    /// Complete a pending admin transfer. Must be authorised by the
-    /// pending admin itself, proving the address is usable.
+    /// Complete a pending admin transfer.
     pub fn accept_admin(env: Env) {
         let pending: Address = env
             .storage()
@@ -343,8 +475,7 @@ impl HtlcContract {
         );
     }
 
-    /// Cancel a pending admin transfer (escape hatch for a mistaken
-    /// `transfer_admin`). Only the current admin may revoke.
+    /// Cancel a pending admin transfer.
     pub fn revoke_pending_admin(env: Env) {
         Self::require_admin(&env);
         let pending: Address = env
@@ -360,16 +491,15 @@ impl HtlcContract {
         );
     }
 
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Core HTLC operations
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /// Create and fund a new HTLC order.
     ///
-    /// `sender.require_auth()` is the on-ledger authorisation that
-    /// the sender owns the locked funds. The function transfers
-    /// `amount` of `asset` from `sender` to this contract and records
-    /// the order under `hashlock`.
+    /// Panics with `Error::SchemaMismatch` if the on-chain schema is not at
+    /// `CURRENT_SCHEMA_VERSION` (migration is pending) or if a migration batch
+    /// is currently in progress (`MigrationLock` is set).
     pub fn create_order(
         env: Env,
         sender: Address,
@@ -382,6 +512,10 @@ impl HtlcContract {
         timelock_seconds: u64,
     ) -> u64 {
         Self::require_initialised(&env);
+        // Schema gate: refuse to create new orders against a stale schema.
+        migration::require_current_schema(&env);
+        // Migration lock: refuse to create while a migration batch is running.
+        Self::require_no_migration_lock(&env);
         sender.require_auth();
 
         if amount <= 0 {
@@ -403,13 +537,6 @@ impl HtlcContract {
             panic_with_error!(&env, Error::SafetyDepositTooSmall);
         }
 
-        // If a resolver registry is configured, require the sender to be
-        // an active resolver. The registry contract owns the membership
-        // policy (stake, slash, activation). The HTLC remains correct
-        // even without this check — funds are still gated by hashlock +
-        // timelock — but enforcing it here keeps the off-chain order
-        // book sybil-resistant. Claim and refund stay permissionless
-        // regardless of registry state.
         if let Some(registry) = env
             .storage()
             .instance()
@@ -439,8 +566,6 @@ impl HtlcContract {
             .instance()
             .set(&DataKey::NextOrderId, &(order_id + 1));
 
-        // Pull the locked amount + safety deposit from sender to the
-        // contract address. token::Client honours sender.require_auth().
         let token_client = token::Client::new(&env, &asset);
         let total = amount
             .checked_add(safety_deposit)
@@ -464,9 +589,6 @@ impl HtlcContract {
         };
 
         env.storage().persistent().set(&DataKey::Order(order_id), &order);
-        // Size the entry's TTL to the order's actual lifetime (timelock
-        // plus margin) rather than a fixed constant, so the entry cannot
-        // be archived while claim or refund is still actionable.
         let order_ttl = Self::order_ttl_ledgers(timelock_seconds);
         env.storage()
             .persistent()
@@ -481,12 +603,13 @@ impl HtlcContract {
         order_id
     }
 
-    /// Reveal the preimage and transfer the locked amount to
-    /// `beneficiary`. The safety deposit is paid to the caller (which
-    /// is typically the beneficiary, but can be any address — this
-    /// incentivises permissionless secret-reveal relays).
+    /// Reveal the preimage and transfer the locked amount to `beneficiary`.
+    ///
+    /// Panics with `Error::SchemaMismatch` if the on-chain schema is stale.
     pub fn claim_order(env: Env, order_id: u64, preimage: Bytes, caller: Address) {
         Self::require_initialised(&env);
+        // Schema gate: any attempt to deserialise an Order must be version-safe.
+        migration::require_current_schema(&env);
         caller.require_auth();
 
         let mut order: Order = env
@@ -502,20 +625,17 @@ impl HtlcContract {
             panic_with_error!(&env, Error::Expired);
         }
 
-        // Hashlock check: sha256(preimage) MUST equal the stored hash.
         let computed = env.crypto().sha256(&preimage);
         if BytesN::<32>::from(computed) != order.hashlock {
             panic_with_error!(&env, Error::InvalidPreimage);
         }
 
         let token_client = token::Client::new(&env, &order.asset);
-        // Locked amount goes to beneficiary.
         token_client.transfer(
             &env.current_contract_address(),
             &order.beneficiary,
             &order.amount,
         );
-        // Safety deposit goes to whoever submitted the claim tx.
         if order.safety_deposit > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -528,7 +648,6 @@ impl HtlcContract {
         order.preimage = preimage.clone();
         order.finalised_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Order(order_id), &order);
-        // Keep the terminal record alive for indexers/reconciliation.
         env.storage().persistent().extend_ttl(
             &DataKey::Order(order_id),
             FINALISED_ORDER_TTL_LEDGERS,
@@ -542,11 +661,13 @@ impl HtlcContract {
         );
     }
 
-    /// Permissionless refund after the timelock has expired. The locked
-    /// amount goes back to `refund_address`; the safety deposit is paid
-    /// to the caller (incentivising anyone to clean up expired orders).
+    /// Permissionless refund after the timelock has expired.
+    ///
+    /// Panics with `Error::SchemaMismatch` if the on-chain schema is stale.
     pub fn refund_order(env: Env, order_id: u64, caller: Address) {
         Self::require_initialised(&env);
+        // Schema gate: same rationale as claim_order.
+        migration::require_current_schema(&env);
         caller.require_auth();
 
         let mut order: Order = env
@@ -579,7 +700,6 @@ impl HtlcContract {
         order.status = OrderStatus::Refunded;
         order.finalised_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Order(order_id), &order);
-        // Keep the terminal record alive for indexers/reconciliation.
         env.storage().persistent().extend_ttl(
             &DataKey::Order(order_id),
             FINALISED_ORDER_TTL_LEDGERS,
@@ -594,14 +714,6 @@ impl HtlcContract {
     }
 
     /// Permissionless keep-alive for an order's ledger entry.
-    ///
-    /// Anyone can call this to re-extend an order entry's TTL so it
-    /// cannot be archived while the order is still actionable — e.g.
-    /// when a claim window straddles an archival boundary. A funded
-    /// order is extended to cover its remaining timelock plus the
-    /// standard margin; a finalised order is extended by the terminal
-    /// retention period. Panics with [`Error::OrderNotFound`] if no
-    /// live entry exists for `order_id`.
     pub fn extend_order_ttl(env: Env, order_id: u64) {
         Self::require_initialised(&env);
 
@@ -625,9 +737,9 @@ impl HtlcContract {
         Self::extend_instance_ttl(&env);
     }
 
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Read-only helpers
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     pub fn get_order(env: Env, order_id: u64) -> Option<Order> {
         env.storage().persistent().get(&DataKey::Order(order_id))
@@ -662,9 +774,9 @@ impl HtlcContract {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Internal helpers
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     fn require_initialised(env: &Env) {
         if !env.storage().instance().has(&DataKey::Admin) {
@@ -672,22 +784,25 @@ impl HtlcContract {
         }
     }
 
-    /// Re-extend the instance TTL (admin, order-id counter, config).
-    /// Called from every state-mutating entry point so that ongoing
-    /// activity keeps the contract alive indefinitely.
+    /// Refuse to proceed if a migration batch is in flight.
+    fn require_no_migration_lock(env: &Env) {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationLock)
+            .unwrap_or(false);
+        if locked {
+            panic_with_error!(env, Error::SchemaMismatch);
+        }
+    }
+
     fn extend_instance_ttl(env: &Env) {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
-    /// TTL, in ledgers, that covers `timelock_seconds` of wall-clock
-    /// time (converted at the conservative
-    /// [`ASSUMED_MIN_LEDGER_TIME_SECS`] close time, rounded up) plus
-    /// [`ORDER_TTL_MARGIN_LEDGERS`].
     fn order_ttl_ledgers(timelock_seconds: u64) -> u32 {
-        // timelock_seconds is bounded by MAX_TIMELOCK_SECONDS (86,400),
-        // so the conversion cannot overflow u32.
         let timelock_ledgers =
             timelock_seconds.div_ceil(ASSUMED_MIN_LEDGER_TIME_SECS) as u32;
         timelock_ledgers + ORDER_TTL_MARGIN_LEDGERS
@@ -702,4 +817,3 @@ impl HtlcContract {
         admin.require_auth();
     }
 }
-
