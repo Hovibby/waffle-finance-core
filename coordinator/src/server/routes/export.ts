@@ -156,18 +156,26 @@ const downloadQuerySchema = z.object({
   startDate: z
     .string()
     .optional()
-    .transform((v) => {
+    .transform((v, ctx) => {
       if (!v || v === "all") return undefined;
       const ts = Number.isFinite(Number(v)) ? Number(v) : Math.floor(new Date(v).getTime() / 1000);
-      return Number.isNaN(ts) ? undefined : ts;
+      if (!Number.isFinite(ts)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Invalid startDate: "${v}" is not a valid date or unix timestamp` });
+        return z.NEVER;
+      }
+      return ts;
     }),
   endDate: z
     .string()
     .optional()
-    .transform((v) => {
+    .transform((v, ctx) => {
       if (!v || v === "all") return undefined;
       const ts = Number.isFinite(Number(v)) ? Number(v) : Math.floor(new Date(v).getTime() / 1000);
-      return Number.isNaN(ts) ? undefined : ts;
+      if (!Number.isFinite(ts)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Invalid endDate: "${v}" is not a valid date or unix timestamp` });
+        return z.NEVER;
+      }
+      return ts;
     }),
   status: z
     .enum([
