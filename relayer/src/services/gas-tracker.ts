@@ -116,7 +116,9 @@ export class GasPriceTracker {
     
     // Apply congestion adjustments
     const congestionMultiplier = this.getCongestionMultiplier();
-    const basePrice = BigInt(gasPrice[transactionType]);
+    // Use default 'standard' price if the requested type is missing (legacy response)
+    const priceStr = gasPrice[transactionType] ?? gasPrice.standard;
+    const basePrice = BigInt(priceStr);
     const adjustedPrice = (basePrice * BigInt(Math.floor(congestionMultiplier * 1000))) / BigInt(1000);
     
     return adjustedPrice.toString();
