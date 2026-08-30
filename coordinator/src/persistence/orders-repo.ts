@@ -97,9 +97,6 @@ export interface OrderRow {
   createdAt: number;
   updatedAt: number;
   archivedAt: number | null;
-  lastEthBlock: number | null;
-  lastSorobanLedger: number | null;
-  lastSolanaSlot: number | null;
 }
 
 export interface OrderHistoryResult {
@@ -159,9 +156,6 @@ interface OrderDbRow {
   created_at: number;
   updated_at: number;
   archived_at: number | null;
-  last_eth_block: number | null;
-  last_soroban_ledger: number | null;
-  last_solana_slot: number | null;
 }
 
 function rowToOrder(r: OrderDbRow): OrderRow {
@@ -198,9 +192,6 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     archivedAt: r.archived_at ?? null,
-    lastEthBlock: r.last_eth_block ?? null,
-    lastSorobanLedger: r.last_soroban_ledger ?? null,
-    lastSolanaSlot: r.last_solana_slot ?? null
   };
 }
 
@@ -510,10 +501,64 @@ export class OrdersRepository {
     }
   }
 
-  async setStatus(publicId: string, status: OrderStatus, actor = "system"): Promise<void> {
+  /**
+   * Update the status of an order identified by `publicId`.
+   *
+   * When `expectedStatus` is provided the update is conditional: it only
+   * applies when the current DB status matches `expectedStatus`.  This
+   * enables optimistic-concurrency-style updates.
+   *
+   * After a zero-row result a narrow SELECT is performed to distinguish:
+   *   - `NOT_FOUND`    — no row with this public_id exists
+   *   - `STALE_STATUS` — row exists but its current status did not match
+   *                      `expectedStatus` (only reachable when expectedStatus
+   *                      is supplied)
+   *
+   * When `expectedStatus` is omitted the underlying SQL has no prior-status
+   * guard so a zero-row result can only mean NOT_FOUND.
+   */
+  async setStatus(
+    publicId: string,
+    status: OrderStatus,
+    actor?: string,
+    expectedStatus?: OrderStatus
+  ): Promise<void>;
+  async setStatus(publicId: string, status: OrderStatus, actor = "system", expectedStatus?: OrderStatus): Promise<void> {
     await this.transactionManager.runWithRetry("status-update", async () => {
+      // Fetch the current row first so we can record a transition event and
+      // also use it for the zero-row disambiguation below.
       const order = await this.get<OrderDbRow>(this.byPublicId, publicId);
-      await this.run(this.updateStatus, { publicId, status });
+
+      let result: StatementResult;
+      if (expectedStatus !== undefined) {
+        // Conditional UPDATE — only succeeds when the current status matches.
+        result = await this.run(
+          this.db.prepare(`
+            UPDATE orders
+            SET status = :status, updated_at = CAST(strftime('%s','now') AS INTEGER)
+            WHERE public_id = :publicId AND status = :expectedStatus
+          `),
+          { publicId, status, expectedStatus }
+        );
+      } else {
+        result = await this.run(this.updateStatus, { publicId, status });
+      }
+
+      if (result.changes === 0) {
+        if (!order) {
+          const err = new Error(`Order not found: ${publicId}`);
+          (err as any).code = "NOT_FOUND";
+          throw err;
+        }
+        // Row exists but the conditional WHERE status = :expectedStatus failed.
+        const err = new Error(
+          `Status update conflict for ${publicId}: current status "${order.status}" does not match expected "${expectedStatus}"`
+        );
+        (err as any).code = "STALE_STATUS";
+        (err as any).currentStatus = order.status;
+        throw err;
+      }
+
       if (order) {
         await this.appendTransitionEvent(order.id, "status.transitioned", {
           actor,
@@ -1157,6 +1202,28 @@ export class OrdersRepository {
       lastSolanaSlot: r.last_solana_slot ?? null,
       updatedAt: r.updated_at,
     }));
+  }
+
+  /**
+   * Return up to `limit` non-terminal, non-archived orders ordered by most
+   * recently updated.  Used by `CacheVerifier` to select a representative
+   * sample for on-chain spot-checking.
+   *
+   * Terminal statuses (completed, refunded, failed) are excluded.  `expired`
+   * is intentionally included — an expired order can still be reconciled.
+   */
+  async findNonTerminalSample(limit: number): Promise<OrderRow[]> {
+    const rows = await this.all<OrderDbRow>(
+      this.db.prepare(`
+        SELECT * FROM orders
+        WHERE status NOT IN ('completed', 'refunded', 'failed')
+          AND archived_at IS NULL
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `),
+      Math.min(Math.max(limit, 1), 1000)
+    );
+    return rows.map(rowToOrder);
   }
 
   async listChainCursors(): Promise<
