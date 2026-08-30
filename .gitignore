@@ -97,6 +97,17 @@ yarn.lock
 .coverage/
 junit.xml
 
+# Test snapshots
+**/__snapshots__/
+*.snap
+
+# Vitest / Jest cache
+.vitest-cache/
+.jest-cache/
+
+# TypeScript build info
+*.tsbuildinfo
+
 # Miscellaneous
 .cache/
 .parcel-cache/

@@ -451,6 +451,40 @@ describe("AuditExporter.validateOrderSequences", () => {
     expect(issues).toHaveLength(1);
     expect(issues[0]!.issue).toMatch(/no audit entries/i);
   });
+
+  it("reports malformed entry when toStatus field is missing", async () => {
+    const { auditRepo, exporter } = await freshSetup();
+    const oid = "wf_malformed_to";
+    // Manually insert a raw entry with no toStatus
+    await auditRepo.append({
+      eventType: "order.announced",
+      orderId: oid,
+      requestId: null,
+      payloadJson: JSON.stringify({ fromStatus: null }),  // toStatus missing
+    });
+    const issues = await exporter.validateOrderSequences([oid]);
+    expect(issues.length).toBeGreaterThan(0);
+    expect(issues[0]!.issue).toMatch(/malformed/i);
+  });
+
+  it("validates a legitimate expired lifecycle without discrepancies", async () => {
+    const { auditRepo, exporter } = await freshSetup();
+    const oid = "wf_expired";
+    const transitions = [
+      { event: "order.announced" as const, from: null,        to: "announced" },
+      { event: "order.src_locked" as const, from: "announced", to: "src_locked" },
+      { event: "order.expired"    as const, from: "src_locked", to: "expired"   },
+    ];
+    for (const t of transitions) {
+      await auditRepo.append(buildOrderAuditEntry(t.event as any, {
+        orderId: oid, hashlock: HASHLOCK, direction: "eth_to_xlm",
+        fromStatus: t.from, toStatus: t.to,
+        srcChain: "ethereum", dstChain: "stellar",
+      }));
+    }
+    const issues = await exporter.validateOrderSequences([oid]);
+    expect(issues).toHaveLength(0);
+  });
 });
 
 
