@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{
-    Error, ResolverRegistry, ResolverRegistryClient,
+    Error, ResolverLifecycle, ResolverRegistry, ResolverRegistryClient,
     MIN_UNBONDING_PERIOD_SECS,
 };
 use soroban_sdk::{
@@ -498,6 +498,31 @@ fn withdraw_stake_without_request_unregister_fails() {
         registry.try_withdraw_stake(&r).err().unwrap().unwrap(),
         Error::UnbondingNotRequested.into()
     );
+}
+
+#[test]
+fn lifecycle_state_tracks_active_unbonding_and_inactive() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    sac.mint(&r, &min_stake);
+    registry.register(&r, &min_stake);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Active);
+    assert!(registry.is_active(&r));
+
+    registry.request_unregister(&r);
+    let unbonding = registry.get(&r).unwrap();
+    assert_eq!(unbonding.lifecycle, ResolverLifecycle::Unbonding);
+    assert!(!registry.is_active(&r));
+
+    registry.slash(&r, &min_stake);
+    let slashed = registry.get(&r).unwrap();
+    assert_eq!(slashed.lifecycle, ResolverLifecycle::Inactive);
+    assert!(!registry.is_active(&r));
 }
 
 #[test]
@@ -1309,4 +1334,269 @@ fn full_lifecycle_register_increase_two_phase_exit() {
     assert_eq!(token.balance(&registry.address), 0);
     assert!(registry.get(&r).is_none());
     assert!(!registry.list().contains(&r));
+}
+
+// ---------------------------------------------------------------------------
+// Slash boundary: stake == min_stake after slash stays Active (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slash_to_exactly_min_stake_keeps_active() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    // One stroops above minimum so slashing by 1 lands exactly at the floor.
+    sac.mint(&r, &(min_stake + 1));
+    registry.register(&r, &(min_stake + 1));
+    assert!(registry.is_active(&r));
+
+    // Slash by 1 → remaining stake == min_stake; must still be Active.
+    registry.slash(&r, &1i128);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.stake, min_stake);
+    assert_eq!(info.lifecycle, ResolverLifecycle::Active);
+    assert!(info.active, "stake == min_stake must remain Active (threshold is strict <)");
+    assert!(registry.is_active(&r));
+}
+
+// ---------------------------------------------------------------------------
+// Inactive resolver can still request_unregister and withdraw (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inactive_resolver_can_request_unregister_and_withdraw() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, token, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    let stake = min_stake * 2;
+    sac.mint(&r, &stake);
+    registry.register(&r, &stake);
+
+    // Slash below the minimum threshold → Inactive lifecycle.
+    registry.slash(&r, &(min_stake + 1));
+    let info_before = registry.get(&r).unwrap();
+    assert_eq!(info_before.lifecycle, ResolverLifecycle::Inactive);
+    assert!(!info_before.active);
+
+    // An Inactive resolver still holds locked stake and can initiate exit.
+    let now = env.ledger().timestamp();
+    registry.request_unregister(&r);
+    let info_unbonding = registry.get(&r).unwrap();
+    assert_eq!(info_unbonding.lifecycle, ResolverLifecycle::Unbonding,
+        "request_unregister must transition Inactive → Unbonding");
+    assert!(info_unbonding.unbonding_at.is_some());
+    let expected_ready = now + PERIOD;
+    assert_eq!(info_unbonding.unbonding_at, Some(expected_ready));
+
+    // Advance past unbonding window and complete the exit.
+    advance_time(&env, PERIOD);
+    let remaining_stake = info_unbonding.stake;
+    registry.withdraw_stake(&r);
+
+    assert_eq!(token.balance(&r), remaining_stake);
+    assert!(registry.get(&r).is_none());
+    assert!(!registry.list().contains(&r));
+}
+
+// ---------------------------------------------------------------------------
+// Re-register while Inactive (entry exists) → AlreadyRegistered (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn re_register_while_inactive_without_withdraw_fails() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    sac.mint(&r, &(min_stake * 3));
+    registry.register(&r, &min_stake);
+
+    // Slash to zero → Inactive (the entry is still in persistent storage).
+    registry.slash(&r, &min_stake);
+    assert_eq!(registry.get(&r).unwrap().lifecycle, ResolverLifecycle::Inactive);
+
+    // Attempting to re-register before withdrawing must fail — the entry exists.
+    assert_eq!(
+        registry.try_register(&r, &min_stake).err().unwrap().unwrap(),
+        Error::AlreadyRegistered.into(),
+        "must not register while an existing entry (even Inactive) is present"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multiple slash events cumulatively accumulate total_slashed (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multiple_slash_events_cumulate_total_slashed() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    let stake = min_stake * 5;
+    sac.mint(&r, &stake);
+    registry.register(&r, &stake);
+
+    // Advance time so last_slash_at is non-zero (Soroban test env starts at timestamp 0).
+    advance_time(&env, 1000);
+
+    let s1 = min_stake;
+    let s2 = 50_0000000i128;
+    let s3 = 25_0000000i128;
+
+    registry.slash(&r, &s1);
+    registry.slash(&r, &s2);
+    registry.slash(&r, &s3);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.total_slashed, s1 + s2 + s3,
+        "total_slashed must accumulate across multiple slash calls");
+    assert_eq!(info.stake, stake - s1 - s2 - s3);
+    // last_slash_at must be updated on each slash.
+    assert!(info.last_slash_at > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Slash during Unbonding that crosses the minimum → Inactive (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slash_during_unbonding_crossing_min_transitions_to_inactive() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    // Stake is min_stake + 1 so a slash of 2 crosses below the floor.
+    sac.mint(&r, &(min_stake + 1));
+    registry.register(&r, &(min_stake + 1));
+
+    registry.request_unregister(&r);
+    assert_eq!(registry.get(&r).unwrap().lifecycle, ResolverLifecycle::Unbonding);
+
+    // Slash by 2 → remaining = min_stake - 1 < min_stake → must become Inactive.
+    registry.slash(&r, &2i128);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Inactive,
+        "slash during Unbonding that crosses min_stake threshold must flip to Inactive");
+    assert!(!info.active);
+    assert!(!registry.is_active(&r));
+}
+
+// ---------------------------------------------------------------------------
+// Slash on an already-Inactive resolver keeps it Inactive (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slash_inactive_resolver_stays_inactive() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    let stake = min_stake * 2;
+    sac.mint(&r, &stake);
+    registry.register(&r, &stake);
+
+    // First slash: crosses the minimum → Inactive.
+    registry.slash(&r, &(min_stake + 1));
+    assert_eq!(registry.get(&r).unwrap().lifecycle, ResolverLifecycle::Inactive);
+
+    // Second slash on an already-Inactive resolver must not change lifecycle.
+    registry.slash(&r, &1i128);
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Inactive,
+        "Inactive must remain Inactive regardless of further slashes");
+    assert!(!info.active);
+}
+
+// ---------------------------------------------------------------------------
+// Full flow: slash → Inactive → unregister → withdraw → re-register (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn full_lifecycle_slash_inactive_exit_and_reregister() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, token, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    sac.mint(&r, &(min_stake * 4));
+
+    // Register and get slashed below the minimum.
+    registry.register(&r, &(min_stake * 2));
+    registry.slash(&r, &(min_stake + 1));
+    assert_eq!(registry.get(&r).unwrap().lifecycle, ResolverLifecycle::Inactive);
+    assert!(!registry.is_active(&r));
+
+    // Initiate exit from Inactive state.
+    registry.request_unregister(&r);
+    advance_time(&env, PERIOD);
+    let remaining = registry.get(&r).unwrap().stake;
+    let balance_before = token.balance(&r);
+    registry.withdraw_stake(&r);
+
+    assert_eq!(token.balance(&r), balance_before + remaining);
+    assert!(registry.get(&r).is_none(), "entry must be removed after withdraw_stake");
+
+    // Re-register cleanly with a fresh stake.
+    registry.register(&r, &min_stake);
+
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Active, "re-registration must start Active");
+    assert!(info.active);
+    assert_eq!(info.unbonding_at, None);
+    assert_eq!(info.total_slashed, 0, "re-registration resets slash accounting");
+    assert_eq!(info.stake, min_stake);
+    assert!(registry.list().contains(&r));
+    assert!(registry.is_active(&r));
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle field and active boolean are always consistent (#501)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_and_active_bool_always_consistent() {
+    let env = Env::default();
+    let min_stake = 100_0000000i128;
+    let (_, _, _, sac, _, registry) = setup_full(&env, min_stake);
+
+    let r = Address::generate(&env);
+    sac.mint(&r, &(min_stake * 3));
+
+    // Active state
+    registry.register(&r, &(min_stake * 3));
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Active);
+    assert!(info.active);
+    assert!(registry.is_active(&r));
+
+    // Unbonding state
+    registry.request_unregister(&r);
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Unbonding);
+    assert!(!info.active, "active must be false in Unbonding");
+    assert!(!registry.is_active(&r));
+
+    // Slash during unbonding → Inactive
+    registry.slash(&r, &(min_stake * 3));
+    let info = registry.get(&r).unwrap();
+    assert_eq!(info.lifecycle, ResolverLifecycle::Inactive);
+    assert!(!info.active, "active must be false in Inactive");
+    assert!(!registry.is_active(&r));
+
+    // Withdrawal completes → entry removed
+    advance_time(&env, PERIOD);
+    registry.withdraw_stake(&r);
+    assert!(registry.get(&r).is_none());
+    assert!(!registry.is_active(&r), "is_active must be false for unknown resolver");
 }

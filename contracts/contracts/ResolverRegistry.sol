@@ -141,6 +141,7 @@ contract ResolverRegistry is IResolverRegistry, Ownable2Step, ReentrancyGuard {
     ///      and be rejected by the AlreadyRegistered guard, preventing a
     ///      double-registration.
     function register(uint256 stake) external nonReentrant {
+        if (msg.sender == address(0)) revert InvalidAddress();
         if (stake < minStake) revert StakeBelowMinimum();
         if (_resolverIndex[msg.sender] != 0) revert AlreadyRegistered();
 
@@ -277,20 +278,18 @@ contract ResolverRegistry is IResolverRegistry, Ownable2Step, ReentrancyGuard {
 
         // ── Effects ──────────────────────────────────────────────────
         ResolverInfo storage info = _resolvers[resolver];
-        uint256 take = amount > info.stake ? info.stake : amount;
-        info.stake       -= take;
-        info.totalSlashed += take;
+        if (amount > info.stake) revert InvalidAmount();
+        info.stake       -= amount;
+        info.totalSlashed += amount;
         info.lastSlashAt   = uint64(block.timestamp);
         if (info.stake < minStake) {
             info.active = false;
         }
 
         // ── Interaction ───────────────────────────────────────────────
-        if (take > 0) {
-            stakeAsset.safeTransfer(slashBeneficiary, take);
-        }
+        stakeAsset.safeTransfer(slashBeneficiary, amount);
 
-        emit Slashed(resolver, take, slashBeneficiary);
+        emit Slashed(resolver, amount, slashBeneficiary);
     }
 
     function setMinStake(uint256 newMinStake) external onlyOwner {

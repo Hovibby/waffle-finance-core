@@ -52,9 +52,19 @@ CREATE TABLE IF NOT EXISTS orders (
     -- Resolver that filled the destination side (if any).
     resolver_address      TEXT,
 
+    -- Per-order reconciler high-water marks (see 011_order_ledger_cursors.sql).
+    last_eth_block        INTEGER,
+    last_soroban_ledger   INTEGER,
+    last_solana_slot      INTEGER,
+
     created_at            INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
     updated_at            INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
-    archived_at           INTEGER
+    archived_at           INTEGER,
+
+    -- Per-order high-water marks for reconciler (see TD-043).
+    last_eth_block        INTEGER,
+    last_soroban_ledger   INTEGER,
+    last_solana_slot      INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_hashlock         ON orders (hashlock);
@@ -67,6 +77,14 @@ CREATE INDEX IF NOT EXISTS idx_orders_public_id        ON orders (public_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at       ON orders (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_src_address_created_at ON orders (src_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_dst_address_created_at ON orders (dst_address, created_at DESC);
+
+-- Cursor-based pagination indexes (see migrations/005_cursor_pagination.sql).
+CREATE INDEX IF NOT EXISTS idx_orders_cursor_pagination ON orders (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_src_cursor ON orders (src_address, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_dst_cursor ON orders (dst_address, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_last_eth_block ON orders (last_eth_block) WHERE last_eth_block IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_last_soroban_ledger ON orders (last_soroban_ledger) WHERE last_soroban_ledger IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_last_solana_slot ON orders (last_solana_slot) WHERE last_solana_slot IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS order_events (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,5 +112,67 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     migration   TEXT    PRIMARY KEY,
     applied_at  INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL
+);
+
+
+-- ── Audit log ─────────────────────────────────────────────────────────────────
+-- Durable, append-only record of order lifecycle transitions and recovery
+-- actions.  Rows are never updated or deleted.
+-- See coordinator/src/audit/audit-log.ts for the full type contract.
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id             INTEGER  PRIMARY KEY AUTOINCREMENT,
+    schema_version INTEGER  NOT NULL DEFAULT 1,
+    event_type     TEXT     NOT NULL,
+    order_id       TEXT,
+    request_id     TEXT,
+    payload_json   TEXT     NOT NULL,
+    created_at     INTEGER  NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_order_id
+    ON audit_log (order_id, id ASC)
+    WHERE order_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_id_asc
+    ON audit_log (id ASC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
+    ON audit_log (event_type, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at
+    ON audit_log (created_at DESC);
+
+-- ── Chain cursors ─────────────────────────────────────────────────────────────
+-- Tracks the last fully-processed block/ledger/slot per chain so the reconciler
+-- can compute the exact gap between "last seen" and "current tip" after a restart.
+-- `position` uses the native unit for each chain:
+--   ethereum → block number
+--   stellar  → ledger sequence number
+--   solana   → slot number
+-- A missing row means the reconciler has never run for that chain.
+CREATE TABLE IF NOT EXISTS chain_cursors (
+    chain       TEXT    PRIMARY KEY CHECK (chain IN ('ethereum', 'stellar', 'solana')),
+    position    INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+
+-- ── Soroban listener checkpoints ──────────────────────────────────────────────
+-- Durable checkpoint for the Soroban event listener so ingestion can resume
+-- safely after a restart, redeploy, or temporary RPC inconsistency without
+-- reprocessing from scratch or skipping a missed ledger range.
+-- See migrations/010_soroban_checkpoints.sql for the full column contract.
+--   contract_id       the Soroban HTLC contract the checkpoint belongs to.
+--   last_safe_ledger  highest fully-processed ledger; advances forward only.
+--   effective_cursor  opaque Soroban RPC pagination cursor, or NULL after a reset.
+--   recovery_marker   'clean' | 'pending_replay' | 'recovering' — drives replay.
+--   updated_at        unix timestamp (seconds) of the last checkpoint write.
+CREATE TABLE IF NOT EXISTS soroban_checkpoints (
+    contract_id      TEXT    PRIMARY KEY,
+    last_safe_ledger INTEGER NOT NULL DEFAULT 0,
+    effective_cursor TEXT,
+    recovery_marker  TEXT    NOT NULL DEFAULT 'clean'
+                     CHECK (recovery_marker IN ('clean', 'pending_replay', 'recovering')),
+    updated_at       INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
 );
 

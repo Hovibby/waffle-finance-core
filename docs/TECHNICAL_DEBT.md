@@ -33,22 +33,17 @@ This register tracks architectural debt, known gaps, and planned improvements ac
 
 ## Platform-wide
 
-### TD-000 · Solana activation pending Anchor program deployment 🔴
+### TD-000 · Solana activation pending Anchor program deployment ✅ RESOLVED
 
 **Discovered:** project inception  
-**Location:** `packages/sdk/src/solana/`, `coordinator/src/listeners/solana-listener.ts`, `relayer/src/utils/solana-config.ts`, `resolver/src/listeners/`
+**Resolved:** 2026-07-30  
+**Location:** `packages/sdk/src/solana/`, `coordinator/src/listeners/solana-listener.ts`, `relayer/src/services/solana-contract.ts`
 
 **Context:**  
-The entire Solana leg — SDK client, coordinator listener, relayer integration, resolver settle path, and E2E simulator — is wired end-to-end but deliberately held in simulation mode until the Anchor HTLC program is deployed on devnet. The SDK enters simulation mode whenever `programId` equals `"PLACEHOLDER"` or is empty. The relayer's `logSolanaStatus` detects this and sets the `solana_placeholder_mode` Prometheus gauge.
+The entire Solana leg — SDK client, coordinator listener, relayer integration, and E2E simulator — was wired end-to-end but held in simulation mode until the Anchor HTLC program was deployed on devnet.
 
-**Impact:**  
-SOL swaps are not settled on-chain. The UI exposes the route and records orders, but no actual Solana funds move.
-
-**Next steps:**
-1. Deploy the Anchor HTLC program to Solana devnet.
-2. Set `SOLANA_HTLC_PROGRAM` in coordinator and relayer env.
-3. Run the E2E harness against devnet to validate the full path.
-4. Remove `SolanaHtlcSim` stub and replace with a live-network fixture.
+**Resolution:**  
+The Solana Anchor HTLC program is deployed on devnet. The relayer's `ConfiguredSolanaIntegration` now submits real Solana transactions for lock, claim, and refund operations using the SDK's instruction builders. The coordinator route policy no longer blocks Solana directions. Simulation mode is retained as a fallback when `SOLANA_HTLC_PROGRAM` is unset or a placeholder value.
 
 ---
 
@@ -288,20 +283,14 @@ In a fresh deployment with no traffic, events that occur before the first `wake`
 
 ---
 
-### TD-043 · Reconciler does not track last-processed ledger per order 🟢
+### TD-043 · Reconciler per-order ledger cursor tracking (RESOLVED) ✅
 
 **Discovered:** 2026-06-30  
-**Location:** `coordinator/src/reconciliation/reconciler.ts` line ~117 — comment: "We don't track last processed ledger per order, so this is a simplified check"
+**Resolved:** 2026-08-24 (Migration 011 added `last_eth_block`, `last_soroban_ledger`, `last_solana_slot` columns to orders table and updated reconciler to skip already-processed events and track per-order cursors).  
+**Location:** `coordinator/src/reconciliation/reconciler.ts`, `coordinator/src/persistence/orders-repo.ts`
 
 **Context:**  
-The reconciler re-scans a fixed lookback window (48 h) on every run and relies on idempotent event processing to skip already-handled events. It does not store a per-order high-water mark. For a high-volume deployment this means re-processing the same events on every reconciliation cycle, which is wasteful and can produce noisy logs.
-
-**Impact:**  
-Increased RPC call volume and log noise in high-throughput scenarios. No correctness issue because event processing is idempotent.
-
-**Next steps:**
-1. Add a `last_eth_block` / `last_soroban_ledger` / `last_solana_slot` column per order in the DB schema.
-2. Update the reconciler to use those cursors as the lower bound instead of the fixed lookback window.
+The reconciler previously re-scanned a fixed lookback window on every run. With TD-043, per-order high-water marks track the highest processed block/ledger/slot per order across Ethereum, Soroban, and Solana, preventing redundant processing and lowering RPC overhead.
 
 ---
 

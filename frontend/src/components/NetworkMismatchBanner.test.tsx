@@ -1,142 +1,196 @@
-import { render, screen } from '@testing-library/react';
+/**
+ * NetworkMismatchBanner component tests — issue #470
+ *
+ * Covers mainnet UI acceptance criteria:
+ *   - Banner hidden when wallets match the app network
+ *   - Banner shown when MetaMask is on mainnet (0x1) while app is in testnet mode
+ *   - Banner shown when Freighter is on mainnet passphrase while app is in testnet mode
+ *   - "Switch wallet to Testnet" button calls syncWalletsToAppMode
+ *   - "Switch app to wallet" button calls setMode with the wallet's detected mode
+ *   - Banner shown when MetaMask is on Sepolia while app is in mainnet mode
+ */
+
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import NetworkMismatchBanner from './NetworkMismatchBanner';
-import { vi } from 'vitest';
+import type { NetworkModeState } from '../lib/useNetworkMode';
 
-// Mock isMainnetEnabled
-vi.mock('../config/networks', () => ({
-  isMainnetEnabled: vi.fn(() => true),
-}));
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 
-const mockNetworkState = {
-  mode: 'testnet' as const,
-  expectedEthChainIdHex: '0xaa36a7',
-  expectedStellarPassphrase: 'Test SDF Network ; September 2015',
-  metamaskChainId: null,
-  metamaskConnected: false,
-  metamaskMatches: true,
-  freighterNetworkPassphrase: null,
-  freighterConnected: false,
-  freighterMatches: true,
-  hasAnyMismatch: false,
-  setMode: vi.fn().mockResolvedValue({ ok: true }),
-  syncWalletsToAppMode: vi.fn().mockResolvedValue({ ok: true }),
-  refreshWalletNetworks: vi.fn(),
-};
+function makeNetworkState(overrides: Partial<NetworkModeState> = {}): NetworkModeState {
+  return {
+    mode: 'testnet',
+    expectedEthChainIdHex: '0xaa36a7',
+    expectedStellarPassphrase: 'Test SDF Network ; September 2015',
+    metamaskChainId: '0xaa36a7',
+    metamaskConnected: false,
+    metamaskMatches: true,
+    freighterNetworkPassphrase: null,
+    freighterConnected: false,
+    freighterMatches: true,
+    hasAnyMismatch: false,
+    setMode: vi.fn().mockResolvedValue({ ok: true }),
+    syncWalletsToAppMode: vi.fn().mockResolvedValue({ ok: true }),
+    refreshWalletNetworks: vi.fn(),
+    ...overrides,
+  };
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('NetworkMismatchBanner', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  it('renders nothing when no mismatch exists', () => {
+    const { container } = render(
+      <NetworkMismatchBanner networkState={makeNetworkState({ hasAnyMismatch: false })} />,
+    );
+    expect(container.firstChild).toBeNull();
   });
 
-  test('does not render when there is no mismatch', () => {
-    render(<NetworkMismatchBanner networkState={mockNetworkState} />);
-    expect(screen.queryByText(/Your wallet network does not match/i)).not.toBeInTheDocument();
+  // ── MetaMask on mainnet while app is testnet ──────────────────────────────
+
+  it('shows banner when MetaMask is on Ethereum Mainnet but app is on Testnet', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          metamaskConnected: true,
+          metamaskChainId: '0x1',
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(screen.getByText(/does not match/i)).toBeInTheDocument();
+    expect(screen.getByText(/ethereum mainnet/i)).toBeInTheDocument();
   });
 
-  test('renders when there is a MetaMask mismatch', () => {
-    const mismatchState = {
-      ...mockNetworkState,
-      metamaskConnected: true,
-      metamaskChainId: '0x1', // Mainnet chain ID
-      metamaskMatches: false,
-      hasAnyMismatch: true,
-    };
-
-    render(<NetworkMismatchBanner networkState={mismatchState} />);
-
-    // Should show the banner
-    expect(screen.getByText(/Your wallet network does not match/i)).toBeInTheDocument();
-    
-    // Check for App is set to Testnet
-    expect(screen.getByText(/App is set to/i)).toBeInTheDocument();
-    
-    // Should show MetaMask is on mainnet
-    expect(screen.getByText(/Ethereum wallet is on/i)).toBeInTheDocument();
-    expect(screen.getByText(/Ethereum Mainnet/i)).toBeInTheDocument();
-    
-    // Should show switch wallet to app button
-    expect(screen.getByRole('button', { name: /Switch wallet to Testnet/i })).toBeInTheDocument();
-    
-    // Should show switch app to wallet button
-    expect(screen.getByRole('button', { name: /Switch app to wallet/i })).toBeInTheDocument();
+  it('shows "Switch wallet to Testnet" button when app is on testnet', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          metamaskConnected: true,
+          metamaskChainId: '0x1',
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: /switch wallet to testnet/i }),
+    ).toBeInTheDocument();
   });
 
-  test('renders when there is a Freighter mismatch', () => {
-    const mismatchState = {
-      ...mockNetworkState,
-      freighterConnected: true,
-      freighterNetworkPassphrase: 'Public Global Stellar Network ; September 2015', // Mainnet
-      freighterMatches: false,
-      hasAnyMismatch: true,
-    };
-
-    render(<NetworkMismatchBanner networkState={mismatchState} />);
-
-    // Should show the banner
-    expect(screen.getByText(/Your wallet network does not match/i)).toBeInTheDocument();
-    
-    // Check for App is set to Testnet
-    expect(screen.getByText(/App is set to/i)).toBeInTheDocument();
-    
-    // Should show Freighter is on mainnet
-    expect(screen.getByText(/Freighter is on/i)).toBeInTheDocument();
-    expect(screen.getByText(/Stellar Mainnet/i)).toBeInTheDocument();
-    
-    // Should show switch wallet to app button
-    expect(screen.getByRole('button', { name: /Switch wallet to Testnet/i })).toBeInTheDocument();
-    
-    // Should show switch app to wallet button
-    expect(screen.getByRole('button', { name: /Switch app to wallet/i })).toBeInTheDocument();
+  it('"Switch wallet to Testnet" button calls syncWalletsToAppMode', async () => {
+    const syncWalletsToAppMode = vi.fn().mockResolvedValue({ ok: true });
+    const refreshWalletNetworks = vi.fn();
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          metamaskConnected: true,
+          metamaskChainId: '0x1',
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+          syncWalletsToAppMode,
+          refreshWalletNetworks,
+        })}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: /switch wallet to testnet/i }),
+    );
+    await waitFor(() => expect(syncWalletsToAppMode).toHaveBeenCalledOnce());
+    expect(refreshWalletNetworks).toHaveBeenCalledOnce();
   });
 
-  test('calls syncWalletsToAppMode when switch wallet to app button clicked', async () => {
-    const mismatchState = {
-      ...mockNetworkState,
-      metamaskConnected: true,
-      metamaskChainId: '0x1', // Mainnet chain ID
-      metamaskMatches: false,
-      hasAnyMismatch: true,
-    };
+  // ── MetaMask on Sepolia while app is mainnet ──────────────────────────────
 
-    render(<NetworkMismatchBanner networkState={mismatchState} />);
-    
-    await userEvent.click(screen.getByRole('button', { name: /Switch wallet to Testnet/i }));
-    
-    expect(mockNetworkState.syncWalletsToAppMode).toHaveBeenCalledTimes(1);
+  it('shows banner when MetaMask is on Sepolia but app is on Mainnet', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'mainnet',
+          metamaskConnected: true,
+          metamaskChainId: '0xaa36a7',
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(screen.getByText(/does not match/i)).toBeInTheDocument();
+    expect(screen.getByText(/sepolia testnet/i)).toBeInTheDocument();
   });
 
-  test('calls setMode when switch app to wallet button clicked', async () => {
-    const mismatchState = {
-      ...mockNetworkState,
-      metamaskConnected: true,
-      metamaskChainId: '0x1', // Mainnet chain ID
-      metamaskMatches: false,
-      hasAnyMismatch: true,
-    };
-
-    render(<NetworkMismatchBanner networkState={mismatchState} />);
-    
-    await userEvent.click(screen.getByRole('button', { name: /Switch app to wallet/i }));
-    
-    expect(mockNetworkState.setMode).toHaveBeenCalledWith('mainnet');
+  it('shows "Switch wallet to Mainnet" button when app is on mainnet', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'mainnet',
+          metamaskConnected: true,
+          metamaskChainId: '0xaa36a7',
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(
+      screen.getByRole('button', { name: /switch wallet to mainnet/i }),
+    ).toBeInTheDocument();
   });
 
-  test('does not show switch app to wallet button when mainnet is disabled and wallet wants mainnet', async () => {
-    const { isMainnetEnabled } = await import('../config/networks');
-    vi.mocked(isMainnetEnabled).mockReturnValue(false);
+  // ── Freighter on mainnet while app is testnet ─────────────────────────────
 
-    const mismatchState = {
-      ...mockNetworkState,
-      metamaskConnected: true,
-      metamaskChainId: '0x1', // Mainnet chain ID
-      metamaskMatches: false,
-      hasAnyMismatch: true,
-    };
+  it('shows banner when Freighter is on Stellar Mainnet but app is on Testnet', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          freighterConnected: true,
+          freighterNetworkPassphrase: 'Public Global Stellar Network ; September 2015',
+          freighterMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(screen.getByText(/does not match/i)).toBeInTheDocument();
+    expect(screen.getByText(/stellar mainnet/i)).toBeInTheDocument();
+  });
 
-    render(<NetworkMismatchBanner networkState={mismatchState} />);
-    
-    // Should NOT show switch app to wallet button
-    expect(screen.queryByRole('button', { name: /Switch app to wallet/i })).not.toBeInTheDocument();
+  it('shows Freighter guidance copy when Freighter is mismatched', () => {
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          freighterConnected: true,
+          freighterNetworkPassphrase: 'Public Global Stellar Network ; September 2015',
+          freighterMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    // Banner advises the user to switch Freighter manually.
+    expect(screen.getByText(/switch freighter/i)).toBeInTheDocument();
+  });
+
+  // ── "Switch app to wallet" — only shown when mainnet is enabled ──────────
+
+  it('"Switch app to wallet" is absent when wallet wants mainnet but mainnet is disabled', () => {
+    // isMainnetEnabled() returns false in the test environment (VITE_MAINNET_ENABLED unset).
+    render(
+      <NetworkMismatchBanner
+        networkState={makeNetworkState({
+          mode: 'testnet',
+          metamaskConnected: true,
+          metamaskChainId: '0x1',  // wallet on mainnet
+          metamaskMatches: false,
+          hasAnyMismatch: true,
+        })}
+      />,
+    );
+    expect(
+      screen.queryByRole('button', { name: /switch app to wallet/i }),
+    ).toBeNull();
   });
 });

@@ -9,14 +9,24 @@ import { historyAddressSchema, orderIdSchema } from "../../validation/address.js
 import { makeRateLimiter, loadApiKeys, loadTrustedProxies } from "../middleware/ratelimit.js";
 import { requireRole, loadOperatorKeys } from "../middleware/auth.js";
 import type { AbuseDetector } from "../middleware/abuse-detection.js";
-import { validationError, orderValidationError, notFoundError } from "../errors.js";
+import { validationError, orderValidationError, notFoundError, invalidCursorError } from "../errors.js";
 
 function serialiseOrder(order: OrderRow | null) {
   if (!order) return null;
+  // `expired` is a soft, non-terminal state: the timelock has passed but no
+  // on-chain refund has been confirmed yet.  Clients may still initiate a
+  // refund — flag this explicitly so UIs can show "Expired — Refund Available"
+  // rather than a locked/disabled state.
+  const isRefundable =
+    order.status === "expired" ||
+    order.status === "src_locked" ||
+    order.status === "dst_locked";
+
   return {
     id: order.publicId,
     direction: order.direction,
     status: order.status,
+    isRefundable,
     hashlock: order.hashlock,
     src: {
       chain: order.srcChain,
@@ -96,7 +106,8 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
       return;
     }
     const address = parsedAddress.data;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const rawLimit = Number(req.query.limit ?? 50);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 50;
 
     // Support both cursor-based (preferred) and offset-based (legacy) pagination
     const cursorParam = req.query.cursor as string | undefined;
@@ -128,10 +139,7 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
     } catch (err) {
       // Handle invalid cursor gracefully
       if (err instanceof Error && err.message.includes('Invalid cursor')) {
-        res.status(400).json({
-          error: "invalid_cursor",
-          message: "The provided cursor is invalid or expired"
-        });
+        res.status(400).json(invalidCursorError());
         return;
       }
       next(err);

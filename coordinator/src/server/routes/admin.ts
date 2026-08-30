@@ -1,0 +1,178 @@
+import { Router } from "express";
+import type { Logger } from "pino";
+import type { StaleCleanupResult } from "../../services/stale-cleanup.js";
+import type { ReconciliationStatus } from "../../reconciliation/reconciler.js";
+import type { OrderService } from "../../services/order-service.js";
+import { requireRole, loadOperatorKeys } from "../middleware/auth.js";
+import { loadTrustedProxies } from "../middleware/ratelimit.js";
+
+export interface ExpiryResult {
+  expiredCount: number;
+}
+
+export interface AdminRouteDeps {
+  log: Logger;
+  /**
+   * Trigger a reconciliation run immediately and return when it completes.
+   * Returns the updated `ReconciliationStatus` so callers can surface the
+   * result in the HTTP response.
+   */
+  runReconcile: () => Promise<ReconciliationStatus>;
+  /**
+   * Trigger a stale-order cleanup run immediately and return when it completes.
+   * Returns the `StaleCleanupResult` containing the count of archived orders.
+   */
+  runStaleCleanup: () => Promise<StaleCleanupResult>;
+  /**
+   * Trigger an on-demand expiry scan — mark all orders whose timelock has
+   * passed as `expired`.  Returns the count of newly-expired orders.
+   *
+   * Omitting this disables the endpoint (the route is not mounted).
+   */
+  runExpiry?: () => Promise<ExpiryResult>;
+  /** Return chain-level and per-order reconciler cursor state for observability. */
+  getReconciliationCursors?: () => ReturnType<OrderService["getReconciliationCursorState"]>;
+}
+
+/**
+ * Admin maintenance endpoints.
+ *
+ * All routes require an `Authorization: Bearer <token>` header with a valid
+ * key from the `COORDINATOR_OPERATOR_KEYS` environment variable.
+ *
+ * Routes:
+ *   POST /admin/reconcile      — trigger an immediate reconciliation run
+ *   POST /admin/stale-cleanup  — trigger an immediate stale-order cleanup run
+ *   POST /admin/expire-now     — trigger an immediate order-expiry scan
+ *   GET  /admin/reconciliation-cursors — inspect chain + per-order ledger cursors
+ *
+ * These endpoints are intentionally POST so they cannot be triggered by bots
+ * or browser prefetching. They are not idempotent in the HTTP sense: each call
+ * performs real work. They are, however, safe to call concurrently because the
+ * underlying services are designed to be idempotent at the data layer.
+ */
+export function adminRoutes(deps: AdminRouteDeps): Router {
+  const router = Router();
+
+  const operatorKeys = loadOperatorKeys();
+  const trustedProxies = loadTrustedProxies();
+  const auth = requireRole("operator", { operatorKeys, log: deps.log, trustedProxies });
+
+  /**
+   * POST /admin/reconcile
+   *
+   * Runs the chain-event reconciler immediately (outside the normal schedule).
+   * Useful after a known RPC outage or when an operator suspects the coordinator
+   * has missed events.
+   *
+   * Response 200:
+   *   { ok: true, lastRunOk: boolean, lastRunAt: number | null, eventsReplayed: number }
+   *
+   * Response 500:
+   *   { ok: false, error: "reconciliation_failed", message: string }
+   */
+  router.post("/admin/reconcile", auth, async (_req, res, next) => {
+    deps.log.info("[admin] manual reconciliation run triggered");
+    try {
+      const status = await deps.runReconcile();
+      res.json({
+        ok: true,
+        lastRunOk: status.lastRunOk,
+        lastRunAt: status.lastRunAt,
+        eventsReplayed: status.eventsReplayed
+      });
+    } catch (err) {
+      deps.log.error({ err }, "[admin] manual reconciliation run failed");
+      next(err);
+    }
+  });
+
+  /**
+   * POST /admin/stale-cleanup
+   *
+   * Runs the stale-order cleanup immediately (outside the normal schedule).
+   * Useful after a bulk import, database restore, or to forcibly prune the
+   * order book without waiting for the next scheduled run.
+   *
+   * Response 200:
+   *   { ok: true, archivedCount: number }
+   *
+   * Response 500:
+   *   { ok: false, error: "stale_cleanup_failed", message: string }
+   */
+  router.post("/admin/stale-cleanup", auth, async (_req, res, next) => {
+    deps.log.info("[admin] manual stale-order cleanup triggered");
+    try {
+      const result = await deps.runStaleCleanup();
+      res.json({ ok: true, archivedCount: result.archivedCount });
+    } catch (err) {
+      deps.log.error({ err }, "[admin] manual stale-order cleanup failed");
+      next(err);
+    }
+  });
+
+  /**
+   * POST /admin/expire-now
+   *
+   * Runs the order-expiry scan immediately (outside the normal schedule).
+   * Marks any `src_locked` or `dst_locked` order whose timelock has already
+   * passed as `expired`.  The `expired` state is non-terminal: refund actions
+   * remain valid.
+   *
+   * Useful when an operator wants to force the UI to surface expired orders
+   * immediately without waiting for the next scheduled scan (~1 min cadence).
+   *
+   * Response 200:
+   *   { ok: true, expiredCount: number }
+   *
+   * Response 501:
+   *   { ok: false, error: "not_configured" }  — runExpiry not injected
+   *
+   * Response 500:
+   *   { ok: false, error: "expiry_scan_failed", message: string }
+   */
+  if (deps.runExpiry) {
+    const runExpiry = deps.runExpiry;
+    router.post("/admin/expire-now", auth, async (_req, res, next) => {
+      deps.log.info("[admin] manual order-expiry scan triggered");
+      try {
+        const result = await runExpiry();
+        res.json({ ok: true, expiredCount: result.expiredCount });
+      } catch (err) {
+        deps.log.error({ err }, "[admin] manual order-expiry scan failed");
+        next(err);
+      }
+    });
+  }
+
+  /**
+   * GET /admin/reconciliation-cursors
+   *
+   * Returns the current chain-level reconciler cursors and per-order ledger
+   * high-water marks for operator observability and cursor audit.
+   *
+   * Response 200:
+   *   {
+   *     ok: true,
+   *     chainCursors: [{ chain, position, updatedAt }],
+   *     orderCursors: [{ publicId, status, lastEthBlock, lastSorobanLedger, lastSolanaSlot, updatedAt }]
+   *   }
+   *
+   * Response 501:
+   *   { ok: false, error: "not_configured" }
+   */
+  if (deps.getReconciliationCursors) {
+    const getReconciliationCursors = deps.getReconciliationCursors;
+    router.get("/admin/reconciliation-cursors", auth, async (_req, res, next) => {
+      try {
+        const state = await getReconciliationCursors();
+        res.json({ ok: true, ...state });
+      } catch (err) {
+        deps.log.error({ err }, "[admin] reconciliation cursor query failed");
+        next(err);
+      }
+    });
+  }
+
+  return router;
+}
