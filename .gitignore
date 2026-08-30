@@ -96,6 +96,10 @@ yarn.lock
 # Testing
 .coverage/
 junit.xml
+*.snap
+__snapshots__/
+*.test-results/
+.vitest-cache/
 
 # Miscellaneous
 .cache/
