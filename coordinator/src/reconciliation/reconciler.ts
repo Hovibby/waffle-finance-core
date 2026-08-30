@@ -49,12 +49,13 @@ interface SorobanRpcEvent {
   value: xdr.ScVal;
 }
 
-/** How many Ethereum blocks ~48h covers at ~12s/block (increased from 24h for better recovery) */
-const ETH_LOOKBACK_BLOCKS = 14_400n;
-/** Soroban ledger lookback (~5s/ledger, 48h) */
-const SOROBAN_LOOKBACK_LEDGERS = 34_560;
-/** Solana slot lookback (~400ms/slot, 48h) */
-const SOLANA_LOOKBACK_SLOTS = 432_000;
+import {
+  computeIncrementalScanStart,
+  ETH_LOOKBACK_BLOCKS,
+  SOROBAN_LOOKBACK_LEDGERS,
+  SOLANA_LOOKBACK_SLOTS,
+  isEventBehindOrderCursor,
+} from "./ledger-cursor.js";
 
 export interface ReconciliationStatus {
   lastRunAt: number | null;
@@ -133,31 +134,27 @@ export class Reconciler {
     }
 
     const tip = Number(latest);
-    const gap = tip - cursor;
+    const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
+      cursor,
+      tip,
+      ETH_LOOKBACK_BLOCKS
+    );
 
-    reconciliationGapBlocks.set({ chain: "ethereum" }, Math.max(gap, 0));
+    reconciliationGapBlocks.set({ chain: "ethereum" }, gap);
+    reconciliationLookbackCoverage.set({ chain: "ethereum" }, Math.min(gap, ETH_LOOKBACK_BLOCKS));
 
-    const lookback = Number(ETH_LOOKBACK_BLOCKS);
-    reconciliationLookbackCoverage.set({ chain: "ethereum" }, Math.min(gap, lookback));
-
-    if (cursor > 0 && gap > lookback) {
+    if (cursor > 0 && gap > ETH_LOOKBACK_BLOCKS) {
       this.log.warn(
-        { chain: "ethereum", cursor, tip, gap, lookback },
+        { chain: "ethereum", cursor, tip, gap, lookback: ETH_LOOKBACK_BLOCKS },
         "reconciler: gap exceeds lookback window — some events may be permanently missed; " +
         "increase ETH_LOOKBACK_BLOCKS or trigger a full historical replay"
       );
       reconciliationConflicts.inc({ chain: "ethereum", conflict_type: "gap_exceeds_lookback" });
-    } else if (cursor > 0) {
-      this.log.info({ chain: "ethereum", cursor, tip, gap }, "reconciler: ethereum gap within lookback window");
+    } else if (cursor > 0 && !usedLookbackFallback) {
+      this.log.info({ chain: "ethereum", cursor, tip, gap }, "reconciler: ethereum incremental scan from chain cursor");
     }
 
-    // Start from the cursor if it's within the lookback window; otherwise
-    // fall back to tip - lookback so we always scan a full window.
-    const fromBlock = cursor > 0 && gap <= lookback
-      ? BigInt(cursor)
-      : (latest > ETH_LOOKBACK_BLOCKS ? latest - ETH_LOOKBACK_BLOCKS : 0n);
-
-    return fromBlock;
+    return BigInt(from);
   }
 
   private async computeSorobanFromLedger(latestSeq: number): Promise<number> {
@@ -169,24 +166,26 @@ export class Reconciler {
       cursor = cursor > 0 ? Math.min(cursor, minOrderCursor) : minOrderCursor;
     }
 
-    const gap = latestSeq - cursor;
+    const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
+      cursor,
+      latestSeq,
+      SOROBAN_LOOKBACK_LEDGERS
+    );
 
-    reconciliationGapBlocks.set({ chain: "stellar" }, Math.max(gap, 0));
+    reconciliationGapBlocks.set({ chain: "stellar" }, gap);
+    reconciliationLookbackCoverage.set({ chain: "stellar" }, Math.min(gap, SOROBAN_LOOKBACK_LEDGERS));
 
-    const lookback = SOROBAN_LOOKBACK_LEDGERS;
-    reconciliationLookbackCoverage.set({ chain: "stellar" }, Math.min(gap, lookback));
-
-    if (cursor > 0 && gap > lookback) {
+    if (cursor > 0 && gap > SOROBAN_LOOKBACK_LEDGERS) {
       this.log.warn(
-        { chain: "stellar", cursor, tip: latestSeq, gap, lookback },
+        { chain: "stellar", cursor, tip: latestSeq, gap, lookback: SOROBAN_LOOKBACK_LEDGERS },
         "reconciler: Soroban gap exceeds lookback window — some events may be permanently missed"
       );
       reconciliationConflicts.inc({ chain: "stellar", conflict_type: "gap_exceeds_lookback" });
+    } else if (cursor > 0 && !usedLookbackFallback) {
+      this.log.info({ chain: "stellar", cursor, tip: latestSeq, gap }, "reconciler: soroban incremental scan from chain cursor");
     }
 
-    return cursor > 0 && gap <= lookback
-      ? cursor
-      : Math.max(0, latestSeq - lookback);
+    return from;
   }
 
   private async computeSolanaFromSlot(tipSlot: number): Promise<number> {
@@ -198,24 +197,45 @@ export class Reconciler {
       cursor = cursor > 0 ? Math.min(cursor, minOrderCursor) : minOrderCursor;
     }
 
-    const gap = tipSlot - cursor;
+    const { from, gap, usedLookbackFallback } = computeIncrementalScanStart(
+      cursor,
+      tipSlot,
+      SOLANA_LOOKBACK_SLOTS
+    );
 
-    reconciliationGapBlocks.set({ chain: "solana" }, Math.max(gap, 0));
+    reconciliationGapBlocks.set({ chain: "solana" }, gap);
+    reconciliationLookbackCoverage.set({ chain: "solana" }, Math.min(gap, SOLANA_LOOKBACK_SLOTS));
 
-    const lookback = SOLANA_LOOKBACK_SLOTS;
-    reconciliationLookbackCoverage.set({ chain: "solana" }, Math.min(gap, lookback));
-
-    if (cursor > 0 && gap > lookback) {
+    if (cursor > 0 && gap > SOLANA_LOOKBACK_SLOTS) {
       this.log.warn(
-        { chain: "solana", cursor, tip: tipSlot, gap, lookback },
+        { chain: "solana", cursor, tip: tipSlot, gap, lookback: SOLANA_LOOKBACK_SLOTS },
         "reconciler: Solana gap exceeds lookback window — some events may be permanently missed"
       );
       reconciliationConflicts.inc({ chain: "solana", conflict_type: "gap_exceeds_lookback" });
+    } else if (cursor > 0 && !usedLookbackFallback) {
+      this.log.info({ chain: "solana", cursor, tip: tipSlot, gap }, "reconciler: solana incremental scan from chain cursor");
     }
 
-    return cursor > 0 && gap <= lookback
-      ? cursor
-      : Math.max(0, tipSlot - lookback);
+    return from;
+  }
+
+  private async advanceOrderCursor(
+    publicId: string,
+    chain: "ethereum" | "stellar" | "solana",
+    position: number
+  ): Promise<void> {
+    if (position <= 0) return;
+    switch (chain) {
+      case "ethereum":
+        await this.orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: position });
+        break;
+      case "stellar":
+        await this.orders.advanceOrderLedgerCursor(publicId, { lastSorobanLedger: position });
+        break;
+      case "solana":
+        await this.orders.advanceOrderLedgerCursor(publicId, { lastSolanaSlot: position });
+        break;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -266,8 +286,8 @@ export class Reconciler {
         }
 
         const blockNum = Number(log.blockNumber ?? 0n);
-        if (order.lastEthBlock !== null && blockNum > 0 && blockNum <= order.lastEthBlock) {
-          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
         }
 
@@ -282,6 +302,7 @@ export class Reconciler {
 
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           // Conflict detection: chain shows a created event but DB is already
           // terminal — this indicates the order completed/refunded in a prior
           // session and is expected during replay of old history.
@@ -302,15 +323,18 @@ export class Reconciler {
           blockNumber: blockNum,
           timelock: Number(args.timelock)
         });
-        if (blockNum > 0) {
-          await this.orders.updateOrderCursor(order.publicId, "ethereum", blockNum);
-        }
+        await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
         n++;
         reconciliationRestartRecoveryEvents.inc({ chain: "ethereum" });
         this.log.info({ hashlock: args.hashlock }, "reconciler: replayed ETH OrderCreated");
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
+          const blockNum = Number(log.blockNumber ?? 0n);
+          if (args?.hashlock) {
+            const order = await this.orders.findByHashlock(args.hashlock);
+            if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
+          }
           continue;
         }
         this.log.warn({ err, hashlock: args.hashlock }, "reconciler: ETH created replay error");
@@ -332,15 +356,15 @@ export class Reconciler {
         }
 
         const blockNum = Number(log.blockNumber ?? 0n);
-        if (order.lastEthBlock !== null && blockNum > 0 && blockNum <= order.lastEthBlock) {
-          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
         }
 
         const decision = decideDispatch({
           path: "replay",
           mutation: "secret_reveal",
-          incomingSequence: Number(log.blockNumber ?? 0n),
+          incomingSequence: blockNum,
           existingSequence: null,
           alreadyApplied: order.preimage !== null,
         });
@@ -348,6 +372,7 @@ export class Reconciler {
 
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           continue;
         }
 
@@ -358,19 +383,23 @@ export class Reconciler {
             "reconciler: ETH OrderClaimed preimage/hashlock mismatch — chain evidence disagrees with DB record; manual review required"
           );
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "preimage_mismatch" });
+          await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           continue;
         }
 
         await this.orders.recordSecret(order.publicId, args.preimage, log.transactionHash ?? "0x");
-        if (blockNum > 0) {
-          await this.orders.updateOrderCursor(order.publicId, "ethereum", blockNum);
-        }
+        await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
         n++;
         reconciliationRestartRecoveryEvents.inc({ chain: "ethereum" });
         this.log.info({ orderId: args.orderId.toString() }, "reconciler: replayed ETH OrderClaimed");
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
+          const blockNum = Number(log.blockNumber ?? 0n);
+          const order = args?.orderId
+            ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
+            : null;
+          if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           continue;
         }
         this.log.warn({ err }, "reconciler: ETH claimed replay error");
@@ -392,15 +421,15 @@ export class Reconciler {
         }
 
         const blockNum = Number(log.blockNumber ?? 0n);
-        if (order.lastEthBlock !== null && blockNum > 0 && blockNum <= order.lastEthBlock) {
-          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
         }
 
         const decision = decideDispatch({
           path: "replay",
           mutation: "refund",
-          incomingSequence: Number(log.blockNumber ?? 0n),
+          incomingSequence: blockNum,
           existingSequence: order.srcLockBlock ?? null,
           alreadyApplied: order.status === "refunded" || order.status === "completed",
         });
@@ -408,6 +437,7 @@ export class Reconciler {
 
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           // DB says completed but chain shows refund — that's an ambiguous conflict.
           if (order.status === "completed") {
             reconciliationConflicts.inc({ chain: "ethereum", conflict_type: "terminal_clash" });
@@ -420,15 +450,18 @@ export class Reconciler {
         }
 
         await this.orders.markStatus(order.publicId, "refunded");
-        if (blockNum > 0) {
-          await this.orders.updateOrderCursor(order.publicId, "ethereum", blockNum);
-        }
+        await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
         n++;
         reconciliationRestartRecoveryEvents.inc({ chain: "ethereum" });
         this.log.info({ orderId: args.orderId.toString() }, "reconciler: replayed ETH OrderRefunded");
       } catch (err: any) {
         if (err?.message?.includes("cannot transition") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
+          const blockNum = Number(log.blockNumber ?? 0n);
+          const order = args?.orderId
+            ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
+            : null;
+          if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           continue;
         }
         this.log.warn({ err }, "reconciler: ETH refunded replay error");
@@ -498,8 +531,8 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSorobanLedger !== null && ev.ledger <= order.lastSorobanLedger) {
-          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSorobanLedger, ev.ledger)) {
+          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
@@ -512,6 +545,7 @@ export class Reconciler {
         workflowDispatchDecisions.inc({ path: "replay", mutation: "src_lock", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           if (isTerminal(order.status)) {
             reconciliationConflicts.inc({ chain: "stellar", conflict_type: "chain_ahead" });
           }
@@ -524,13 +558,15 @@ export class Reconciler {
           blockNumber: ev.ledger,
           timelock: result.timelock,
         });
-        await this.orders.updateOrderCursor(order.publicId, "stellar", ev.ledger);
+        await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
         reconciliationRestartRecoveryEvents.inc({ chain: "stellar" });
         this.log.info({ hashlock: result.hashlock }, "reconciler: replayed Soroban created");
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_applied" });
+          const order = await this.orders.findByHashlock(result.hashlock);
+          if (order) await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           return 0;
         }
         this.log.warn({ err, hashlock: result.hashlock }, "reconciler: Soroban created replay error");
@@ -545,8 +581,8 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSorobanLedger !== null && ev.ledger <= order.lastSorobanLedger) {
-          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSorobanLedger, ev.ledger)) {
+          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
@@ -559,6 +595,7 @@ export class Reconciler {
         workflowDispatchDecisions.inc({ path: "replay", mutation: "secret_reveal", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           return 0;
         }
         if (!validatePreimage(result.preimage, order.hashlock)) {
@@ -568,16 +605,19 @@ export class Reconciler {
             "reconciler: Soroban claimed preimage/hashlock mismatch — chain evidence disagrees; manual review required"
           );
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "preimage_mismatch" });
+          await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           return 0;
         }
         await this.orders.recordSecret(order.publicId, result.preimage, ev.txHash);
-        await this.orders.updateOrderCursor(order.publicId, "stellar", ev.ledger);
+        await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
         reconciliationRestartRecoveryEvents.inc({ chain: "stellar" });
         this.log.info({ orderId: result.orderId.toString() }, "reconciler: replayed Soroban claimed");
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_applied" });
+          const order = await this.orders.findBySrcOrderId("stellar", result.orderId.toString());
+          if (order) await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           return 0;
         }
         this.log.warn({ err }, "reconciler: Soroban claimed replay error");
@@ -592,8 +632,8 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSorobanLedger !== null && ev.ledger <= order.lastSorobanLedger) {
-          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSorobanLedger, ev.ledger)) {
+          reconciliationEventsSkipped.inc({ chain: "stellar", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
@@ -606,6 +646,7 @@ export class Reconciler {
         workflowDispatchDecisions.inc({ path: "replay", mutation: "refund", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           if (order.status === "completed") {
             reconciliationConflicts.inc({ chain: "stellar", conflict_type: "terminal_clash" });
             this.log.error(
@@ -616,12 +657,15 @@ export class Reconciler {
           return 0;
         }
         await this.orders.markStatus(order.publicId, "refunded");
+        await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
         reconciliationRestartRecoveryEvents.inc({ chain: "stellar" });
         this.log.info({ orderId: result.orderId.toString() }, "reconciler: replayed Soroban refunded");
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot transition") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "stellar", reason: "already_applied" });
+          const order = await this.orders.findBySrcOrderId("stellar", result.orderId.toString());
+          if (order) await this.advanceOrderCursor(order.publicId, "stellar", ev.ledger);
           return 0;
         }
         this.log.warn({ err }, "reconciler: Soroban refunded replay error");
@@ -658,7 +702,11 @@ export class Reconciler {
             maxSupportedTransactionVersion: 0
           });
           if (!tx?.meta?.logMessages) continue;
-          replayed += await this.replaySolanaLogs(sigInfo.signature, tx.meta.logMessages, slot);
+          replayed += await this.replaySolanaLogs(
+            sigInfo.signature,
+            tx.meta.logMessages,
+            sigInfo.slot ?? 0
+          );
         } catch (err) {
           this.log.warn({ sig: sigInfo.signature, err }, "reconciler: Solana tx fetch failed");
         }
@@ -672,7 +720,7 @@ export class Reconciler {
     return replayed;
   }
 
-  private async replaySolanaLogs(sig: string, logs: string[], slot = 0): Promise<number> {
+  private async replaySolanaLogs(sig: string, logs: string[], slot: number): Promise<number> {
     let eventType: string | null = null;
     const payload: Record<string, unknown> = {};
 
@@ -697,34 +745,35 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSolanaSlot !== null && slot > 0 && slot <= order.lastSolanaSlot) {
-          reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSolanaSlot, slot)) {
+          reconciliationEventsSkipped.inc({ chain: "solana", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
           path: "replay",
           mutation: "src_lock",
-          incomingSequence: null,
+          incomingSequence: slot,
           existingSequence: order.srcLockBlock ?? null,
           alreadyApplied: order.srcOrderId !== null,
         });
         workflowDispatchDecisions.inc({ path: "replay", mutation: "src_lock", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "solana", slot);
           if (isTerminal(order.status)) {
             reconciliationConflicts.inc({ chain: "solana", conflict_type: "chain_ahead" });
           }
           return 0;
         }
-        await this.orders.recordSrcLock({ publicId: order.publicId, orderId, txHash: sig, blockNumber: 0, timelock: timelock ?? 0 });
-        if (slot > 0) {
-          await this.orders.updateOrderCursor(order.publicId, "solana", slot);
-        }
+        await this.orders.recordSrcLock({ publicId: order.publicId, orderId, txHash: sig, blockNumber: slot, timelock: timelock ?? 0 });
+        await this.advanceOrderCursor(order.publicId, "solana", slot);
         reconciliationRestartRecoveryEvents.inc({ chain: "solana" });
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_applied" });
+          const order = hashlock ? await this.orders.findByHashlock(hashlock) : null;
+          if (order) await this.advanceOrderCursor(order.publicId, "solana", slot);
           return 0;
         }
         this.log.warn({ err, hashlock }, "reconciler: Solana OrderCreated replay error");
@@ -741,37 +790,39 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSolanaSlot !== null && slot > 0 && slot <= order.lastSolanaSlot) {
-          reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSolanaSlot, slot)) {
+          reconciliationEventsSkipped.inc({ chain: "solana", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
           path: "replay",
           mutation: "secret_reveal",
-          incomingSequence: null,
+          incomingSequence: slot,
           existingSequence: null,
           alreadyApplied: order.preimage !== null,
         });
         workflowDispatchDecisions.inc({ path: "replay", mutation: "secret_reveal", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "solana", slot);
           return 0;
         }
         if (!validatePreimage(preimage, order.hashlock)) {
           reconciliationConflicts.inc({ chain: "solana", conflict_type: "terminal_clash" });
           this.log.warn({ orderId, publicId: order.publicId }, "reconciler: Solana OrderClaimed preimage/hashlock mismatch — manual review required");
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "preimage_mismatch" });
+          await this.advanceOrderCursor(order.publicId, "solana", slot);
           return 0;
         }
         await this.orders.recordSecret(order.publicId, preimage, sig);
-        if (slot > 0) {
-          await this.orders.updateOrderCursor(order.publicId, "solana", slot);
-        }
+        await this.advanceOrderCursor(order.publicId, "solana", slot);
         reconciliationRestartRecoveryEvents.inc({ chain: "solana" });
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_applied" });
+          const order = orderId ? await this.orders.findBySrcOrderId("solana", orderId) : null;
+          if (order) await this.advanceOrderCursor(order.publicId, "solana", slot);
           return 0;
         }
         this.log.warn({ err }, "reconciler: Solana OrderClaimed replay error");
@@ -788,20 +839,21 @@ export class Reconciler {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "order_not_found" });
           return 0;
         }
-        if (order.lastSolanaSlot !== null && slot > 0 && slot <= order.lastSolanaSlot) {
-          reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_processed_cursor" });
+        if (isEventBehindOrderCursor(order.lastSolanaSlot, slot)) {
+          reconciliationEventsSkipped.inc({ chain: "solana", reason: "cursor_already_processed" });
           return 0;
         }
         const decision = decideDispatch({
           path: "replay",
           mutation: "refund",
-          incomingSequence: null,
+          incomingSequence: slot,
           existingSequence: order.srcLockBlock ?? null,
           alreadyApplied: order.status === "refunded" || order.status === "completed",
         });
         workflowDispatchDecisions.inc({ path: "replay", mutation: "refund", outcome: decision.reason });
         if (!decision.shouldApply) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: decision.reason });
+          await this.advanceOrderCursor(order.publicId, "solana", slot);
           if (order.status === "completed") {
             reconciliationConflicts.inc({ chain: "solana", conflict_type: "terminal_clash" });
             this.log.error({ publicId: order.publicId, orderId }, "reconciler: Solana OrderRefunded conflicts with DB status=completed — manual review required");
@@ -809,11 +861,14 @@ export class Reconciler {
           return 0;
         }
         await this.orders.markStatus(order.publicId, "refunded");
+        await this.advanceOrderCursor(order.publicId, "solana", slot);
         reconciliationRestartRecoveryEvents.inc({ chain: "solana" });
         return 1;
       } catch (err: any) {
         if (err?.message?.includes("cannot transition") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "solana", reason: "already_applied" });
+          const order = orderId ? await this.orders.findBySrcOrderId("solana", orderId) : null;
+          if (order) await this.advanceOrderCursor(order.publicId, "solana", slot);
           return 0;
         }
         this.log.warn({ err }, "reconciler: Solana OrderRefunded replay error");

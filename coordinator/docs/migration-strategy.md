@@ -215,7 +215,7 @@ INSERT INTO … ON CONFLICT DO NOTHING;
 | 008     | `008_query_optimizations_advanced.sql` | Advanced composite indexes and query optimizations |
 | 009     | `009_chain_cursors.sql`        | Adds dedicated per-chain cursor table                        |
 | 010     | `010_soroban_checkpoints.sql`  | Adds durable checkpoints for Soroban listener                |
-| 011     | `011_order_ledger_cursors.sql` | Adds per-order block/ledger/slot cursor columns              |
+| 011     | `011_order_ledger_cursors.sql` | Per-order reconciler ledger cursors on `orders`               |
 
 ---
 

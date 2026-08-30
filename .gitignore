@@ -160,6 +160,10 @@ cypress/screenshots/
 **/__snapshots__/
 **/*.snap
 
+# Jest
+__snapshots__/
+*.snap
+
 # Miscellaneous
 .cache/
 .parcel-cache/
