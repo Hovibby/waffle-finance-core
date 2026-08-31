@@ -947,5 +947,56 @@ describe("ResolverRegistry", () => {
       ).to.be.revertedWithCustomError(Registry, "OwnableInvalidOwner");
     });
   });
+
+  //  list/mapping invariant sequence
+
+  describe("list/mapping invariant sequence", () => {
+    it("keeps list() and the index mapping synchronized across a mixed sequence of registrations and removals", async () => {
+      const signers = await ethers.getSigners();
+      const [, , , r1, r2, r3, r4] = signers;
+      const { token, registry } = await deploy();
+
+      for (const r of [r1, r2, r3, r4]) {
+        await fundAndApprove(token, registry, r, MIN_STAKE);
+      }
+
+      // Build up a list of four, then remove a middle entry (forces
+      // swap-and-pop compaction), then remove the newly-swapped-in last
+      // entry, then register a fresh resolver to confirm the freed slot
+      // is reused correctly.
+      await registry.connect(r1).register(MIN_STAKE);
+      await assertInvariants(registry, [r1.address]);
+
+      await registry.connect(r2).register(MIN_STAKE);
+      await assertInvariants(registry, [r1.address, r2.address]);
+
+      await registry.connect(r3).register(MIN_STAKE);
+      await assertInvariants(registry, [r1.address, r2.address, r3.address]);
+
+      // Remove r1 (first element): triggers swap-and-pop, moving r3 into
+      // r1's old slot.
+      await registry.connect(r1).unregister();
+      await assertInvariants(registry, [r2.address, r3.address]);
+
+      await registry.connect(r4).register(MIN_STAKE);
+      await assertInvariants(registry, [r2.address, r3.address, r4.address]);
+
+      // Remove r3, now in a middle slot after the earlier compaction.
+      await registry.connect(r3).unregister();
+      await assertInvariants(registry, [r2.address, r4.address]);
+
+      // Every resolver still listed must independently report itself
+      // active and resolvable, and each address appears exactly once.
+      const listed = await registry.list();
+      expect(listed.length).to.equal(2);
+      const seen = new Set<string>();
+      for (const addr of listed) {
+        const lower = addr.toLowerCase();
+        expect(seen.has(lower), `duplicate entry for ${addr}`).to.be.false;
+        seen.add(lower);
+        expect(await registry.isActive(addr)).to.be.true;
+      }
+    });
+  });
 });
 
