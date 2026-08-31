@@ -33,9 +33,9 @@ import type { AuditEventType } from "../../audit/audit-log.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Thrown when a query param is present but not a valid integer. Routes
- *  catch this and translate it into the existing `bad_request` client-facing
- *  validation response. */
+/** Thrown when a query param is present but not a valid integer (or, for
+ *  `limit`, not a positive one). Routes catch this and translate it into the
+ *  existing `bad_request` client-facing validation response. */
 class InvalidQueryParamError extends Error {
   constructor(public readonly param: string, public readonly value: string) {
     super(`invalid value for query param "${param}": ${value}`);
@@ -67,6 +67,20 @@ function parseIntParam(val: unknown, paramName: string, defaultVal: number, max?
   return max !== undefined ? Math.min(n, max) : n;
 }
 
+/**
+ * Parse a query param as a strictly positive integer (used for `limit`,
+ * where zero or negative values must never reach the repository layer).
+ * Delegates format validation to {@link parseIntParam} and additionally
+ * rejects nonpositive results.
+ */
+function parsePositiveIntParam(val: unknown, paramName: string, defaultVal: number, max?: number): number {
+  const n = parseIntParam(val, paramName, defaultVal, max);
+  if (n <= 0) {
+    throw new InvalidQueryParamError(paramName, String(val ?? n));
+  }
+  return n;
+}
+
 function parseEventTypes(val: unknown): AuditEventType[] | undefined {
   if (!val || typeof val !== 'string') return undefined;
   const parts = val.split(',').map((s) => s.trim()).filter(Boolean);
@@ -88,7 +102,7 @@ export function auditRoutes(
    */
   router.get('/audit', async (req: Request, res: Response): Promise<void> => {
     try {
-      const limit = parseIntParam(req.query['limit'], 'limit', 100, 1000);
+      const limit = parsePositiveIntParam(req.query['limit'], 'limit', 100, 1000);
       const afterId = req.query['afterId'] !== undefined
         ? parseIntParam(req.query['afterId'], 'afterId', 0)
         : undefined;
@@ -187,7 +201,7 @@ export function auditRoutes(
    */
   router.get('/audit/tail', async (req: Request, res: Response): Promise<void> => {
     try {
-      const n = parseIntParam(req.query['n'], 'n', 50, 500);
+      const n = parsePositiveIntParam(req.query['n'], 'n', 50, 500);
       const entries = await repo.tail(n);
       res.json({ entries, count: entries.length });
     } catch (err) {
@@ -229,7 +243,7 @@ export function auditRoutes(
         ? req.query['orderId']
         : undefined;
       const eventTypes = parseEventTypes(req.query['eventTypes']);
-      const pageSize = parseIntParam(req.query['pageSize'], 'pageSize', 500, 2000);
+      const pageSize = parsePositiveIntParam(req.query['pageSize'], 'pageSize', 500, 2000);
 
       res.setHeader('Content-Type', 'application/x-ndjson');
       res.setHeader('Transfer-Encoding', 'chunked');

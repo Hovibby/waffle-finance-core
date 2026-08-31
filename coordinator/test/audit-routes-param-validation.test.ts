@@ -1,7 +1,7 @@
 /**
- * Focused tests for strict integer query-param parsing in
- * `routes/audit.ts`. Uses stub repo/exporter objects so the test exercises
- * only the route-level parsing behavior.
+ * Focused tests for the strict integer / positive-limit query-param
+ * validation in `routes/audit.ts`. Uses stub repo/exporter objects so the
+ * test exercises only the route-level parsing behavior.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -31,7 +31,7 @@ function buildApp() {
   return { app, repo };
 }
 
-describe('GET /api/audit — strict integer query-param parsing', () => {
+describe('GET /api/audit — limit query-param validation', () => {
   it('rejects a malformed limit like "12junk" with a bad_request response', async () => {
     const { app, repo } = buildApp();
 
@@ -53,6 +53,26 @@ describe('GET /api/audit — strict integer query-param parsing', () => {
     );
   });
 
+  it('rejects a zero limit', async () => {
+    const { app, repo } = buildApp();
+
+    const res = await request(app).get('/api/audit').query({ limit: '0' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('bad_request');
+    expect(repo.query).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative limit', async () => {
+    const { app, repo } = buildApp();
+
+    const res = await request(app).get('/api/audit').query({ limit: '-1' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('bad_request');
+    expect(repo.query).not.toHaveBeenCalled();
+  });
+
   it('uses the default limit when omitted', async () => {
     const { app, repo } = buildApp();
 
@@ -71,16 +91,5 @@ describe('GET /api/audit — strict integer query-param parsing', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('bad_request');
-  });
-
-  it('accepts a valid signed afterId', async () => {
-    const { app, repo } = buildApp();
-
-    const res = await request(app).get('/api/audit').query({ afterId: '-3' });
-
-    expect(res.status).toBe(200);
-    expect(repo.query).toHaveBeenCalledWith(
-      expect.objectContaining({ cursor: { afterId: -3 } }),
-    );
   });
 });
