@@ -112,6 +112,13 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
     // Support both cursor-based (preferred) and offset-based (legacy) pagination
     const cursorParam = req.query.cursor as string | undefined;
     const cursor = cursorParam && cursorParam.trim() !== '' ? cursorParam : undefined;
+    if (cursor !== undefined) {
+      const cursorNum = Number(cursor);
+      if (Number.isFinite(cursorNum) && cursorNum < 0) {
+        res.status(400).json(invalidCursorError());
+        return;
+      }
+    }
     const offset = req.query.offset !== undefined ? Math.max(Number(req.query.offset), 0) : undefined;
 
     try {
