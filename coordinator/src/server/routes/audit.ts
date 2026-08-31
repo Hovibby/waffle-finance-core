@@ -90,6 +90,14 @@ export function auditRoutes(
         return;
       }
 
+      if (since !== undefined && until !== undefined && since > until) {
+        res.status(400).json(validationError(
+          [{ message: 'since must not be later than until' }],
+          'Invalid time range: since must not be later than until',
+        ));
+        return;
+      }
+
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
@@ -214,6 +222,14 @@ export function auditRoutes(
         res.status(400).json(validationError(
           [{ message: 'afterId, since, and until must be nonnegative' }],
           'Cursor and timestamp parameters must be nonnegative',
+        ));
+        return;
+      }
+
+      if (since !== undefined && until !== undefined && since > until) {
+        res.status(400).json(validationError(
+          [{ message: 'since must not be later than until' }],
+          'Invalid time range: since must not be later than until',
         ));
         return;
       }
