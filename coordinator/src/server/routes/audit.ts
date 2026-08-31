@@ -33,10 +33,38 @@ import type { AuditEventType } from "../../audit/audit-log.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function parseIntParam(val: unknown, defaultVal: number, max?: number): number {
-  const n = val !== undefined ? parseInt(String(val), 10) : defaultVal;
-  const safe = isNaN(n) ? defaultVal : n;
-  return max !== undefined ? Math.min(safe, max) : safe;
+/** Thrown when a query param is present but not a valid integer. Routes
+ *  catch this and translate it into the existing `bad_request` client-facing
+ *  validation response. */
+class InvalidQueryParamError extends Error {
+  constructor(public readonly param: string, public readonly value: string) {
+    super(`invalid value for query param "${param}": ${value}`);
+  }
+}
+
+const INTEGER_PATTERN = /^-?\d+$/;
+
+/**
+ * Parse a query param as an integer, requiring the *entire* string to
+ * represent one — unlike `parseInt`, which silently accepts a numeric
+ * prefix (e.g. "12junk" -> 12). Absent values fall back to `defaultVal`
+ * unchanged. Throws {@link InvalidQueryParamError} for a present-but-malformed
+ * value.
+ */
+function parseIntParam(val: unknown, paramName: string, defaultVal: number, max?: number): number {
+  if (val === undefined) return defaultVal;
+
+  const str = String(val);
+  if (!INTEGER_PATTERN.test(str)) {
+    throw new InvalidQueryParamError(paramName, str);
+  }
+
+  const n = Number(str);
+  if (!Number.isFinite(n)) {
+    throw new InvalidQueryParamError(paramName, str);
+  }
+
+  return max !== undefined ? Math.min(n, max) : n;
 }
 
 function parseEventTypes(val: unknown): AuditEventType[] | undefined {
@@ -60,15 +88,15 @@ export function auditRoutes(
    */
   router.get('/audit', async (req: Request, res: Response): Promise<void> => {
     try {
-      const limit = parseIntParam(req.query['limit'], 100, 1000);
+      const limit = parseIntParam(req.query['limit'], 'limit', 100, 1000);
       const afterId = req.query['afterId'] !== undefined
-        ? parseIntParam(req.query['afterId'], 0)
+        ? parseIntParam(req.query['afterId'], 'afterId', 0)
         : undefined;
       const since = req.query['since'] !== undefined
-        ? parseIntParam(req.query['since'], 0)
+        ? parseIntParam(req.query['since'], 'since', 0)
         : undefined;
       const until = req.query['until'] !== undefined
-        ? parseIntParam(req.query['until'], 0)
+        ? parseIntParam(req.query['until'], 'until', 0)
         : undefined;
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
@@ -92,6 +120,10 @@ export function auditRoutes(
         totalCount: page.totalCount,
       });
     } catch (err) {
+      if (err instanceof InvalidQueryParamError) {
+        res.status(400).json({ error: 'bad_request', message: err.message });
+        return;
+      }
       log.error({ err }, 'audit query failed');
       res.status(500).json({ error: 'internal_error', message: 'audit query failed' });
     }
@@ -155,10 +187,14 @@ export function auditRoutes(
    */
   router.get('/audit/tail', async (req: Request, res: Response): Promise<void> => {
     try {
-      const n = parseIntParam(req.query['n'], 50, 500);
+      const n = parseIntParam(req.query['n'], 'n', 50, 500);
       const entries = await repo.tail(n);
       res.json({ entries, count: entries.length });
     } catch (err) {
+      if (err instanceof InvalidQueryParamError) {
+        res.status(400).json({ error: 'bad_request', message: err.message });
+        return;
+      }
       log.error({ err }, 'audit tail query failed');
       res.status(500).json({ error: 'internal_error', message: 'audit tail query failed' });
     }
@@ -181,19 +217,19 @@ export function auditRoutes(
   router.get('/audit/export', async (req: Request, res: Response): Promise<void> => {
     try {
       const afterId = req.query['afterId'] !== undefined
-        ? parseIntParam(req.query['afterId'], 0)
+        ? parseIntParam(req.query['afterId'], 'afterId', 0)
         : undefined;
       const since = req.query['since'] !== undefined
-        ? parseIntParam(req.query['since'], 0)
+        ? parseIntParam(req.query['since'], 'since', 0)
         : undefined;
       const until = req.query['until'] !== undefined
-        ? parseIntParam(req.query['until'], 0)
+        ? parseIntParam(req.query['until'], 'until', 0)
         : undefined;
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
       const eventTypes = parseEventTypes(req.query['eventTypes']);
-      const pageSize = parseIntParam(req.query['pageSize'], 500, 2000);
+      const pageSize = parseIntParam(req.query['pageSize'], 'pageSize', 500, 2000);
 
       res.setHeader('Content-Type', 'application/x-ndjson');
       res.setHeader('Transfer-Encoding', 'chunked');
@@ -225,6 +261,10 @@ export function auditRoutes(
         'audit export completed',
       );
     } catch (err) {
+      if (err instanceof InvalidQueryParamError && !res.headersSent) {
+        res.status(400).json({ error: 'bad_request', message: err.message });
+        return;
+      }
       log.error({ err }, 'audit export failed');
       // If headers already sent (partial stream), we can only close the conn.
       if (!res.headersSent) {
