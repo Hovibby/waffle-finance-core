@@ -265,6 +265,13 @@ export function auditRoutes(
         return;
       }
       const pageSize = parseIntParam(req.query['pageSize'], 500, 2000);
+      if (req.query['pageSize'] !== undefined && pageSize < 1) {
+        res.status(400).json(validationError(
+          [{ message: 'pageSize must be a positive integer' }],
+          'pageSize must be a positive integer',
+        ));
+        return;
+      }
 
       res.setHeader('Content-Type', 'application/x-ndjson');
       res.setHeader('Transfer-Encoding', 'chunked');
