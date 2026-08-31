@@ -30,6 +30,7 @@ import type { Logger } from "pino";
 import type { AuditRepository } from "../../audit/audit-repo.js";
 import type { AuditExporter } from "../../audit/audit-exporter.js";
 import type { AuditEventType } from "../../audit/audit-log.js";
+import { validationError } from "../errors.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,16 @@ function parseIntParam(val: unknown, defaultVal: number, max?: number): number {
   const n = val !== undefined ? parseInt(String(val), 10) : defaultVal;
   const safe = isNaN(n) ? defaultVal : n;
   return max !== undefined ? Math.min(safe, max) : safe;
+}
+
+/**
+ * Parse a nonnegative integer query param (cursors, timestamps). Returns
+ * `null` if the value is present but negative, so the caller can respond
+ * with a 400 rather than silently passing it through to the repository.
+ */
+function parseNonNegativeIntParam(val: unknown, defaultVal: number): number | null {
+  const n = parseIntParam(val, defaultVal);
+  return n < 0 ? null : n;
 }
 
 function parseEventTypes(val: unknown): AuditEventType[] | undefined {
@@ -62,14 +73,23 @@ export function auditRoutes(
     try {
       const limit = parseIntParam(req.query['limit'], 100, 1000);
       const afterId = req.query['afterId'] !== undefined
-        ? parseIntParam(req.query['afterId'], 0)
+        ? parseNonNegativeIntParam(req.query['afterId'], 0)
         : undefined;
       const since = req.query['since'] !== undefined
-        ? parseIntParam(req.query['since'], 0)
+        ? parseNonNegativeIntParam(req.query['since'], 0)
         : undefined;
       const until = req.query['until'] !== undefined
-        ? parseIntParam(req.query['until'], 0)
+        ? parseNonNegativeIntParam(req.query['until'], 0)
         : undefined;
+
+      if (afterId === null || since === null || until === null) {
+        res.status(400).json(validationError(
+          [{ message: 'afterId, since, and until must be nonnegative' }],
+          'Cursor and timestamp parameters must be nonnegative',
+        ));
+        return;
+      }
+
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
@@ -181,14 +201,23 @@ export function auditRoutes(
   router.get('/audit/export', async (req: Request, res: Response): Promise<void> => {
     try {
       const afterId = req.query['afterId'] !== undefined
-        ? parseIntParam(req.query['afterId'], 0)
+        ? parseNonNegativeIntParam(req.query['afterId'], 0)
         : undefined;
       const since = req.query['since'] !== undefined
-        ? parseIntParam(req.query['since'], 0)
+        ? parseNonNegativeIntParam(req.query['since'], 0)
         : undefined;
       const until = req.query['until'] !== undefined
-        ? parseIntParam(req.query['until'], 0)
+        ? parseNonNegativeIntParam(req.query['until'], 0)
         : undefined;
+
+      if (afterId === null || since === null || until === null) {
+        res.status(400).json(validationError(
+          [{ message: 'afterId, since, and until must be nonnegative' }],
+          'Cursor and timestamp parameters must be nonnegative',
+        ));
+        return;
+      }
+
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
