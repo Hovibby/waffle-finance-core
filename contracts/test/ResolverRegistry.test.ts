@@ -773,6 +773,24 @@ describe("ResolverRegistry", () => {
       await registry.connect(newOwner).acceptOwnership();
       expect(await registry.owner()).to.equal(newOwner.address);
     });
+
+    it("rejects acceptOwnership from an account that is not the pending administrator", async () => {
+      const [, , newOwner, stranger] = await ethers.getSigners();
+      const { owner, registry } = await deploy();
+
+      await registry.connect(owner).transferOwnership(newOwner.address);
+
+      const ownerBefore = await registry.owner();
+      const pendingBefore = await registry.pendingOwner();
+
+      await expect(
+        registry.connect(stranger).acceptOwnership()
+      ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
+
+      // Neither current nor pending admin changed.
+      expect(await registry.owner()).to.equal(ownerBefore);
+      expect(await registry.pendingOwner()).to.equal(pendingBefore);
+    });
   });
 
   //  getActiveResolvers
