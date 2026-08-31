@@ -29,7 +29,7 @@ import { Router, type Request, type Response } from "express";
 import type { Logger } from "pino";
 import type { AuditRepository } from "../../audit/audit-repo.js";
 import type { AuditExporter } from "../../audit/audit-exporter.js";
-import type { AuditEventType } from "../../audit/audit-log.js";
+import { AUDIT_EVENT_TYPES, type AuditEventType } from "../../audit/audit-log.js";
 import { validationError } from "../errors.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -50,10 +50,22 @@ function parseNonNegativeIntParam(val: unknown, defaultVal: number): number | nu
   return n < 0 ? null : n;
 }
 
-function parseEventTypes(val: unknown): AuditEventType[] | undefined {
+/** Set of all known audit event types, used to validate untrusted query input at runtime. */
+const AUDIT_EVENT_TYPE_SET = new Set<string>(AUDIT_EVENT_TYPES);
+
+/**
+ * Parse a comma-separated `eventTypes` query param, validating each entry
+ * against the known event taxonomy. Returns `null` if any entry is not a
+ * recognized event type, so the caller can respond with a 400.
+ */
+function parseEventTypes(val: unknown): AuditEventType[] | undefined | null {
   if (!val || typeof val !== 'string') return undefined;
   const parts = val.split(',').map((s) => s.trim()).filter(Boolean);
-  return parts.length > 0 ? (parts as AuditEventType[]) : undefined;
+  if (parts.length === 0) return undefined;
+  for (const part of parts) {
+    if (!AUDIT_EVENT_TYPE_SET.has(part)) return null;
+  }
+  return parts as AuditEventType[];
 }
 
 // ─── Route factory ────────────────────────────────────────────────────────────
@@ -102,6 +114,13 @@ export function auditRoutes(
         ? req.query['orderId']
         : undefined;
       const eventTypes = parseEventTypes(req.query['eventTypes']);
+      if (eventTypes === null) {
+        res.status(400).json(validationError(
+          [{ message: 'eventTypes contains an unrecognized event type' }],
+          'Unknown event type in eventTypes filter',
+        ));
+        return;
+      }
       const includeCount = req.query['count'] === 'true';
 
       const page = await repo.query({
@@ -238,6 +257,13 @@ export function auditRoutes(
         ? req.query['orderId']
         : undefined;
       const eventTypes = parseEventTypes(req.query['eventTypes']);
+      if (eventTypes === null) {
+        res.status(400).json(validationError(
+          [{ message: 'eventTypes contains an unrecognized event type' }],
+          'Unknown event type in eventTypes filter',
+        ));
+        return;
+      }
       const pageSize = parseIntParam(req.query['pageSize'], 500, 2000);
 
       res.setHeader('Content-Type', 'application/x-ndjson');
