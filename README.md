@@ -23,7 +23,7 @@ WaffleFinance locks funds in Hash Time-Lock Contracts (HTLCs) on each chain simu
 
 If anything fails — coordinator down, resolver offline, RPC unavailable, frontend unreachable — locked funds either settle to the beneficiary or refund permissionlessly to the user. There is no state where funds are stuck under operator control.
 
-> **Status:** Live on testnet (Sepolia + Stellar testnet). Solana support is live in simulation mode — full settlement activates once the Anchor HTLC program is deployed on devnet. Mainnet gated until independent audit (Q1 2027).
+> **Status:** Live on testnet (Sepolia + Stellar testnet + Solana devnet). Mainnet gated until independent audit (Q1 2027).
 
 ---
 
@@ -33,7 +33,7 @@ If anything fails — coordinator down, resolver offline, RPC unavailable, front
 |---|---|---|
 | Ethereum (Sepolia) | ETH | ✅ Live |
 | Stellar | XLM | ✅ Live |
-| Solana | SOL | 🟡 Simulation mode (Anchor program pending deployment) |
+| Solana | SOL | ✅ Live |
 
 ---
 
@@ -129,6 +129,13 @@ frontend/           React + Vite dApp (Ethereum · Stellar · Solana)
 e2e/                Cross-chain differential test harness
 ```
 
+The supported build, test, lint, and smoke-test entry points for every
+package are documented in [docs/COMMANDS.md](docs/COMMANDS.md) — start there
+to find the right command for the package you're touching. New to the repo?
+Start with the [Contributor Handbook](docs/CONTRIBUTOR_HANDBOOK.md) instead —
+it maps package boundaries to validation checklists. For how the pieces fit
+together end to end, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ---
 
 ## Quick start
@@ -170,6 +177,18 @@ See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for deployment checklists, incide
 
 See [`docs/TECHNICAL_DEBT.md`](docs/TECHNICAL_DEBT.md) for the service-level technical debt register and roadmap — architectural gaps, known limitations, and planned improvements across all services.
 
+See [`docs/QUALITY_GATE.md`](docs/QUALITY_GATE.md) for the contract that keeps code, runtime config, and docs in sync — including a running list of drift found in the repo.
+
+See [`docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md`](docs/DEPLOYMENT_ROLLBACK_RUNBOOK.md) for the rollback-first deployment procedure for the coordinator and relayer.
+
+See [`docs/RELEASE_CONTRACT.md`](docs/RELEASE_CONTRACT.md) for the typed build/release contract covering every package, including known gaps in local release verification.
+
+See [`docs/SMOKE_TEST_CONTRACT.md`](docs/SMOKE_TEST_CONTRACT.md) for the repo-wide smoke test contract spanning coordinator readiness, order announcement, SDK init, and the frontend entry point.
+
+See [`docs/RPC_DEGRADATION_TEST_MATRIX.md`](docs/RPC_DEGRADATION_TEST_MATRIX.md) for the deterministic multi-chain RPC degradation test matrix — proving the coordinator, relayer, and resolver degrade honestly under delayed, reset, and partial-receipt RPC conditions.
+
+See [`docs/PERFORMANCE_BASELINE.md`](docs/PERFORMANCE_BASELINE.md) for the measurable performance baseline covering order lookup, announcement, event replay, and stale-order cleanup.
+
 ---
 
 ## Wallet support
@@ -188,17 +207,19 @@ All three wallets can be connected simultaneously from the wallet menu. The brid
 
 The Solana leg is fully wired end-to-end:
 
-- **SDK** — `SolanaHTLCClient` in `packages/sdk/src/solana/` handles `createOrder`, `claimOrder`, `refundOrder`. Runs in simulation mode until the Anchor program is deployed.
+- **SDK** — `SolanaHTLCClient` in `packages/sdk/src/solana/` handles `createOrder`, `claimOrder`, `refundOrder` with real Anchor instruction builders and account deserialization.
+- **Relayer** — `ConfiguredSolanaIntegration` in `relayer/src/services/solana-contract.ts` submits real Solana transactions for lock, claim, and refund operations.
 - **Coordinator** — `SolanaListener` polls RPC for HTLC program logs and forwards `OrderCreated`, `OrderClaimed`, `OrderRefunded` events into `OrderService`.
 - **DB** — `Chain` type includes `"solana"`, `Direction` includes `"eth_to_sol"` and `"sol_to_eth"`. Migration `002_solana_support.sql` upgrades existing databases.
-- **Frontend** — `useSolanaWallet()` handles Phantom connection. Route selector in `BridgeForm` exposes all four routes. Solana swaps are announced to the coordinator immediately; full settlement goes live once the Anchor program is deployed on devnet.
+- **Frontend** — `useSolanaWallet()` handles Phantom connection. Route selector in `BridgeForm` exposes all four routes.
 - **Asset mappings** — `resolveSolanaAsset()` and `resolveEthereumTokenFromSolana()` in `packages/sdk/src/assets/` cover testnet (devnet USDC) and mainnet (native SOL).
 
-To activate full Solana settlement, deploy the Anchor HTLC program to devnet and set:
+To enable Solana settlement, set:
 
 ```env
 SOLANA_RPC_URL=https://api.devnet.solana.com
 SOLANA_HTLC_PROGRAM=<your_program_id>
+SOLANA_PRIVATE_KEY=<your_relayer_keypair>
 ```
 
 ---
@@ -257,7 +278,7 @@ All environment variables across the monorepo packages are consolidated and vali
 | `RELAYER_PRIVATE_KEY` | relayer | ETH signing key |
 | `RELAYER_STELLAR_SECRET` | relayer | Stellar signing key |
 | `SOLANA_RPC_URL` | coordinator | Solana RPC endpoint |
-| `SOLANA_HTLC_PROGRAM` | coordinator | Anchor program ID (leave blank for simulation mode) |
+| `SOLANA_HTLC_PROGRAM` | coordinator, relayer | Anchor program ID (leave blank to disable Solana) |
 | `NETWORK_MODE` | relayer, frontend | `testnet` or `mainnet` |
 | `VITE_MAINNET_ENABLED` | frontend | Set `true` post-audit to unlock mainnet UI |
 

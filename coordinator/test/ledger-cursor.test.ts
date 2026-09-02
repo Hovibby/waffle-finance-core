@@ -1,338 +1,169 @@
-import { describe, it, expect } from "vitest";
+/**
+ * Per-order ledger cursor validation, recovery, and edge-case tests (#476).
+ */
+import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
+import pino from "pino";
+import { openDatabase } from "../src/persistence/db.js";
+import { OrdersRepository } from "../src/persistence/orders-repo.js";
+import { OrderService } from "../src/services/order-service.js";
 import {
-  LedgerCursor,
-  createLedgerCursor,
-  type GapSeverity,
+  advanceCursor,
+  computeIncrementalScanStart,
+  isEventBehindOrderCursor,
+  ETH_LOOKBACK_BLOCKS,
 } from "../src/reconciliation/ledger-cursor.js";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+const log = pino({ level: "silent" });
 
-/** Build a cursor with a 1 000-unit lookback window and the given initial HWM. */
-function cursor(initialHwm = 0, lookback = 1_000): LedgerCursor {
-  return new LedgerCursor("ethereum", lookback, initialHwm);
+const VALID_ETH = "0x1111111111111111111111111111111111111111";
+const VALID_STELLAR = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB422";
+const HASHLOCK = "0x" + "aa".repeat(32);
+
+async function freshService() {
+  const dir = mkdtempSync(resolve(tmpdir(), "wafflefinance-cursor-test-"));
+  const db = await openDatabase(`file:${dir}/test.db`);
+  const repo = new OrdersRepository(db);
+  const orders = new OrderService(repo, log);
+  return { orders, repo, db };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Construction & accessors
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor — construction", () => {
-  it("getHwm() returns the initial HWM", () => {
-    expect(cursor(5_000).getHwm()).toBe(5_000);
+describe("ledger-cursor helpers", () => {
+  it("isEventBehindOrderCursor returns true when position is at or below cursor", () => {
+    expect(isEventBehindOrderCursor(100, 100)).toBe(true);
+    expect(isEventBehindOrderCursor(100, 50)).toBe(true);
+    expect(isEventBehindOrderCursor(100, 101)).toBe(false);
+    expect(isEventBehindOrderCursor(null, 50)).toBe(false);
   });
 
-  it("getHwm() returns 0 when no initial HWM provided", () => {
-    expect(cursor().getHwm()).toBe(0);
+  it("computeIncrementalScanStart uses chain cursor when gap is within lookback", () => {
+    const result = computeIncrementalScanStart(19_900, 20_000, ETH_LOOKBACK_BLOCKS);
+    expect(result.from).toBe(19_900);
+    expect(result.gap).toBe(100);
+    expect(result.usedLookbackFallback).toBe(false);
   });
 
-  it("getLookbackWindow() returns the configured lookback", () => {
-    expect(cursor(0, 14_400).getLookbackWindow()).toBe(14_400);
+  it("computeIncrementalScanStart falls back to lookback on first run", () => {
+    const tip = 20_000;
+    const result = computeIncrementalScanStart(0, tip, ETH_LOOKBACK_BLOCKS);
+    expect(result.from).toBe(tip - ETH_LOOKBACK_BLOCKS);
+    expect(result.usedLookbackFallback).toBe(true);
   });
 
-  it("getLookbackExceededCount() starts at 0", () => {
-    expect(cursor(0).getLookbackExceededCount()).toBe(0);
-  });
-
-  it("createLedgerCursor factory produces a correctly seeded cursor", () => {
-    const c = createLedgerCursor("soroban", 34_560, 100_000);
-    expect(c.getHwm()).toBe(100_000);
-    expect(c.getLookbackWindow()).toBe(34_560);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// advance()
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor.advance()", () => {
-  it("advances the HWM to a higher value", () => {
-    const c = cursor(100);
-    c.advance(200);
-    expect(c.getHwm()).toBe(200);
-  });
-
-  it("is a no-op when called with a value equal to the current HWM", () => {
-    const c = cursor(100);
-    c.advance(100);
-    expect(c.getHwm()).toBe(100);
-  });
-
-  it("is a no-op when called with a value below the current HWM (no regression)", () => {
-    const c = cursor(500);
-    c.advance(100);
-    expect(c.getHwm()).toBe(500);
-  });
-
-  it("can be called multiple times — only the highest value wins", () => {
-    const c = cursor(0);
-    c.advance(300);
-    c.advance(200); // lower — no-op
-    c.advance(400);
-    expect(c.getHwm()).toBe(400);
+  it("advanceCursor never regresses", () => {
+    expect(advanceCursor(500, 400)).toBe(500);
+    expect(advanceCursor(500, 600)).toBe(600);
+    expect(advanceCursor(null, 100)).toBe(100);
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// seed()
-// ─────────────────────────────────────────────────────────────────────────────
+describe("OrdersRepository.advanceOrderLedgerCursor", () => {
+  let orders: OrderService;
+  let publicId: string;
 
-describe("LedgerCursor.seed()", () => {
-  it("unconditionally sets the HWM", () => {
-    const c = cursor(500);
-    c.seed(100); // lower than current HWM — still applied
-    expect(c.getHwm()).toBe(100);
+  beforeEach(async () => {
+    const ctx = await freshService();
+    orders = ctx.orders;
+    const order = await orders.announce({
+      direction: "eth_to_xlm",
+      hashlock: HASHLOCK,
+      srcChain: "ethereum",
+      srcAddress: VALID_ETH,
+      srcAsset: "native",
+      srcAmount: "1000000",
+      srcSafetyDeposit: "1000",
+      dstChain: "stellar",
+      dstAddress: VALID_STELLAR,
+      dstAsset: "native",
+      dstAmount: "1000000",
+    });
+    publicId = order.publicId;
   });
 
-  it("can seed to 0 to reset the cursor", () => {
-    const c = cursor(999);
-    c.seed(0);
-    expect(c.getHwm()).toBe(0);
-  });
-});
+  it("advances last_eth_block forward only", async () => {
+    await orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 1000 });
+    let row = await orders.get(publicId);
+    expect(row?.lastEthBlock).toBe(1000);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// assess() — severity classification
-// ─────────────────────────────────────────────────────────────────────────────
+    await orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 900 });
+    row = await orders.get(publicId);
+    expect(row?.lastEthBlock).toBe(1000);
 
-describe("LedgerCursor.assess() — gap severity", () => {
-  const lookback = 1_000;
-
-  it("severity=none when tip equals HWM", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(5_000);
-    expect(a.severity).toBe<GapSeverity>("none");
-    expect(a.gap).toBe(0);
-    expect(a.lookbackExceeded).toBe(false);
+    await orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 1200 });
+    row = await orders.get(publicId);
+    expect(row?.lastEthBlock).toBe(1200);
   });
 
-  it("severity=none when tip is behind HWM (already ahead)", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(4_999);
-    expect(a.severity).toBe<GapSeverity>("none");
-    expect(a.gap).toBe(0);
+  it("survives pause/resume — cursor persists across service instances", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "wafflefinance-cursor-resume-"));
+    const dbUrl = `file:${dir}/test.db`;
+    const db1 = await openDatabase(dbUrl);
+    const svc1 = new OrderService(new OrdersRepository(db1), log);
+    const order = await svc1.announce({
+      direction: "eth_to_xlm",
+      hashlock: "0x" + "bb".repeat(32),
+      srcChain: "ethereum",
+      srcAddress: VALID_ETH,
+      srcAsset: "native",
+      srcAmount: "1",
+      srcSafetyDeposit: "1",
+      dstChain: "stellar",
+      dstAddress: VALID_STELLAR,
+      dstAsset: "native",
+      dstAmount: "1",
+    });
+    await svc1.advanceOrderLedgerCursor(order.publicId, { lastEthBlock: 42_000 });
+
+    const db2 = await openDatabase(dbUrl);
+    const svc2 = new OrderService(new OrdersRepository(db2), log);
+    const resumed = await svc2.get(order.publicId);
+    expect(resumed?.lastEthBlock).toBe(42_000);
   });
 
-  it("severity=normal for gap == 1 (one block behind)", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(5_001);
-    expect(a.severity).toBe<GapSeverity>("normal");
-    expect(a.gap).toBe(1);
-    expect(a.lookbackExceeded).toBe(false);
+  it("handles concurrent advance attempts without regression", async () => {
+    await Promise.all([
+      orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 500 }),
+      orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 600 }),
+      orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 550 }),
+    ]);
+    const row = await orders.get(publicId);
+    expect(row?.lastEthBlock).toBe(600);
   });
 
-  it("severity=normal for gap == lookback (exactly at window boundary)", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(6_000); // gap == 1000 == lookback
-    expect(a.severity).toBe<GapSeverity>("normal");
-    expect(a.gap).toBe(lookback);
+  it("simulates reorg safety — lower block after higher block does not rewind cursor", async () => {
+    await orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 10_000 });
+    await orders.advanceOrderLedgerCursor(publicId, { lastEthBlock: 9_999 });
+    const row = await orders.get(publicId);
+    expect(row?.lastEthBlock).toBe(10_000);
   });
 
-  it("severity=large for gap == lookback + 1", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(6_001); // gap == 1001
-    expect(a.severity).toBe<GapSeverity>("large");
-  });
+  it("getReconciliationCursorState returns chain and order cursors", async () => {
+    await orders.setChainCursor("ethereum", 99_000);
+    await orders.advanceOrderLedgerCursor(publicId, {
+      lastEthBlock: 5000,
+      lastSorobanLedger: 8000,
+    });
 
-  it("severity=large for gap == 2 × lookback (exactly at the exceeded boundary)", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(7_000); // gap == 2000 == 2 × lookback
-    expect(a.severity).toBe<GapSeverity>("large");
-    expect(a.lookbackExceeded).toBe(false);
-  });
-
-  it("severity=exceeded for gap == 2 × lookback + 1", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(7_001); // gap == 2001 > 2 × lookback
-    expect(a.severity).toBe<GapSeverity>("exceeded");
-    expect(a.lookbackExceeded).toBe(true);
-  });
-
-  it("severity=exceeded for a very large gap", () => {
-    const c = cursor(0, lookback);
-    const a = c.assess(100_000);
-    expect(a.severity).toBe<GapSeverity>("exceeded");
-    expect(a.lookbackExceeded).toBe(true);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// assess() — fromBlock computation
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor.assess() — fromBlock", () => {
-  const lookback = 1_000;
-
-  it("fromBlock == HWM when gap is within the lookback window", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(5_500); // gap == 500 <= lookback
-    expect(a.fromBlock).toBe(5_000);
-  });
-
-  it("fromBlock == HWM when gap equals the large boundary (2 × lookback)", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(7_000); // gap == 2000 == 2 × lookback
-    expect(a.fromBlock).toBe(5_000);
-  });
-
-  it("fromBlock falls back to tip - lookback when gap exceeds 2 × lookback", () => {
-    const c = cursor(5_000, lookback);
-    const a = c.assess(10_000); // gap == 5000 > 2 × lookback
-    expect(a.fromBlock).toBe(10_000 - lookback);
-  });
-
-  it("fromBlock is 0 when the fallback would be negative (early chain history)", () => {
-    const c = cursor(0, 14_400);
-    const a = c.assess(1_000); // tip < lookback
-    // gap == 1000 <= 14400 — no exceeded, fromBlock == hwm == 0
-    expect(a.fromBlock).toBe(0);
-  });
-
-  it("fromBlock is 0 clamped when HWM=0 and tip < lookback", () => {
-    // lookback=5000, tip=3000 → gap=3000 ≤ lookback 5000 → 'normal', fromBlock=HWM=0
-    const c = cursor(0, 5_000);
-    const a = c.assess(3_000);
-    expect(a.severity).toBe<GapSeverity>("normal");
-    expect(a.fromBlock).toBe(0);
+    const state = await orders.getReconciliationCursorState();
+    expect(state.chainCursors.find((c) => c.chain === "ethereum")?.position).toBe(99_000);
+    expect(state.orderCursors.some((o) => o.publicId === publicId)).toBe(true);
+    const oc = state.orderCursors.find((o) => o.publicId === publicId)!;
+    expect(oc.lastEthBlock).toBe(5000);
+    expect(oc.lastSorobanLedger).toBe(8000);
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// assess() — lookbackExceededCount
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor — lookbackExceededCount", () => {
-  it("increments on each exceeded assessment", () => {
-    const c = cursor(0, 100);
-    c.assess(500);  // exceeded
-    c.assess(600);  // exceeded
-    expect(c.getLookbackExceededCount()).toBe(2);
-  });
-
-  it("does NOT increment for normal or large gaps", () => {
-    const c = cursor(0, 100);
-    c.assess(50);   // normal
-    c.assess(150);  // large (exactly 2 × lookback)
-    expect(c.getLookbackExceededCount()).toBe(0);
-  });
-
-  it("increments even when assess() is called in the same run multiple times", () => {
-    const c = cursor(0, 100);
-    for (let i = 0; i < 5; i++) c.assess(10_000); // all exceeded
-    expect(c.getLookbackExceededCount()).toBe(5);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// assess() — tip / hwm fields in returned assessment
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor.assess() — returned fields", () => {
-  it("populates tip and hwm accurately", () => {
-    const c = cursor(1_234, 500);
-    const a = c.assess(2_000);
-    expect(a.tip).toBe(2_000);
-    expect(a.hwm).toBe(1_234);
-  });
-
-  it("gap matches tip - hwm for positive gaps", () => {
-    const c = cursor(1_000, 500);
-    const a = c.assess(1_700);
-    expect(a.gap).toBe(700);
-  });
-
-  it("gap is 0 (never negative) when tip < hwm", () => {
-    const c = cursor(5_000, 500);
-    const a = c.assess(4_000);
-    expect(a.gap).toBe(0);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// resolveFromBlock()
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor.resolveFromBlock()", () => {
-  it("returns HWM for a gap within the lookback window", () => {
-    const c = cursor(5_000, 1_000);
-    expect(c.resolveFromBlock(5_500)).toBe(5_000);
-  });
-
-  it("returns tip - lookback for an exceeded gap", () => {
-    const c = cursor(0, 1_000);
-    expect(c.resolveFromBlock(10_000)).toBe(9_000);
-  });
-
-  it("returns the same value as assess(tip).fromBlock", () => {
-    const c = cursor(3_000, 500);
-    const tip = 4_500;
-    expect(c.resolveFromBlock(tip)).toBe(c.assess(tip).fromBlock);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Boundary values — lookback = 1 (pathological)
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor — lookback=1 boundary", () => {
-  it("gap of 1 is normal (== lookback)", () => {
-    const c = cursor(100, 1);
-    expect(c.assess(101).severity).toBe("normal");
-  });
-
-  it("gap of 2 is large (== 2 × lookback)", () => {
-    const c = cursor(100, 1);
-    expect(c.assess(102).severity).toBe("large");
-  });
-
-  it("gap of 3 is exceeded (> 2 × lookback)", () => {
-    const c = cursor(100, 1);
-    const a = c.assess(103);
-    expect(a.severity).toBe("exceeded");
-    expect(a.lookbackExceeded).toBe(true);
-    expect(a.fromBlock).toBe(102); // 103 - 1
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Real-world scenario: Ethereum 48-hour lookback
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("LedgerCursor — Ethereum real-world scenario", () => {
-  const ETH_LOOKBACK = 14_400; // ~48h at 12s/block
-
-  it("seed from DB + tip just ahead → normal gap, fromBlock == seed", () => {
-    const dbHwm = 20_000_000;
-    const c = createLedgerCursor("ethereum", ETH_LOOKBACK, dbHwm);
-    const a = c.assess(20_001_000); // 1000-block gap — well within window
-    expect(a.severity).toBe("normal");
-    expect(a.fromBlock).toBe(dbHwm);
-    expect(a.lookbackExceeded).toBe(false);
-  });
-
-  it("seed from DB + 3-day gap → exceeded, falls back to tip - lookback", () => {
-    const dbHwm = 19_500_000;
-    const currentTip = 20_000_000; // gap = 500 000 >> 2 × 14400
-    const c = createLedgerCursor("ethereum", ETH_LOOKBACK, dbHwm);
-    const a = c.assess(currentTip);
-    expect(a.severity).toBe("exceeded");
-    expect(a.fromBlock).toBe(currentTip - ETH_LOOKBACK);
-    expect(a.lookbackExceeded).toBe(true);
-  });
-
-  it("no prior DB records (HWM=0) → normal when tip < lookback", () => {
-    const c = createLedgerCursor("ethereum", ETH_LOOKBACK, 0);
-    const a = c.assess(10_000); // fresh testnet with few blocks
-    expect(a.severity).toBe("normal");
-    expect(a.fromBlock).toBe(0);
-  });
-
-  it("cursor advances correctly after replay", () => {
-    const c = createLedgerCursor("ethereum", ETH_LOOKBACK, 20_000_000);
-    c.advance(20_005_000);
-    const a = c.assess(20_005_000);
-    expect(a.severity).toBe("none");
-    expect(a.gap).toBe(0);
+describe("migration 011 — order ledger cursor columns", () => {
+  it("orders table includes per-order cursor columns", async () => {
+    const { db } = await freshService();
+    const cols = (db as any)
+      .prepare("PRAGMA table_info(orders)")
+      .all()
+      .map((c: any) => c.name);
+    expect(cols).toContain("last_eth_block");
+    expect(cols).toContain("last_soroban_ledger");
+    expect(cols).toContain("last_solana_slot");
   });
 });

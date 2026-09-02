@@ -2033,1021 +2033,652 @@ fn create_order_auth_tree_covers_token_transfer_sub_invocation() {
 }
 
 // =====================================================================
-// MIGRATION FRAMEWORK — unit tests
-//
-// Coverage:
-//   - New deployment stamps V1 schema from constructor
-//   - Legacy deployment (V0) schema reads back as 0
-//   - version_info string format
-//   - Schema gate blocks create_order / claim_order / refund_order on V0
-//   - migrate_orders happy path (V0 → V1)
-//   - migrate_orders is idempotent (AlreadyMigrated on second call)
-//   - Non-finalising batches do not bump the schema version
-//   - Finalising batch commits version and clears lock
-//   - Partial migration is recoverable
-//   - Admin change mid-migration does not unlock or corrupt state
-//   - Expired V0 order is refundable post-migration
-//   - V0 order with safety deposit is claimable post-migration
-//   - Batch over empty range migrates 0 entries
-//   - check_migration_integrity returns 0 on clean state
-//   - check_migration_integrity detects missing keys (bitmask correctness)
-//   - migration event shape (topics + data)
-//   - config_check event shape
-//   - Non-admin cannot migrate or integrity-check
-//   - MigrationLock blocks create_order
-//   - MigrationLock cleared after finalize
+// ASSET CLASS MODEL — native XLM vs SAC token, order version field
 // =====================================================================
 
-// Bring harness helpers into scope for migration tests.
-use crate::harness::{
-    advance_ledger as h_advance_ledger,
-    assert_config_keys_present, assert_current_schema, assert_no_migration_lock,
-    assert_order_migrated, assert_order_ttls,
-    clear_migration_lock, deploy_htlc, deploy_htlc_legacy, deploy_token as h_deploy_token,
-    erase_schema_version, has_migration_lock,
-    plant_migration_lock, plant_v0_order,
-    sha256_32 as h_sha256_32, write_raw_schema_version, LegacyScenario,
-    OrderV0Builder,
-};
-use crate::migration::{SchemaVersion, CURRENT_SCHEMA_VERSION};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: deploy a fresh (V1) HTLC with a registered token for migration tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn migration_setup(env: &Env) -> (Address, HtlcContractClient<'_>, Address, soroban_sdk::token::StellarAssetClient<'_>, soroban_sdk::token::TokenClient<'_>) {
-    let asset_admin = Address::generate(env);
-    let (asset, sac, token) = deploy_token(env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc(env, 0);
-    (_admin, htlc, asset, sac, token)
-}
-
-fn migration_setup_legacy(env: &Env) -> (Address, HtlcContractClient<'_>, Address, soroban_sdk::token::StellarAssetClient<'_>, soroban_sdk::token::TokenClient<'_>) {
-    let asset_admin = Address::generate(env);
-    let (asset, sac, token) = deploy_token(env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(env, 0);
-    (_admin, htlc, asset, sac, token)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Schema version stamping
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[test]
-fn new_deployment_stamps_v1_schema_version() {
+fn native_xlm_order_create_and_claim_succeeds() {
+    // Register the SAC token as the "native XLM" address via set_native_token,
+    // then verify the order is classified AssetClass::Native and that
+    // the full create → claim flow works correctly.
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-    assert_eq!(
-        htlc.schema_version(),
-        CURRENT_SCHEMA_VERSION as u32,
-        "constructor must stamp the current schema version"
-    );
-    assert_current_schema(&env, &htlc.address);
-}
+    let asset_admin = Address::generate(&env);
+    let (native_asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
 
-#[test]
-fn legacy_deployment_reads_v0_schema_version() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-    assert_eq!(
-        htlc.schema_version(),
-        SchemaVersion::V0 as u32,
-        "absent SchemaVersion key must be treated as V0"
-    );
-}
-
-#[test]
-fn version_info_format_new_deployment() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-    let info = htlc.version_info();
-    // Must be "schema:1 binary:1" for a current deployment.
-    let expected = soroban_sdk::String::from_str(&env, "schema:1 binary:1");
-    assert_eq!(info, expected, "version_info must reflect on-chain and compiled versions");
-}
-
-#[test]
-fn version_info_format_legacy_deployment() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-    // On-chain = V0, binary compiled against V1 → "schema:0 binary:1"
-    let info = htlc.version_info();
-    let expected = soroban_sdk::String::from_str(&env, "schema:0 binary:1");
-    assert_eq!(info, expected);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Schema gate blocks mutations on V0 deployments
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn create_order_blocked_on_v0_schema() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc, asset, sac, _token) = migration_setup_legacy(&env);
+    // Mark this token as the native XLM contract.
+    htlc.set_native_token(&native_asset);
+    assert_eq!(htlc.native_token(), Some(native_asset.clone()));
 
     let sender = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
     let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[1u8; 32]);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &500_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xaau8; 32]);
     let hashlock = sha256_32(&env, &preimage);
-
-    let res = htlc.try_create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &0i128, &hashlock, &600u64,
-    );
-    assert_eq!(res.err().unwrap().unwrap(), Error::SchemaMismatch.into());
-}
-
-#[test]
-fn claim_order_blocked_on_v0_schema() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc, asset, sac, _token) = migration_setup(&env);
-
-    let sender = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
-    let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[2u8; 32]);
-    let hashlock = sha256_32(&env, &preimage);
+    let amount = 100_0000000i128;
+    let safety = 5_000_000i128;
 
     let order_id = htlc.create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &0i128, &hashlock, &600u64,
+        &sender, &beneficiary, &sender, &native_asset,
+        &amount, &safety, &hashlock, &600u64,
     );
 
-    // Downgrade schema to V0.
-    erase_schema_version(&env, &htlc.address);
-
-    let res = htlc.try_claim_order(&order_id, &preimage, &beneficiary);
-    assert_eq!(res.err().unwrap().unwrap(), Error::SchemaMismatch.into());
-
-    // Restore and verify no state change.
-    write_raw_schema_version(&env, &htlc.address, CURRENT_SCHEMA_VERSION);
-    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Funded);
-}
-
-#[test]
-fn refund_order_blocked_on_v0_schema() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc, asset, sac, _token) = migration_setup(&env);
-
-    let sender = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
-    let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[3u8; 32]);
-    let hashlock = sha256_32(&env, &preimage);
-
-    let order_id = htlc.create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &0i128, &hashlock, &600u64,
-    );
-    h_advance_ledger(&env, 601);
-    erase_schema_version(&env, &htlc.address);
-
-    let caller = Address::generate(&env);
-    let res = htlc.try_refund_order(&order_id, &caller);
-    assert_eq!(res.err().unwrap().unwrap(), Error::SchemaMismatch.into());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// migrate_orders happy path
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn migrate_orders_v0_to_v1_happy_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let preimage = Bytes::from_array(&env, &[10u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-
-    // Manually build with known fields for assertion.
-    let sender = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let now = env.ledger().timestamp();
-    let timelock = now + 600;
-    let v0_full = crate::migration::OrderV0 {
-        id: 1,
-        sender: sender.clone(),
-        beneficiary: beneficiary.clone(),
-        refund_address: sender.clone(),
-        asset: asset.clone(),
-        amount: 10_0000000,
-        safety_deposit: 0,
-        hashlock: hashlock.clone(),
-        timelock,
-        status: OrderStatus::Funded,
-        preimage: preimage.clone(),
-    };
-    plant_v0_order(&env, &htlc.address, v0_full.clone(), crate::FINALISED_ORDER_TTL_LEDGERS);
-
-    let (migrated, new_version) = htlc.migrate_orders(&1u64, &2u64, &true);
-
-    assert_eq!(migrated, 1u32);
-    assert_eq!(new_version, CURRENT_SCHEMA_VERSION as u32);
-    assert_eq!(htlc.schema_version(), CURRENT_SCHEMA_VERSION as u32);
-    assert_current_schema(&env, &htlc.address);
-    assert_no_migration_lock(&env, &htlc.address);
-    assert_order_migrated(&env, &htlc.address, 1, &v0_full);
-}
-
-#[test]
-fn migrate_orders_empty_range_migrates_zero_entries() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    // start == end → empty range.
-    let (migrated, _) = htlc.migrate_orders(&5u64, &5u64, &true);
-    assert_eq!(migrated, 0u32);
-    assert_eq!(htlc.schema_version(), CURRENT_SCHEMA_VERSION as u32);
-}
-
-#[test]
-fn migrate_orders_skips_absent_ids() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let preimage = Bytes::from_array(&env, &[20u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-
-    // Only plant ids 1 and 3; id 2 is absent.
-    for &id in &[1u64, 3u64] {
-        let v0 = crate::migration::OrderV0 {
-            id,
-            sender: Address::generate(&env),
-            beneficiary: Address::generate(&env),
-            refund_address: Address::generate(&env),
-            asset: asset.clone(),
-            amount: 10_0000000,
-            safety_deposit: 0,
-            hashlock: hashlock.clone(),
-            timelock: 0,
-            status: OrderStatus::Funded,
-            preimage: preimage.clone(),
-        };
-        plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
-    }
-
-    let (migrated, _) = htlc.migrate_orders(&1u64, &4u64, &true);
-    assert_eq!(migrated, 2u32, "only 2 of the 3 ids had entries");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Idempotency
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn migrate_orders_already_migrated_returns_error() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-    htlc.migrate_orders(&1u64, &1u64, &true);
-
-    let res = htlc.try_migrate_orders(&1u64, &1u64, &true);
-    assert_eq!(res.err().unwrap().unwrap(), Error::AlreadyMigrated.into());
-}
-
-#[test]
-fn migrate_orders_on_new_deployment_returns_already_migrated() {
-    // A new deployment is already at V1 — calling migrate_orders must fail.
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    let res = htlc.try_migrate_orders(&1u64, &1u64, &true);
-    assert_eq!(res.err().unwrap().unwrap(), Error::AlreadyMigrated.into());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Batch / partial migration
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn non_finalising_batch_does_not_bump_schema_version() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    htlc.migrate_orders(&1u64, &2u64, &false);
-
-    assert_eq!(
-        htlc.schema_version(),
-        SchemaVersion::V0 as u32,
-        "schema version must not advance until finalize=true"
-    );
-    // Lock must be set because migration is in-flight.
-    assert!(has_migration_lock(&env, &htlc.address));
-}
-
-#[test]
-fn finalising_batch_commits_version_and_clears_lock() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    htlc.migrate_orders(&1u64, &3u64, &false); // batch 1
-    htlc.migrate_orders(&3u64, &3u64, &true);  // finalise
-
-    assert_eq!(htlc.schema_version(), CURRENT_SCHEMA_VERSION as u32);
-    assert!(!has_migration_lock(&env, &htlc.address));
-}
-
-#[test]
-fn partial_migration_recovery_across_three_batches() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let preimage = Bytes::from_array(&env, &[30u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-
-    for id in 1u64..=6 {
-        let v0 = crate::migration::OrderV0 {
-            id,
-            sender: Address::generate(&env),
-            beneficiary: Address::generate(&env),
-            refund_address: Address::generate(&env),
-            asset: asset.clone(),
-            amount: 10_0000000,
-            safety_deposit: 0,
-            hashlock: hashlock.clone(),
-            timelock: 0,
-            status: OrderStatus::Funded,
-            preimage: preimage.clone(),
-        };
-        plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
-    }
-
-    // Batch 1: ids 1-2, non-final.
-    let (m1, v1) = htlc.migrate_orders(&1u64, &3u64, &false);
-    assert_eq!(m1, 2);
-    assert_eq!(v1, SchemaVersion::V0 as u32);
-
-    // Batch 2: ids 3-4, non-final.
-    let (m2, v2) = htlc.migrate_orders(&3u64, &5u64, &false);
-    assert_eq!(m2, 2);
-    assert_eq!(v2, SchemaVersion::V0 as u32);
-
-    // Batch 3: ids 5-6, final.
-    let (m3, v3) = htlc.migrate_orders(&5u64, &7u64, &true);
-    assert_eq!(m3, 2);
-    assert_eq!(v3, CURRENT_SCHEMA_VERSION as u32);
-
-    assert_current_schema(&env, &htlc.address);
-    assert_no_migration_lock(&env, &htlc.address);
-
-    // All 6 orders must be readable.
-    for id in 1u64..=6 {
-        assert!(htlc.get_order(&id).is_some());
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Admin changes mid-migration
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn admin_change_during_migration_does_not_corrupt_state() {
-    // Scenario: admin starts a non-finalising batch, then transfers admin to a
-    // new address. The new admin must be able to complete the migration.
-    let env = Env::default();
-
-    let admin = Address::generate(&env);
-    let contract_id = env.register(HtlcContract, (admin.clone(), 0i128));
-    let htlc = HtlcContractClient::new(&env, &contract_id);
-    env.mock_all_auths();
-
-    erase_schema_version(&env, &contract_id);
-
-    // Batch 1 by current admin.
-    htlc.migrate_orders(&1u64, &2u64, &false);
-    assert!(has_migration_lock(&env, &contract_id));
-
-    // Transfer admin during migration.
-    let new_admin = Address::generate(&env);
-    htlc.transfer_admin(&new_admin);
-    htlc.accept_admin();
-    assert_eq!(htlc.admin(), new_admin);
-
-    // New admin finalises.
-    htlc.migrate_orders(&2u64, &2u64, &true);
-    assert_eq!(htlc.schema_version(), CURRENT_SCHEMA_VERSION as u32);
-    assert_no_migration_lock(&env, &contract_id);
-}
-
-#[test]
-fn pending_admin_cannot_call_migrate_orders() {
-    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-    use soroban_sdk::IntoVal;
-
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(HtlcContract, (admin.clone(), 0i128));
-    let htlc = HtlcContractClient::new(&env, &contract_id);
-
-    env.mock_all_auths();
-    erase_schema_version(&env, &contract_id);
-
-    // Propose new_admin but don't accept.
-    let new_admin = Address::generate(&env);
-    htlc.transfer_admin(&new_admin);
-
-    // new_admin's auth is NOT sufficient to call migrate_orders.
-    env.mock_auths(&[MockAuth {
-        address: &new_admin,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "migrate_orders",
-            args: (1u64, 2u64, true).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    let res = htlc.try_migrate_orders(&1u64, &2u64, &true);
-    assert!(res.is_err(), "pending admin must not be able to migrate");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Expired V0 order under legacy layout
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn expired_v0_order_is_refundable_post_migration() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, sac, token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let refund_to = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[40u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-    let now = env.ledger().timestamp();
-    let expired_timelock = now.saturating_sub(1); // already expired
-    let amount: i128 = 10_0000000;
-
-    sac.mint(&htlc.address, &amount);
-
-    let v0 = crate::migration::OrderV0 {
-        id: 1,
-        sender: Address::generate(&env),
-        beneficiary: beneficiary.clone(),
-        refund_address: refund_to.clone(),
-        asset: asset.clone(),
-        amount,
-        safety_deposit: 0,
-        hashlock,
-        timelock: expired_timelock,
-        status: OrderStatus::Funded,
-        preimage: preimage.clone(),
-    };
-    plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
-    htlc.migrate_orders(&1u64, &2u64, &true);
-
-    let caller = Address::generate(&env);
-    htlc.refund_order(&1u64, &caller);
-    assert_eq!(token.balance(&refund_to), amount);
-    assert_eq!(htlc.get_order(&1u64).unwrap().status, OrderStatus::Refunded);
-}
-
-#[test]
-fn v0_order_with_safety_deposit_claimable_post_migration() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, sac, token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let sender = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let relayer = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[41u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-    let now = env.ledger().timestamp();
-    let timelock = now + 600;
-    let amount: i128 = 10_0000000;
-    let safety: i128 = 1_000_000;
-
-    // Fund the contract directly (simulating locked funds from V0 era).
-    sac.mint(&htlc.address, &(amount + safety));
-
-    let v0 = crate::migration::OrderV0 {
-        id: 1,
-        sender: sender.clone(),
-        beneficiary: beneficiary.clone(),
-        refund_address: sender.clone(),
-        asset: asset.clone(),
-        amount,
-        safety_deposit: safety,
-        hashlock,
-        timelock,
-        status: OrderStatus::Funded,
-        preimage: preimage.clone(),
-    };
-    plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
-    htlc.migrate_orders(&1u64, &2u64, &true);
-
-    htlc.claim_order(&1u64, &preimage, &relayer);
-
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native);
+    assert_eq!(order.version, 1);
+    assert_eq!(token.balance(&htlc.address), amount + safety);
+
+    htlc.claim_order(&order_id, &preimage, &caller);
     assert_eq!(token.balance(&beneficiary), amount);
-    assert_eq!(token.balance(&relayer), safety);
+    assert_eq!(token.balance(&caller), safety);
     assert_eq!(token.balance(&htlc.address), 0);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Claimed);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MigrationLock semantics
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[test]
-fn migration_lock_blocks_create_order() {
+fn native_xlm_order_create_and_refund_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-
     let asset_admin = Address::generate(&env);
-    let (asset, sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc(&env, 0);
+    let (native_asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
 
-    plant_migration_lock(&env, &htlc.address);
+    htlc.set_native_token(&native_asset);
 
     let sender = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
     let beneficiary = Address::generate(&env);
-    let preimage = Bytes::from_array(&env, &[50u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
+    let refund_to = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &200_0000000);
 
-    let res = htlc.try_create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &0i128, &hashlock, &600u64,
+    let preimage = Bytes::from_array(&env, &[0xbbu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let amount = 80_0000000i128;
+    let safety = 2_000_000i128;
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &refund_to, &native_asset,
+        &amount, &safety, &hashlock, &600u64,
     );
-    assert_eq!(res.err().unwrap().unwrap(), Error::SchemaMismatch.into());
 
-    // After clearing the lock, create_order must succeed.
-    clear_migration_lock(&env, &htlc.address);
-    let id = htlc.create_order(
-        &sender, &beneficiary, &sender, &asset,
-        &10_0000000i128, &0i128, &hashlock, &600u64,
-    );
-    assert!(htlc.get_order(&id).is_some());
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native);
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+
+    assert_eq!(token.balance(&refund_to), amount);
+    assert_eq!(token.balance(&caller), safety);
+    assert_eq!(token.balance(&htlc.address), 0);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Refunded);
 }
 
 #[test]
-fn migration_lock_is_cleared_after_finalize_true() {
+fn sac_token_order_asset_class_is_token() {
+    // An asset address that is not registered as native is classified Token.
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    htlc.migrate_orders(&1u64, &3u64, &false);
-    assert!(has_migration_lock(&env, &htlc.address));
-
-    htlc.migrate_orders(&3u64, &3u64, &true);
-    assert!(!has_migration_lock(&env, &htlc.address));
-}
-
-#[test]
-fn migration_lock_not_set_on_new_deployment() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-    assert!(!has_migration_lock(&env, &htlc.address));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// check_migration_integrity
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn check_migration_integrity_returns_zero_on_clean_state() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-    htlc.migrate_orders(&1u64, &1u64, &true);
-
-    assert_eq!(htlc.check_migration_integrity(), 0u32);
-    assert_config_keys_present(&env, &htlc.address);
-}
-
-#[test]
-fn check_migration_integrity_detects_missing_admin_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    env.as_contract(&htlc.address, || {
-        env.storage().instance().remove(&DataKey::Admin);
-    });
-    let missing = htlc.check_migration_integrity();
-    assert_eq!(missing & 1, 1, "bit 0 must indicate missing Admin key");
-}
-
-#[test]
-fn check_migration_integrity_detects_missing_next_order_id_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    env.as_contract(&htlc.address, || {
-        env.storage().instance().remove(&DataKey::NextOrderId);
-    });
-    let missing = htlc.check_migration_integrity();
-    assert_eq!(missing & 2, 2, "bit 1 must indicate missing NextOrderId key");
-}
-
-#[test]
-fn check_migration_integrity_detects_missing_min_safety_deposit_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    env.as_contract(&htlc.address, || {
-        env.storage().instance().remove(&DataKey::MinSafetyDeposit);
-    });
-    let missing = htlc.check_migration_integrity();
-    assert_eq!(missing & 4, 4, "bit 2 must indicate missing MinSafetyDeposit key");
-}
-
-#[test]
-fn check_migration_integrity_detects_missing_schema_version_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    erase_schema_version(&env, &htlc.address);
-    // Admin key is still present; only the SchemaVersion key was erased.
-    let missing = htlc.check_migration_integrity();
-    assert_eq!(missing & 8, 8, "bit 3 must indicate missing SchemaVersion key");
-}
-
-#[test]
-fn check_migration_integrity_bitmask_multiple_missing_keys() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    env.as_contract(&htlc.address, || {
-        env.storage().instance().remove(&DataKey::MinSafetyDeposit);
-        env.storage().instance().remove(&DataKey::NextOrderId);
-    });
-    let missing = htlc.check_migration_integrity();
-    // Bits 1 and 2 set → value is 6.
-    assert_eq!(missing & 6, 6);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Event shape
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn migration_event_emitted_with_correct_shape() {
-    // The finalising batch must emit ("migration","schema") with
-    // (from_version_u32, to_version_u32, migrated_count).
-    let env = Env::default();
-    env.mock_all_auths();
-
     let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
+    let (asset, sac, token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
 
-    let preimage = Bytes::from_array(&env, &[60u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-    let v0 = crate::migration::OrderV0 {
-        id: 1,
-        sender: Address::generate(&env),
-        beneficiary: Address::generate(&env),
-        refund_address: Address::generate(&env),
-        asset: asset.clone(),
-        amount: 10_0000000,
-        safety_deposit: 0,
-        hashlock,
-        timelock: 0,
-        status: OrderStatus::Funded,
-        preimage,
-    };
-    plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
+    // Do NOT call set_native_token — asset stays Token-class.
 
-    htlc.migrate_orders(&1u64, &2u64, &true);
-
-    assert_last_event(
-        &env,
-        &htlc.address,
-        (symbol_short!("migration"), symbol_short!("schema")),
-        // (from=0, to=1, migrated=1)
-        (0u32, CURRENT_SCHEMA_VERSION as u32, 1u32),
-    );
-}
-
-#[test]
-fn migration_event_not_emitted_for_non_finalising_batch() {
-    // A non-finalising batch must NOT emit the ("migration","schema") event.
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let events_before = env.events().all().len();
-    htlc.migrate_orders(&1u64, &2u64, &false);
-    let events_after = env.events().all().len();
-
-    // The only event that could be emitted would be the migration schema event.
-    // In a non-finalising batch no migration event should be present, so the
-    // event count must not increase by more than 0.
-    // (The call itself may emit nothing extra — assert count is unchanged.)
-    assert_eq!(
-        events_after, events_before,
-        "non-finalising batch must not emit migration event"
-    );
-}
-
-#[test]
-fn config_check_event_emitted_with_bitmask() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, htlc) = deploy_htlc(&env, 0);
-
-    htlc.check_migration_integrity();
-    assert_last_event(
-        &env,
-        &htlc.address,
-        (symbol_short!("migration"), symbol_short!("cfg_chk")),
-        0u32, // all keys present → bitmask 0
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TTL assertions post-migration
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn migrated_entries_get_ttl_floor() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    let preimage = Bytes::from_array(&env, &[70u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-
-    for id in 1u64..=3 {
-        let v0 = crate::migration::OrderV0 {
-            id,
-            sender: Address::generate(&env),
-            beneficiary: Address::generate(&env),
-            refund_address: Address::generate(&env),
-            asset: asset.clone(),
-            amount: 10_0000000,
-            safety_deposit: 0,
-            hashlock: hashlock.clone(),
-            timelock: 0,
-            status: OrderStatus::Claimed,
-            preimage: preimage.clone(),
-        };
-        // Plant with near-zero TTL.
-        plant_v0_order(&env, &htlc.address, v0, 1);
-    }
-
-    htlc.migrate_orders(&1u64, &4u64, &true);
-    assert_order_ttls(&env, &htlc.address, &[1, 2, 3], crate::FINALISED_ORDER_TTL_LEDGERS);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LegacyScenario integration
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn legacy_scenario_all_terminal_orders_readable_post_migration() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let scenario = LegacyScenario::build(&env, 0, 4);
-    let client = &scenario.client;
-
-    let (migrated, version) = client.migrate_orders(&1u64, &5u64, &true);
-    assert_eq!(migrated, 4u32);
-    assert_eq!(version, CURRENT_SCHEMA_VERSION as u32);
-
-    for order_v0 in scenario.orders.iter() {
-        let order = client.get_order(&order_v0.id);
-        assert!(order.is_some(), "terminal order {} must be readable post-migration", order_v0.id);
-    }
-}
-
-#[test]
-fn legacy_scenario_mixed_funded_and_terminal_orders() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    const N_FUNDED: u32 = 3;
-    const N_TERMINAL: u32 = 2;
-
-    let scenario = LegacyScenario::build(&env, N_FUNDED, N_TERMINAL);
-    let client = &scenario.client;
-    let total = N_FUNDED + N_TERMINAL;
-
-    let (migrated, version) = client.migrate_orders(&1u64, &(total as u64 + 1), &true);
-    assert_eq!(migrated, total);
-    assert_eq!(version, CURRENT_SCHEMA_VERSION as u32);
-    assert_current_schema(&env, &client.address);
-
-    // All funded orders must still be claimable.
-    for order_v0 in scenario.orders.iter() {
-        if order_v0.status == OrderStatus::Funded {
-            client.claim_order(&order_v0.id, &order_v0.preimage, &order_v0.beneficiary);
-            let order = client.get_order(&order_v0.id).unwrap();
-            assert_eq!(order.status, OrderStatus::Claimed);
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Non-admin authorisation checks for migration entry points
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn migrate_orders_requires_admin_auth() {
-    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-    use soroban_sdk::IntoVal;
-
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(HtlcContract, (admin.clone(), 0i128));
-    let htlc = HtlcContractClient::new(&env, &contract_id);
-    env.mock_all_auths();
-    erase_schema_version(&env, &contract_id);
-
-    let stranger = Address::generate(&env);
-    env.mock_auths(&[MockAuth {
-        address: &stranger,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "migrate_orders",
-            args: (1u64, 2u64, true).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(
-        htlc.try_migrate_orders(&1u64, &2u64, &true).is_err(),
-        "non-admin must be rejected"
-    );
-
-    // Admin succeeds.
-    env.mock_auths(&[MockAuth {
-        address: &admin,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "migrate_orders",
-            args: (1u64, 2u64, true).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(htlc.try_migrate_orders(&1u64, &2u64, &true).is_ok());
-}
-
-#[test]
-fn check_migration_integrity_requires_admin_auth() {
-    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-    use soroban_sdk::IntoVal;
-
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(HtlcContract, (admin.clone(), 0i128));
-    let htlc = HtlcContractClient::new(&env, &contract_id);
-
-    let stranger = Address::generate(&env);
-    env.mock_auths(&[MockAuth {
-        address: &stranger,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "check_migration_integrity",
-            args: ().into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(htlc.try_check_migration_integrity().is_err());
-
-    env.mock_auths(&[MockAuth {
-        address: &admin,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "check_migration_integrity",
-            args: ().into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    assert_eq!(htlc.check_migration_integrity(), 0u32);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Regression: post-migration create_order works normally
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn create_order_works_normally_after_migration() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let asset_admin = Address::generate(&env);
-    let (asset, sac, token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
-
-    // Migrate (no orders to transform).
-    htlc.migrate_orders(&1u64, &1u64, &true);
-
-    // Normal create + claim.
     let sender = Address::generate(&env);
     let beneficiary = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
-    let preimage = Bytes::from_array(&env, &[80u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
-    let amount = 10_0000000i128;
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &200_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0xccu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let amount = 50_0000000i128;
 
     let order_id = htlc.create_order(
         &sender, &beneficiary, &sender, &asset,
         &amount, &0i128, &hashlock, &600u64,
     );
-    assert_eq!(order_id, 1u64);
 
-    htlc.claim_order(&order_id, &preimage, &beneficiary);
+    let order: Order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token);
+    assert_eq!(order.version, 1);
+
+    htlc.claim_order(&order_id, &preimage, &caller);
     assert_eq!(token.balance(&beneficiary), amount);
+    assert_eq!(token.balance(&htlc.address), 0);
 }
 
 #[test]
-fn created_at_is_set_correctly_on_post_migration_orders() {
-    // Orders created AFTER migration must have a non-zero created_at.
+fn clear_native_token_reclassifies_subsequent_orders_as_token() {
+    // After clear_native_token, the same asset address no longer maps to Native.
     let env = Env::default();
     env.mock_all_auths();
-
     let asset_admin = Address::generate(&env);
-    let (asset, sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
 
-    htlc.migrate_orders(&1u64, &1u64, &true);
+    htlc.set_native_token(&asset);
 
     let sender = Address::generate(&env);
-    sac.mint(&sender, &100_0000000);
-    let preimage = Bytes::from_array(&env, &[81u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &400_0000000);
 
-    let now = env.ledger().timestamp();
-    let order_id = htlc.create_order(
-        &sender, &sender, &sender, &asset,
+    let preimage = Bytes::from_array(&env, &[0xddu8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    // First order: Native.
+    let id1 = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &50_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(htlc.get_order(&id1).unwrap().asset_class, crate::AssetClass::Native);
+
+    // Clear the native token binding.
+    htlc.clear_native_token();
+    assert_eq!(htlc.native_token(), None);
+
+    // Second order with same asset: now Token.
+    let id2 = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &50_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(htlc.get_order(&id2).unwrap().asset_class, crate::AssetClass::Token);
+}
+
+// =====================================================================
+// INVALID ASSET — rejected before any transfer
+// =====================================================================
+
+#[test]
+fn create_order_with_htlc_itself_as_asset_rejected() {
+    // Passing the HTLC contract's own address as the token would route
+    // the transfer to itself; this is explicitly rejected before any
+    // transfer occurs.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let hashlock = sha256_32(&env, &Bytes::from_array(&env, &[0xeeu8; 32]));
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender,
+        &htlc.address,   // ← the HTLC contract itself as asset
         &10_0000000i128, &0i128, &hashlock, &600u64,
     );
-    let order = htlc.get_order(&order_id).unwrap();
-    assert_eq!(order.created_at, now, "post-migration orders must have correct created_at");
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::InvalidAsset.into(),
+        "HTLC must reject its own address as the asset"
+    );
+}
+
+// =====================================================================
+// OVERFLOW — amount + safety_deposit overflows i128
+// =====================================================================
+
+#[test]
+fn create_order_overflow_total_rejected() {
+    // i128::MAX + 1 overflows. The overflow check fires before any
+    // transfer so no tokens need to be held by the sender.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, _sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let hashlock = sha256_32(&env, &Bytes::from_array(&env, &[0xffu8; 32]));
+
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &i128::MAX, &1i128, &hashlock, &600u64,
+    );
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::Overflow.into(),
+        "amount + safety_deposit overflow must be caught before transfer"
+    );
+}
+
+// =====================================================================
+// POST-FINALIZATION IDEMPOTENCY — terminal orders cannot be re-entered
+// =====================================================================
+
+#[test]
+fn double_refund_after_refund_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x11u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+    assert_eq!(htlc.get_order(&order_id).unwrap().status, OrderStatus::Refunded);
+
+    // Second refund on a terminal (Refunded) order must fail.
+    let res = htlc.try_refund_order(&order_id, &caller);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotRefundable.into(),
+        "double-refund on a Refunded order must be rejected"
+    );
 }
 
 #[test]
-fn migrated_v0_order_sentinel_created_at_is_zero() {
-    // V0 orders that went through migration must have created_at == 0.
+fn claim_after_refund_fails() {
+    // An order that has been refunded is terminal; a subsequent claim
+    // attempt must be rejected with OrderNotClaimable, not with an
+    // incorrect preimage error.
     let env = Env::default();
     env.mock_all_auths();
-
     let asset_admin = Address::generate(&env);
-    let (asset, _sac, _token) = h_deploy_token(&env, &asset_admin);
-    let (_admin, htlc) = deploy_htlc_legacy(&env, 0);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
 
-    let preimage = Bytes::from_array(&env, &[82u8; 32]);
-    let hashlock = h_sha256_32(&env, &preimage);
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let caller = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
 
-    let v0 = crate::migration::OrderV0 {
-        id: 1,
-        sender: Address::generate(&env),
-        beneficiary: Address::generate(&env),
-        refund_address: Address::generate(&env),
-        asset: asset.clone(),
-        amount: 10_0000000,
-        safety_deposit: 0,
-        hashlock,
-        timelock: 0,
-        status: OrderStatus::Funded,
-        preimage,
-    };
-    plant_v0_order(&env, &htlc.address, v0, crate::FINALISED_ORDER_TTL_LEDGERS);
-    htlc.migrate_orders(&1u64, &2u64, &true);
+    let preimage = Bytes::from_array(&env, &[0x22u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
 
-    let order = htlc.get_order(&1u64).unwrap();
-    assert_eq!(
-        order.created_at, 0,
-        "migrated V0 order must have sentinel created_at == 0"
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
     );
+
+    advance_ledger(&env, 601);
+    htlc.refund_order(&order_id, &caller);
+
+    // Even with the correct preimage, claim must be rejected.
+    let res = htlc.try_claim_order(&order_id, &preimage, &beneficiary);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotClaimable.into(),
+        "claim after refund must be rejected as not claimable"
+    );
+}
+
+#[test]
+fn refund_after_claim_is_rejected_as_not_refundable() {
+    // Mirror of claim_after_refund: once claimed, any refund is rejected.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x33u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    // Advance past timelock; the order is still Claimed.
+    advance_ledger(&env, 601);
+    let res = htlc.try_refund_order(&order_id, &beneficiary);
+    assert_eq!(
+        res.err().unwrap().unwrap(),
+        Error::OrderNotRefundable.into(),
+        "refund after claim must be rejected"
+    );
+}
+
+// =====================================================================
+// Order metadata: version, asset classification, timestamps (#500)
+// =====================================================================
+
+#[test]
+fn order_version_field_is_1_for_new_orders() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x50u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.version, 1,
+        "newly created orders must carry version=1 for upgrade-safe deserialization");
+}
+
+#[test]
+fn order_created_at_is_recorded_and_finalised_at_is_zero_while_funded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let now = env.ledger().timestamp();
+    let preimage = Bytes::from_array(&env, &[0x51u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.created_at, now, "created_at must equal the ledger timestamp at creation");
+    assert_eq!(order.finalised_at, 0, "finalised_at must be 0 while order is Funded");
+}
+
+#[test]
+fn finalised_at_is_set_on_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x52u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    // Advance time so finalised_at differs from created_at.
+    advance_ledger(&env, 100);
+    let claim_time = env.ledger().timestamp();
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.finalised_at, claim_time,
+        "finalised_at must be set to the ledger timestamp at the moment of claim");
+    assert_eq!(order.status, OrderStatus::Claimed);
+}
+
+#[test]
+fn finalised_at_is_set_on_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x53u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    let refund_time = env.ledger().timestamp();
+    let cleaner = Address::generate(&env);
+    htlc.refund_order(&order_id, &cleaner);
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.finalised_at, refund_time,
+        "finalised_at must be set to the ledger timestamp at refund");
+    assert_eq!(order.status, OrderStatus::Refunded);
+}
+
+#[test]
+fn asset_classified_as_token_when_no_native_token_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x54u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token,
+        "asset must be classified as Token when no native token is registered");
+}
+
+#[test]
+fn asset_classified_as_native_when_native_token_matches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Register this SAC as the native token address.
+    htlc.set_native_token(&asset);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x55u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Native,
+        "asset must be classified as Native when its address matches the registered native token");
+}
+
+#[test]
+fn asset_classified_as_token_after_native_token_cleared() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    // Set then clear the native token binding.
+    htlc.set_native_token(&asset);
+    htlc.clear_native_token();
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x56u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    let order = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order.asset_class, crate::AssetClass::Token,
+        "asset must fall back to Token after the native token binding is cleared");
+}
+
+#[test]
+fn create_order_with_htlc_contract_as_asset_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let preimage = Bytes::from_array(&env, &[0x57u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    // Using the HTLC contract's own address as the asset must be rejected before
+    // any token transfer, as it would silently succeed with no external balance change.
+    let res = htlc.try_create_order(
+        &sender, &beneficiary, &sender, &htlc.address,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+    assert_eq!(res.err().unwrap().unwrap(), Error::InvalidAsset.into(),
+        "using the HTLC contract itself as the asset must be rejected with InvalidAsset");
+}
+
+#[test]
+fn order_id_increments_monotonically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x58u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+
+    let id1 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+    let id2 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+    let id3 = htlc.create_order(&sender, &beneficiary, &sender, &asset, &1_0000000i128, &0i128, &hashlock, &600u64);
+
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
+    assert_eq!(id3, 3);
+    assert_eq!(htlc.next_order_id(), 4,
+        "next_order_id must be one ahead of the last issued id");
+}
+
+#[test]
+fn extend_order_ttl_on_claimed_order_restores_finalised_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x59u8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+    // Erode some TTL to make the re-extension observable.
+    advance_sequence(&env, 100_000);
+    assert!(order_ttl(&env, &htlc, order_id) < FINALISED_ORDER_TTL_LEDGERS);
+
+    htlc.extend_order_ttl(&order_id);
+    assert_eq!(order_ttl(&env, &htlc, order_id), FINALISED_ORDER_TTL_LEDGERS,
+        "extend_order_ttl on a claimed order must restore the finalised TTL");
+}
+
+#[test]
+fn extend_order_ttl_on_refunded_order_restores_finalised_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x5au8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    advance_ledger(&env, 601);
+    let cleaner = Address::generate(&env);
+    htlc.refund_order(&order_id, &cleaner);
+    advance_sequence(&env, 100_000);
+    assert!(order_ttl(&env, &htlc, order_id) < FINALISED_ORDER_TTL_LEDGERS);
+
+    htlc.extend_order_ttl(&order_id);
+    assert_eq!(order_ttl(&env, &htlc, order_id), FINALISED_ORDER_TTL_LEDGERS,
+        "extend_order_ttl on a refunded order must restore the finalised TTL");
+}
+
+#[test]
+fn preimage_is_stored_after_claim() {
+    // Validate that the revealed preimage is persisted in the order record
+    // so off-chain indexers can verify the hashlock opening without re-hashing.
+    let env = Env::default();
+    env.mock_all_auths();
+    let asset_admin = Address::generate(&env);
+    let (asset, sac, _token) = deploy_token(&env, &asset_admin);
+    let (_admin, htlc) = setup(&env, 0);
+
+    let sender = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    sac.mint(&sender, &100_0000000);
+
+    let preimage = Bytes::from_array(&env, &[0x5du8; 32]);
+    let hashlock = sha256_32(&env, &preimage);
+    let order_id = htlc.create_order(
+        &sender, &beneficiary, &sender, &asset,
+        &10_0000000i128, &0i128, &hashlock, &600u64,
+    );
+
+    // Before claim, preimage is empty.
+    let order_before = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order_before.preimage.len(), 0,
+        "preimage must be empty before claim");
+
+    htlc.claim_order(&order_id, &preimage, &beneficiary);
+
+    let order_after = htlc.get_order(&order_id).unwrap();
+    assert_eq!(order_after.preimage, preimage,
+        "revealed preimage must be stored in the order record after claim");
 }

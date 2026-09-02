@@ -30,11 +30,23 @@ import { OrdersRepository } from "../src/persistence/orders-repo.js";
 import { OrderService } from "../src/services/order-service.js";
 import { Reconciler } from "../src/reconciliation/reconciler.js";
 import type { CoordinatorConfig } from "../src/config.js";
+import {
+  makeCreatedEvent,
+  makeClaimedEvent,
+  makeRefundedEvent,
+  makeMalformedDataEvent,
+  makeUnknownTopicEvent,
+  PREIMAGE,
+  ORDER_ID,
+  TIMELOCK,
+  HASHLOCK,
+} from "./fixtures/soroban-xdr-fixtures.js";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPC mocks
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ---------------------------------------------------------------------------
+// Mock viem + @stellar/stellar-sdk + @solana/web3.js so the reconciler can
+// run without live RPCs.
+// ---------------------------------------------------------------------------
+let mockSorobanEvents: any[] = [];
 vi.mock("viem", async (importOriginal) => {
   const actual = await importOriginal<typeof import("viem")>();
   return {
@@ -46,14 +58,18 @@ vi.mock("viem", async (importOriginal) => {
   };
 });
 
-vi.mock("@stellar/stellar-sdk", () => ({
-  rpc: {
-    Server: vi.fn(() => ({
-      getLatestLedger: vi.fn(async () => ({ sequence: 100_000 })),
-      getEvents: vi.fn(async () => ({ events: [], cursor: null })),
-    })),
-  },
-}));
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    rpc: {
+      Server: vi.fn(() => ({
+        getLatestLedger: vi.fn(async () => ({ sequence: 100_000 })),
+        getEvents: vi.fn(async () => ({ events: mockSorobanEvents, cursor: null }))
+      }))
+    }
+  };
+});
 
 vi.mock("@solana/web3.js", () => ({
   Connection: vi.fn(() => ({
@@ -959,5 +975,125 @@ describe("Reconciler — Solana PLACEHOLDER skip", () => {
     await r.run();
     expect(mock.getSlot).not.toHaveBeenCalled();
     expect(mock.getSignaturesForAddress).not.toHaveBeenCalled();
+  });
+});
+
+describe("Reconciler — Soroban event replay", () => {
+  let orders: OrderService;
+  let reconciler: Reconciler;
+
+  beforeEach(async () => {
+    orders = await freshOrders();
+    mockSorobanEvents = [];
+    vi.resetModules();
+    vi.clearAllMocks();
+    const sorobanCfg = {
+      ...BASE_CFG,
+      soroban: { ...BASE_CFG.soroban, htlcContract: "C123456789" }
+    };
+    reconciler = new Reconciler(sorobanCfg, orders, log);
+  });
+
+  it("replays a missing Soroban created event and advances order to src_locked", async () => {
+    const order = await seedOrder(orders);
+    mockSorobanEvents = [makeCreatedEvent(100050, "0xstellar_created_tx")];
+
+    await reconciler.run();
+
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("src_locked");
+    expect(updated?.srcOrderId).toBe(ORDER_ID);
+    expect(updated?.srcLockTx).toBe("0xstellar_created_tx");
+  });
+
+  it("skips a malformed Soroban event and records a decode error without mutating state", async () => {
+    const order = await seedOrder(orders);
+    mockSorobanEvents = [makeMalformedDataEvent(100051, "0xstellar_malformed_tx")];
+
+    await reconciler.run();
+
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+  });
+
+  it("skips an unknown Soroban topic event without recording a decode error", async () => {
+    const order = await seedOrder(orders);
+    mockSorobanEvents = [makeUnknownTopicEvent(100052, "0xstellar_unknown_tx")];
+
+    await reconciler.run();
+
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+  });
+});
+
+// ── #576: unsafe numeric conversion guard ─────────────────────────────────────
+
+describe("Reconciler — #576: unsafe integer guard", () => {
+  it("skips an ETH OrderCreated event with an unsafe block number and does not mutate order state", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders);
+
+    const reconciler = new Reconciler(BASE_CFG, orders, log);
+
+    const { createPublicClient } = await import("viem");
+    const mockClient = (createPublicClient as MockedFunction<any>).mock.results.at(-1)?.value;
+
+    // blockNumber larger than Number.MAX_SAFE_INTEGER — would be silently rounded otherwise
+    const UNSAFE_BLOCK = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    mockClient.getLogs.mockImplementation(async ({ event }: any) => {
+      if (event?.name === "OrderCreated") {
+        return [
+          {
+            args: { orderId: 1n, hashlock: HASHLOCK, timelock: 9999n },
+            transactionHash: "0xdeadbeef",
+            blockNumber: UNSAFE_BLOCK,
+          },
+        ];
+      }
+      return [];
+    });
+
+    await reconciler.run();
+
+    // Run must succeed (no throw)
+    expect(reconciler.getStatus().lastRunOk).toBe(true);
+    // Order must NOT have been advanced — unsafe block was rejected
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+    expect(updated?.srcOrderId).toBeNull();
+    // No events replayed
+    expect(reconciler.getStatus().eventsReplayed).toBe(0);
+  });
+
+  it("skips an ETH OrderCreated event with an unsafe timelock and does not mutate order state", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders);
+
+    const reconciler = new Reconciler(BASE_CFG, orders, log);
+
+    const { createPublicClient } = await import("viem");
+    const mockClient = (createPublicClient as MockedFunction<any>).mock.results.at(-1)?.value;
+
+    const UNSAFE_TIMELOCK = BigInt(Number.MAX_SAFE_INTEGER) + 100n;
+    mockClient.getLogs.mockImplementation(async ({ event }: any) => {
+      if (event?.name === "OrderCreated") {
+        return [
+          {
+            args: { orderId: 1n, hashlock: HASHLOCK, timelock: UNSAFE_TIMELOCK },
+            transactionHash: "0xdeadbeef",
+            blockNumber: 100n,
+          },
+        ];
+      }
+      return [];
+    });
+
+    await reconciler.run();
+
+    expect(reconciler.getStatus().lastRunOk).toBe(true);
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+    expect(reconciler.getStatus().eventsReplayed).toBe(0);
   });
 });

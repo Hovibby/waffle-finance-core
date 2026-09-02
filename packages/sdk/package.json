@@ -1,7 +1,7 @@
 {
   "name": "@wafflefinance/sdk",
   "version": "1.0.0",
-  "description": "TypeScript SDK for the WaffleFinance cross-chain bridge: Ethereum + Soroban HTLC clients, secret utilities, and a shared order state machine.",
+  "description": "TypeScript SDK for the WaffleFinance cross-chain bridge: Ethereum, Soroban, and Solana HTLC clients, a typed Coordinator API client, secret utilities, and a shared order state machine.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -39,6 +39,10 @@
       "import": "./dist/types/index.js",
       "types": "./dist/types/index.d.ts"
     },
+    "./routes": {
+      "import": "./dist/routes/index.js",
+      "types": "./dist/routes/index.d.ts"
+    },
     "./htlc-client": {
       "import": "./dist/htlc-client.js",
       "types": "./dist/htlc-client.d.ts"
@@ -58,6 +62,10 @@
     "./shared-utils": {
       "import": "./dist/shared-utils/index.js",
       "types": "./dist/shared-utils/index.d.ts"
+    },
+    "./coordinator": {
+      "import": "./dist/coordinator/index.js",
+      "types": "./dist/coordinator/index.d.ts"
     }
   },
   "files": [
@@ -69,6 +77,7 @@
     "analyze": "node scripts/analyze-bundle.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist"
   },

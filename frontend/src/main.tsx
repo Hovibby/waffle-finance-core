@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App.tsx'
+import WagmiRainbowProvider from './providers/WagmiRainbowProvider.tsx'
 import './index.css'
 
 // Belt-and-suspenders runtime guard against console leakage.
@@ -23,8 +24,10 @@ if (import.meta.env.PROD && typeof window !== 'undefined') {
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
+    <WagmiRainbowProvider>
       <BrowserRouter>
         <App />
       </BrowserRouter>
+    </WagmiRainbowProvider>
   </React.StrictMode>,
 )

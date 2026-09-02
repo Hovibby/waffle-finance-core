@@ -127,8 +127,15 @@ export class SorobanEventDecodeError extends Error {
  * JS value via `scValToNative`.
  */
 function decodeScVal(base64: string): unknown {
-  const val = xdr.ScVal.fromXDR(base64, "base64");
-  return scValToNative(val);
+  try {
+    const val = xdr.ScVal.fromXDR(base64, "base64");
+    return scValToNative(val);
+  } catch {
+    throw new SorobanEventDecodeError(
+      "unknown",
+      "invalid base64-encoded XDR ScVal",
+    );
+  }
 }
 
 /**
@@ -144,12 +151,32 @@ function toHex(raw: unknown): string {
 }
 
 /**
+ * Like {@link toHex} but additionally rejects a zero-length byte sequence.
+ * Used exclusively for the HTLC preimage field: a zero-length preimage is
+ * structurally valid XDR yet semantically impossible — sha256("") can never
+ * equal any real hashlock stored on-chain — so forwarding it would silently
+ * corrupt downstream claim handling.
+ */
+function toNonEmptyHex(raw: unknown, field: string): string {
+  const hex = toHex(raw);
+  if (hex.length === 0) {
+    throw new TypeError(`${field}: preimage must be non-empty bytes`);
+  }
+  return hex;
+}
+
+/**
  * Ensure a native value is BigInt; coerce from number for robustness.
  * Soroban u64 / i128 both decode to BigInt with scValToNative.
  */
-function toBigInt(v: unknown, field: string): bigint {
+export function toBigInt(v: unknown, field: string): bigint {
   if (typeof v === "bigint") return v;
-  if (typeof v === "number") return BigInt(v);
+  if (typeof v === "number") {
+    if (!Number.isFinite(v) || !Number.isSafeInteger(v)) {
+      throw new RangeError(`Unsafe number: ${v} cannot be safely converted to bigint`);
+    }
+    return BigInt(v);
+  }
   throw new TypeError(`${field}: expected bigint, got ${typeof v}`);
 }
 
@@ -296,7 +323,7 @@ function decodeClaimed(
       ...meta,
       orderId: toBigInt(val[0], "order_id"),
       caller: toStr(val[1], "caller"),
-      preimage: toHex(val[2]),
+      preimage: toNonEmptyHex(val[2], "preimage"),
       amount: toBigInt(val[3], "amount"),
       safetyDeposit: toBigInt(val[4], "safety_deposit"),
       beneficiary,

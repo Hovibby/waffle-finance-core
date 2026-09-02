@@ -46,6 +46,19 @@ export interface HTLCTxResult {
 
 // ── Error types ─────────────────────────────────────────────────────────────
 
+/**
+ * Submission metadata attached to HTLCErrors thrown by the Soroban
+ * orchestration layer. Absent for errors from other adapters.
+ */
+export interface HTLCSubmissionMeta {
+  /** Total number of submission attempts made before the error. */
+  attempts: number;
+  /** Base fees (stroops) used in each fee-bump attempt, in order. */
+  feeBumpHistory: number[];
+  /** Hash of the last submitted transaction, if any. */
+  lastHash?: string;
+}
+
 export type HTLCErrorCode =
   /** The signer/wallet rejected the transaction or is unavailable. */
   | "wallet_unavailable"
@@ -78,18 +91,22 @@ export class HTLCError extends Error {
   public readonly retryable: boolean;
   /** Optional lower-level cause (chain SDK error, network error, etc.). */
   public readonly cause?: unknown;
+  /** Orchestration metadata — populated by the Soroban orchestration layer. */
+  public readonly submissionMeta?: HTLCSubmissionMeta;
 
   constructor(opts: {
     code: HTLCErrorCode;
     message: string;
     retryable?: boolean;
     cause?: unknown;
+    submissionMeta?: HTLCSubmissionMeta;
   }) {
     super(opts.message);
     this.name = "HTLCError";
     this.code = opts.code;
     this.retryable = opts.retryable ?? false;
     this.cause = opts.cause;
+    this.submissionMeta = opts.submissionMeta;
   }
 }
 

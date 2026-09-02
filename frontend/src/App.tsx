@@ -1,16 +1,20 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, lazy, Suspense } from 'react'
 import BridgeForm from './components/BridgeForm'
-import DarkVeil from './components/DarkVeil'
-import TransactionHistory from './components/TransactionHistory'
 import { ToastContainer, useToast } from './components/Toast'
 import { useFreighter } from './hooks/useFreighter'
 import { useSolanaWallet } from './hooks/useSolanaWallet'
 import { useEthereumWallet } from './hooks/useEthereumWallet'
 import { useNetworkMode } from './lib/useNetworkMode'
 import { pingBackendWake } from './lib/wakeBackend'
-import { isMainnetEnabled } from './config/networks'
-import NetworkMismatchBanner from './components/NetworkMismatchBanner'
-import MainnetVersionBanner from './components/MainnetVersionBanner'
+import { selectIsMainnetEnabled, selectResolvedNetworkMode, selectCurrentEthereumNetwork, selectCurrentStellarNetwork, selectApiBaseUrl, selectIntroAnimationEnabled, selectDarkVeilEnabled } from './config/selectors';
+
+// Non-critical components are lazy-loaded so the initial bridge form bundle
+// stays as small as possible. Suspense boundaries provide invisible fallbacks
+// because all three sections progressively enhance the core swap flow.
+const DarkVeil = lazy(() => import('./components/DarkVeil'));
+const TransactionHistory = lazy(() => import('./components/TransactionHistory'));
+const NetworkMismatchBanner = lazy(() => import('./components/NetworkMismatchBanner'));
+const MainnetVersionBanner = lazy(() => import('./components/MainnetVersionBanner'));
 import {
   Activity,
   ArrowRightLeft,
@@ -29,7 +33,11 @@ function App() {
   const [showWalletMenu, setShowWalletMenu] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [activeTab, setActiveTab] = useState<'bridge' | 'history'>('bridge');
+  const introAllowed = selectIntroAnimationEnabled();
+  const darkVeilAllowed = selectDarkVeilEnabled();
+
   const [showIntro, setShowIntro] = useState(() => {
+    if (!introAllowed) return false;
     return sessionStorage.getItem('wafflefinance:intro-seen') !== 'true';
   });
   const [introLogoReady, setIntroLogoReady] = useState(false);
@@ -249,7 +257,7 @@ function App() {
               </a>
             </nav>
 
-            {isMainnetEnabled() ? (
+            {selectIsMainnetEnabled() ? (
               <button
                 onClick={toggleNetwork}
                 className={`network-pill px-3 py-1.5 text-xs font-semibold transition-all duration-200 md:px-3.5 ${
@@ -477,8 +485,10 @@ function App() {
         </div>
       </nav>
 
-      <NetworkMismatchBanner networkState={networkState} />
-      <MainnetVersionBanner networkState={networkState} />
+      <Suspense fallback={null}>
+        <NetworkMismatchBanner networkState={networkState} />
+        <MainnetVersionBanner networkState={networkState} />
+      </Suspense>
 
       {/* Main Content */}
       <main className="relative z-10 mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-10 px-4 pb-24 pt-10 md:px-8 lg:grid-cols-[minmax(0,1fr)_minmax(420px,540px)] lg:items-start lg:pt-16">
@@ -568,28 +578,34 @@ function App() {
             />
           )}
           {activeTab === 'history' && (
-            <TransactionHistory
-              ethAddress={ethAddress}
-              stellarAddress={stellarAddress || ''}
-            />
+            <Suspense fallback={<div className="py-12 text-center text-slate-400 text-sm">Loading history…</div>}>
+              <TransactionHistory
+                ethAddress={ethAddress}
+                stellarAddress={stellarAddress || ''}
+              />
+            </Suspense>
           )}
         </section>
       </main>
 
-      <div className="background-depth pointer-events-none fixed inset-0 -z-10 overflow-hidden">
-        <div className="dark-veil-layer">
-          <DarkVeil
-            hueShift={0}
-            noiseIntensity={0.008}
-            scanlineIntensity={0.035}
-            scanlineFrequency={1.8}
-            speed={0.9}
-            warpAmount={0.08}
-            resolutionScale={0.72}
-            verticalOffset={0.42}
-          />
+      {darkVeilAllowed && (
+        <div className="background-depth pointer-events-none fixed inset-0 -z-10 overflow-hidden">
+          <div className="dark-veil-layer">
+            <Suspense fallback={null}>
+              <DarkVeil
+                hueShift={0}
+                noiseIntensity={0.008}
+                scanlineIntensity={0.035}
+                scanlineFrequency={1.8}
+                speed={0.9}
+                warpAmount={0.08}
+                resolutionScale={0.72}
+                verticalOffset={0.42}
+              />
+            </Suspense>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Waffle backdrop — blended large waffle pattern behind everything */}
       <div className="waffle-backdrop-wrap">

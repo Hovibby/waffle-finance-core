@@ -7,19 +7,15 @@ import { ethers, Contract, EventLog } from 'ethers';
 import { RELAYER_CONFIG } from '../index.js';
 import { startAdaptivePoll, type AdaptivePollHandle } from '../utils/adaptive-poll.js';
 import { sanitizeForLog } from '../utils/sanitize-for-log.js';
+import {
+  createEthOrderCreatedEvent,
+  createEthOrderClaimedEvent,
+  createEthOrderRefundedEvent,
+  type NormalizedRelayEvent,
+} from '../events/relay-event.js';
+import { getLogger } from '../logger.js';
 
-// Mock CrossChainOrder interface for now
-interface CrossChainOrder {
-  orderId: string;
-  sender: string;
-  token: string;
-  amount: string;
-  hashLock: string;
-  timelock: number;
-  feeRate: string;
-  partialFillEnabled: boolean;
-  ethereumOrderId?: string;
-}
+const logger = getLogger().child({ component: 'ethereum-listener' });
 
 // HTLCBridge contract ABI (focusing on OrderCreated event)
 const HTLC_BRIDGE_ABI = [
@@ -27,6 +23,9 @@ const HTLC_BRIDGE_ABI = [
   "event OrderClaimed(uint256 indexed orderId, address indexed claimer, uint256 amount, uint256 totalFilled, bytes32 preimage)",
   "event OrderRefunded(uint256 indexed orderId, address indexed sender, uint256 refundAmount)"
 ];
+
+/** Relay event handler registered via `setRelayEventHandler`. */
+export type RelayEventHandler = (event: NormalizedRelayEvent) => void | Promise<void>;
 
 /**
  * Ethereum OrderCreated event data
@@ -70,9 +69,31 @@ export class EthereumEventListener {
   private isPolling: boolean = false;
   private isActiveFn: () => boolean = () => true;
   private isAttentiveFn: () => boolean = () => true;
+  /** Downstream handler for normalized relay events. */
+  private relayEventHandler: RelayEventHandler | null = null;
 
   constructor() {
     // Lazy initialization - will be done in startListening()
+  }
+
+  /** Register a handler that receives every normalized relay event this listener emits. */
+  setRelayEventHandler(handler: RelayEventHandler): void {
+    this.relayEventHandler = handler;
+  }
+
+  /** Dispatch a normalized event to the registered handler (fire-and-forget). */
+  private dispatchRelayEvent(event: NormalizedRelayEvent): void {
+    if (!this.relayEventHandler) return;
+    try {
+      const result = this.relayEventHandler(event);
+      if (result instanceof Promise) {
+        result.catch((err: unknown) =>
+          logger.warn({ err: sanitizeForLog(err) }, '[eth-listener] relay event handler error')
+        );
+      }
+    } catch (err) {
+      logger.warn({ err: sanitizeForLog(err) }, '[eth-listener] relay event handler threw synchronously');
+    }
   }
 
   /** Wire idle/active gating before `startListening()`. */
@@ -89,7 +110,7 @@ export class EthereumEventListener {
 
     // In mock mode, don't initialize real provider to avoid RPC errors
     if (RELAYER_CONFIG.enableMockMode) {
-      console.log('🧪 Mock mode: Skipping Ethereum provider initialization');
+      logger.info('Mock mode: Skipping Ethereum provider initialization');
       return;
     }
 
@@ -103,8 +124,7 @@ export class EthereumEventListener {
       this.provider
     );
 
-    // Initialize Stellar client (placeholder for now)
-    console.log('🌟 Stellar client initialization placeholder');
+    logger.debug('Stellar client initialization placeholder');
   }
 
   /**
@@ -120,23 +140,23 @@ export class EthereumEventListener {
       // Initialize components first
       this.initializeComponents();
 
-      console.log('🔄 Starting Ethereum event listener...');
-      console.log(`📍 Contract address: ${RELAYER_CONFIG.ethereum.contractAddress}`);
-      console.log(`🌐 Network: ${RELAYER_CONFIG.ethereum.network}`);
+      logger.info('Starting Ethereum event listener');
+      logger.info({ contractAddress: RELAYER_CONFIG.ethereum.contractAddress }, 'Contract address');
+      logger.info({ network: RELAYER_CONFIG.ethereum.network }, 'Network');
 
       // Validate configuration
       await this.validateConfiguration();
 
       // Set up event listener for OrderCreated events
       if (RELAYER_CONFIG.enableMockMode) {
-        console.log('🧪 Mock mode: Simulating event listener (no real blockchain connection)');
+        logger.info('Mock mode: Simulating event listener (no real blockchain connection)');
       } else {
         // Start from the current head — we only care about NEW orders,
         // not history. Historical orders are surfaced via /api/orders.
         this.lastProcessedBlock = await this.provider!.getBlockNumber();
-        console.log(
-          `📦 Polling from block ${this.lastProcessedBlock} forward ` +
-          `(active ${RELAYER_CONFIG.activePollIntervalMs / 1000}s / idle ${RELAYER_CONFIG.idlePollIntervalMs / 1000}s)`
+        logger.info(
+          { fromBlock: this.lastProcessedBlock, activeIntervalMs: RELAYER_CONFIG.activePollIntervalMs, idleIntervalMs: RELAYER_CONFIG.idlePollIntervalMs },
+          'Polling from current block forward',
         );
 
         this.pollHandle = startAdaptivePoll({
@@ -150,11 +170,11 @@ export class EthereumEventListener {
       }
 
       this.isListening = true;
-      console.log('✅ Ethereum event listener started successfully');
-      console.log('👂 Listening for OrderCreated events...');
+      logger.info('Ethereum event listener started successfully');
+      logger.info('Listening for OrderCreated events');
 
     } catch (error) {
-      console.error('❌ Failed to start event listener:', error);
+      logger.error({ err: error }, 'Failed to start event listener');
       throw error;
     }
   }
@@ -164,7 +184,7 @@ export class EthereumEventListener {
    */
   async stopListening(): Promise<void> {
     if (!this.isListening) {
-      console.log('⚠️  Event listener is not running');
+      logger.warn('Event listener is not running');
       return;
     }
 
@@ -174,9 +194,9 @@ export class EthereumEventListener {
         this.pollHandle = null;
       }
       this.isListening = false;
-      console.log('🛑 Ethereum event listener stopped');
+      logger.info('Ethereum event listener stopped');
     } catch (error) {
-      console.error('❌ Error stopping event listener:', error);
+      logger.error({ err: error }, 'Error stopping event listener');
     }
   }
 
@@ -220,14 +240,17 @@ export class EthereumEventListener {
       // Don't advance the cursor — we'll retry the same window next
       // tick. Public RPCs occasionally return 429s or transient
       // upstream errors; logging once per failure is enough.
-      console.warn('[eth-listener] poll failed, will retry next tick:', err?.shortMessage ?? err?.message ?? err);
+      logger.warn({ err: err?.shortMessage ?? err?.message ?? String(err) }, '[eth-listener] poll failed, will retry next tick');
     } finally {
       this.isPolling = false;
     }
   }
 
   /**
-   * Handle OrderCreated event from HTLCBridge contract
+   * Handle OrderCreated event from HTLCBridge contract.
+   *
+   * Emits a `NormalizedRelayEvent` via the registered handler so downstream
+   * relay logic is decoupled from raw Ethereum event shapes.
    */
   private async handleOrderCreatedEvent(
     orderId: bigint,
@@ -241,37 +264,28 @@ export class EthereumEventListener {
     event: EventLog
   ): Promise<void> {
     try {
-      console.log(`\n🚨 orderId=${orderId.toString()} NEW ETHEREUM ORDER DETECTED!`);
-      console.log('================================');
-      console.log(`🆔 orderId=${orderId.toString()} Order ID: ${orderId.toString()}`);
-      console.log(`👤 Sender: ${sender}`);
-      console.log(`💰 Token: ${token}`);
-      console.log(`💵 Amount: ${ethers.formatUnits(amount.toString(), 18)} tokens`);
-      console.log(`🔒 Hash Lock: ${hashLock}`);
-      console.log(`⏰ Timelock: ${new Date(Number(timelock) * 1000).toISOString()}`);
-      console.log(`💸 Fee Rate: ${Number(feeRate) / 100}%`);
-      console.log(`🔄 Partial Fill: ${partialFillEnabled ? 'Enabled' : 'Disabled'}`);
-      console.log(`📝 Tx Hash: ${event.transactionHash}`);
-      console.log(`🧱 Block: ${event.blockNumber}`);
+      const orderIdStr = orderId.toString();
+      logger.info({ orderId: orderIdStr, blockNumber: event.blockNumber, txHash: event.transactionHash }, '[eth-listener] OrderCreated');
 
-      // Convert Ethereum event to CrossChainOrder format
-      const crossChainOrder: CrossChainOrder = {
-        orderId: orderId.toString(),
-        ethereumOrderId: orderId.toString(),
-        token: token,
-        amount: amount.toString(),
-        hashLock: hashLock,
+      const normalizedEvent = createEthOrderCreatedEvent({
+        orderId: orderIdStr,
+        txHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        hashlock: hashLock,
         timelock: Number(timelock),
-        sender: sender,
-        partialFillEnabled: partialFillEnabled,
-        feeRate: feeRate.toString()
-      };
+        amount: amount.toString(),
+        tokenAddress: token,
+        feeRateBps: Number(feeRate),
+        partialFillEnabled,
+      });
 
-      // Process the order (create Stellar HTLC)
-      await this.processCrossChainOrder(crossChainOrder);
+      this.dispatchRelayEvent(normalizedEvent);
+
+      // v1 Stellar HTLC path is disabled — see processCrossChainOrder comment.
+      this.processCrossChainOrder({ orderId: orderIdStr, hashLock });
 
     } catch (error) {
-      console.error(`❌ orderId=${orderId.toString()} Error handling OrderCreated event:`, sanitizeForLog(error));
+      logger.error({ orderId: orderId.toString(), err: sanitizeForLog(error) }, '[eth-listener] error handling OrderCreated');
     }
   }
 
@@ -285,16 +299,9 @@ export class EthereumEventListener {
    * the user's own claim/refund handle settlement, rather than logging
    * fake success messages.
    */
-  private async processCrossChainOrder(order: CrossChainOrder): Promise<void> {
-    console.log(`🌉 orderId=${order.ethereumOrderId} OrderCreated observed on Ethereum:`, {
-      ethereumOrderId: order.ethereumOrderId,
-      hashLock: order.hashLock
-    });
-    console.log(
-      `⚠️  orderId=${order.ethereumOrderId} v1 placeholder Stellar HTLC path disabled. The v2 coordinator (Phase 4) ` +
-      'creates the Soroban HTLC. Until then the user can refund permissionlessly ' +
-      'after the timelock.'
-    );
+  private processCrossChainOrder(order: { orderId: string; hashLock: string }): void {
+    logger.info({ orderId: order.orderId, hashlock: order.hashLock }, '[eth-listener] OrderCreated observed on Ethereum');
+    logger.info('[eth-listener] v1 placeholder Stellar HTLC path disabled. The v2 coordinator (Phase 4) creates the Soroban HTLC. Until then the user can refund permissionlessly after the timelock.');
   }
 
   /**
@@ -308,8 +315,8 @@ export class EthereumEventListener {
 
     // Skip network validation in mock mode
     if (RELAYER_CONFIG.enableMockMode) {
-      console.log('🧪 Mock mode enabled - skipping network validation');
-      console.log('✅ Mock configuration validated');
+      logger.info('Mock mode enabled - skipping network validation');
+      logger.info('Mock configuration validated');
       return;
     }
 
@@ -321,7 +328,7 @@ export class EthereumEventListener {
     try {
       // Test provider connection
       const network = await this.provider!.getNetwork();
-      console.log(`🔗 Connected to Ethereum network: ${network.name} (Chain ID: ${network.chainId})`);
+      logger.info({ networkName: network.name, chainId: network.chainId.toString() }, 'Connected to Ethereum network');
 
       // Test contract deployment
       const code = await this.provider!.getCode(RELAYER_CONFIG.ethereum.contractAddress);
@@ -329,10 +336,10 @@ export class EthereumEventListener {
         throw new Error(`No contract deployed at address: ${RELAYER_CONFIG.ethereum.contractAddress}`);
       }
 
-      console.log('✅ Contract validation successful');
+      logger.info('Contract validation successful');
 
     } catch (error) {
-      console.error('❌ Configuration validation failed:', error);
+      logger.error({ err: error }, 'Configuration validation failed');
       throw error;
     }
   }

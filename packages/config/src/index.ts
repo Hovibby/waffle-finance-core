@@ -8,6 +8,9 @@ export { ZodError, z } from "zod";
 export * from "./schema.js";
 export * from "./ethereum-rpc-url.js";
 export * from "./solana-placeholder.js";
+export * from "./soroban-chain-config.js";
+export * from "./support-policy.js";
+export * from "./feature-flags.js";
 
 /**
  * Validates and loads frontend configuration.
@@ -27,6 +30,11 @@ export function loadFrontendConfig(
     infuraApiKey: rawEnv.VITE_INFURA_API_KEY,
     oneinchApiKey: rawEnv.VITE_ONEINCH_API_KEY,
     apiBaseUrl: rawEnv.VITE_API_BASE_URL ?? "http://localhost:3001",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.VITE_FEATURE_SOLANA_SIMULATION_MODE ?? false,
+      sorobanEarlySupport: rawEnv.VITE_FEATURE_SOROBAN_EARLY_SUPPORT ?? false,
+      experimentalUiRoutes: rawEnv.VITE_FEATURE_EXPERIMENTAL_UI_ROUTES ?? false,
+    },
   };
 
   return frontendConfigSchema.parse(mapped);

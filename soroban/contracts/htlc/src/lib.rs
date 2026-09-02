@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! WaffleFinance HTLC contract for Stellar (Soroban).
 //!
 //! This contract implements the Stellar side of the WaffleFinance cross-chain
@@ -85,16 +85,37 @@ use soroban_sdk::{
     Symbol,
 };
 
-pub mod migration;
-
-#[cfg(test)]
-pub mod harness;
+/// Asset class stored on each order so settlement paths, indexers, and
+/// future upgrade code can branch on asset type without re-deriving it.
+///
+/// - `Native` — the Stellar native XLM token (registered as the contract's
+///   known native token address via `set_native_token`).
+/// - `Token`  — any Soroban SAC or custom token contract.
+///
+/// Both classes settle through the same `token::Client` interface; the
+/// distinction exists for auditing, policy enforcement, and forward
+/// compatibility with future asset adapters.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssetClass {
+    Native = 0,
+    Token = 1,
+}
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
+mod harness;
+
+#[cfg(test)]
+mod governance;
+
+#[cfg(test)]
 mod prop_tests;
+
+#[cfg(test)]
+mod governance_props;
 
 /// Maximum allowed timelock duration in seconds (24 hours).
 /// Mirrors the EVM contract bound and protects users from accidentally
@@ -135,6 +156,43 @@ pub const FINALISED_ORDER_TTL_LEDGERS: u32 = 30 * LEDGERS_PER_DAY;
 // Error codes
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Contract-wide operational mode.
+///
+/// The mode governs which settlement operations are permitted at any
+/// given time. Only the admin may change the mode and every transition
+/// emits an auditable `mode` event carrying the old and new states.
+///
+/// # Permitted transitions
+///
+/// ```text
+///  Live ──────────────► Paused ──────────────► Live
+///    │                     │
+///    └────────────────► Maintenance ──────────► Live
+/// ```
+///
+/// In words:
+/// - `Live` → `Paused` (admin-initiated emergency stop)
+/// - `Paused` → `Live` (resume normal operations)
+/// - `Live` → `Maintenance` (scheduled maintenance; refunds still work)
+/// - `Maintenance` → `Live` (end maintenance window)
+///
+/// `Paused` → `Maintenance` and `Maintenance` → `Paused` are **not**
+/// allowed — the admin must return to `Live` first. This prevents
+/// cascading state transitions that could confuse the coordinator.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContractMode {
+    /// Normal operation. All settlement operations are permitted.
+    Live = 0,
+    /// Emergency stop. `create_order`, `claim_order`, and
+    /// `refund_order` are all blocked. Read-only access is preserved.
+    Paused = 1,
+    /// Scheduled maintenance. `create_order` and `claim_order` are
+    /// blocked, but `refund_order` **remains open** so users with
+    /// expiring orders are never locked out of their funds.
+    Maintenance = 2,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -169,17 +227,18 @@ pub enum Error {
     Overflow = 14,
     /// No admin transfer is pending.
     NoPendingTransfer = 15,
-    /// The on-chain schema version does not match the version this binary
-    /// expects. The contract must be migrated (or restored) before this
-    /// operation can proceed.
-    SchemaMismatch = 16,
-    /// A prerequisite migration has not been applied. Migrations must be
-    /// applied in order; you cannot jump from V0 to V2 without first
-    /// applying V0→V1.
-    MigrationPreconditionFailed = 17,
-    /// The migration target version is the same as the current version;
-    /// the migration has already been applied.
-    AlreadyMigrated = 18,
+    /// The requested operation is blocked because the contract is
+    /// paused. Read-only queries are still available.
+    ContractPaused = 16,
+    /// The requested mode transition is not in the permitted table.
+    /// See [`ContractMode`] for the allowed transition diagram.
+    InvalidModeTransition = 17,
+    /// The requested operation is blocked because the contract is in
+    /// maintenance mode.
+    ContractInMaintenance = 18,
+    /// The asset address is not a valid or supported token contract.
+    /// Rejected before any transfer occurs.
+    InvalidAsset = 19,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,14 +259,22 @@ pub enum OrderStatus {
 
 /// A single hash + time-locked order.
 ///
-/// **Schema version note**: this struct corresponds to `SchemaVersion::V1`.
-/// If fields are ever added or removed in a future version, snapshot the
-/// current layout as `OrderV1` in `migration.rs` before changing this struct,
-/// and add the appropriate `From<OrderV1>` conversion to the new layout.
+/// # Versioning
+///
+/// The `version` field is the on-chain schema marker for this order record.
+/// Readers that encounter `version == 0` are interacting with a pre-v1
+/// order (created before this field was added). Future contract upgrades
+/// that change the struct layout MUST increment `version` and handle
+/// earlier versions explicitly, keeping existing order IDs and external
+/// event consumers unaffected.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Order {
     pub id: u64,
+    /// Schema version of this order record (1 for orders created by this
+    /// contract revision). Allows future upgrades to detect and migrate
+    /// legacy records without breaking existing order IDs.
+    pub version: u32,
     /// Account that locked the funds (and paid the safety deposit).
     pub sender: Address,
     /// Account that can claim the funds by revealing the preimage.
@@ -216,6 +283,10 @@ pub struct Order {
     pub refund_address: Address,
     /// The asset locked.
     pub asset: Address,
+    /// Asset classification inferred at creation time. Stored so
+    /// settlement paths, indexers, and future upgrade code can branch
+    /// without re-deriving the class from the address.
+    pub asset_class: AssetClass,
     /// Amount of `asset` locked (in the asset's smallest unit).
     pub amount: i128,
     /// Safety deposit posted by the order creator.
@@ -251,13 +322,12 @@ pub enum DataKey {
     ResolverRegistry,
     /// Minimum safety deposit (in stroops).
     MinSafetyDeposit,
-    /// Monotonically increasing schema version. Absent on pre-versioning
-    /// deployments; treated as `SchemaVersion::V0` when missing.
-    SchemaVersion,
-    /// Locked flag set at the start of a migration batch and cleared when
-    /// the migration is finalised. Prevents concurrent re-entry or a fresh
-    /// order from being created while a migration is in progress.
-    MigrationLock,
+    /// Current operational mode. Absent means Live (backward compat).
+    ContractMode,
+    /// Address of the native XLM token contract. When set, orders whose
+    /// `asset` matches this address are classified as `AssetClass::Native`;
+    /// all others are `AssetClass::Token`.
+    NativeToken,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,6 +339,10 @@ fn topic_claimed() -> Symbol { symbol_short!("claimed") }
 fn topic_refunded() -> Symbol { symbol_short!("refunded") }
 fn topic_admin_transfer() -> Symbol { symbol_short!("adm_xfer") }
 fn topic_config() -> Symbol { symbol_short!("cfg") }
+/// Contract lifecycle mode changes: data = (old_mode, new_mode).
+/// Emitted by `set_mode` so the coordinator and audit trail can track
+/// every operational state transition.
+fn topic_mode() -> Symbol { symbol_short!("mode") }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Contract
@@ -296,104 +370,9 @@ impl HtlcContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextOrderId, &1u64);
         env.storage().instance().set(&DataKey::MinSafetyDeposit, &min_safety_deposit);
-
-        // Stamp the initial schema version so `require_current_schema` passes
-        // from the first invocation without needing a migration.
-        migration::stamp_initial_version(&env);
-
-        Self::extend_instance_ttl(&env);
-    }
-
-    // -------------------------------------------------------------------------
-    // Migration entry points
-    // -------------------------------------------------------------------------
-
-    /// Return the current on-chain schema version as a `u32`. Intended for
-    /// indexers and off-chain tooling to detect when a migration is needed.
-    pub fn schema_version(env: Env) -> u32 {
-        migration::read_schema_version(&env) as u32
-    }
-
-    /// Return a human-readable version info string:
-    /// `"schema:<N> binary:<M>"` where `N` is the on-chain schema version and
-    /// `M` is the schema version this binary was compiled against. Indexers
-    /// can compare the two to determine whether a migration is pending.
-    pub fn version_info(env: Env) -> String {
-        let on_chain = migration::read_schema_version(&env) as u32;
-        let compiled = migration::CURRENT_SCHEMA_VERSION as u32;
-        // Build a compact info string. Soroban `String` is UTF-8; we use
-        // a static prefix and append the version digits.
-        // Format: "schema:N binary:M"  (all single-digit for now; extend
-        // if versions ever exceed 9).
-        let mut buf = [0u8; 18]; // "schema:X binary:X\0" fits in 18 bytes
-        let schema_digit = b'0' + (on_chain % 10) as u8;
-        let binary_digit = b'0' + (compiled % 10) as u8;
-        // "schema:" = 7, digit = 1, " binary:" = 8, digit = 1 → 17 total
-        let prefix = b"schema:";
-        let middle = b" binary:";
-        let mut pos = 0usize;
-        for &b in prefix { buf[pos] = b; pos += 1; }
-        buf[pos] = schema_digit; pos += 1;
-        for &b in middle { buf[pos] = b; pos += 1; }
-        buf[pos] = binary_digit; pos += 1;
-        String::from_bytes(&env, &soroban_sdk::Bytes::from_slice(&env, &buf[..pos]))
-    }
-
-    /// Admin-only, batchable migration entry point.
-    ///
-    /// Migrates orders whose ids fall in `[start_order_id, end_order_id)` from
-    /// the current (old) schema to `CURRENT_SCHEMA_VERSION`. The caller must
-    /// process all order ids in batches and set `finalize = true` on the last
-    /// batch to atomically bump the schema version and emit the audit event.
-    ///
-    /// **Concurrency / re-entry guard**: the first call (with any `finalize`
-    /// value) sets a `MigrationLock` in instance storage. While the lock is
-    /// held, `create_order` panics with `Error::SchemaMismatch`. The lock is
-    /// cleared when `finalize = true` completes successfully.
-    ///
-    /// **Idempotency**: if the schema is already at `CURRENT_SCHEMA_VERSION`
-    /// this function panics with `Error::AlreadyMigrated` — it cannot silently
-    /// re-process already-migrated orders.
-    ///
-    /// Returns `(migrated_count, new_schema_version)`.
-    pub fn migrate_orders(
-        env: Env,
-        start_order_id: u64,
-        end_order_id: u64,
-        finalize: bool,
-    ) -> (u32, u32) {
-        Self::require_admin(&env);
-
-        // Guard against running on an already-current schema.
-        let current = migration::read_schema_version(&env);
-        if current >= migration::CURRENT_SCHEMA_VERSION {
-            panic_with_error!(&env, Error::AlreadyMigrated);
-        }
-
-        // Set migration lock so create_order is blocked during migration.
-        env.storage()
-            .instance()
-            .set(&DataKey::MigrationLock, &true);
-
-        let (migrated, new_version) =
-            migration::execute_migration(&env, start_order_id, end_order_id, finalize);
-
-        // Clear lock only when we commit the final version bump.
-        if finalize {
-            env.storage().instance().remove(&DataKey::MigrationLock);
-        }
-
-        Self::extend_instance_ttl(&env);
-        (migrated, new_version as u32)
-    }
-
-    /// Validate post-migration config integrity. Emits a
-    /// `("migration","cfg_chk")` event with a bitmask of missing keys.
-    /// Returns `0` on success (all keys present). Admin-only.
-    pub fn check_migration_integrity(env: Env) -> u32 {
-        Self::require_admin(&env);
-        let missing = migration::check_config_keys(&env);
-        migration::emit_config_check_event(&env, missing);
+        // Explicitly store Live so the mode is always present in storage and
+        // the coordinator can read it without any "absent = Live" inference.
+        env.storage().instance().set(&DataKey::ContractMode, &ContractMode::Live);
         Self::extend_instance_ttl(&env);
         missing
     }
@@ -491,7 +470,72 @@ impl HtlcContract {
         );
     }
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Contract lifecycle governance
+    // ---------------------------------------------------------------------
+
+    /// Transition the contract to a new operational mode.
+    ///
+    /// Only the admin may call this. The full permitted transition table is:
+    ///
+    /// - `Live` → `Paused`        (emergency stop)
+    /// - `Live` → `Maintenance`   (scheduled maintenance)
+    /// - `Paused` → `Live`        (resume from emergency stop)
+    /// - `Maintenance` → `Live`   (end maintenance window)
+    ///
+    /// Any other transition (e.g. `Paused` → `Maintenance`) panics with
+    /// [`Error::InvalidModeTransition`]. This forces the admin to return
+    /// to `Live` first, keeping the audit trail unambiguous.
+    ///
+    /// Emits `(symbol "mode") → (old_mode, new_mode)` so the coordinator
+    /// and any monitoring system can build a complete timeline of
+    /// governance actions.
+    pub fn set_mode(env: Env, new_mode: ContractMode) {
+        Self::require_admin(&env);
+        Self::require_initialised(&env);
+
+        let old_mode: ContractMode = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractMode)
+            .unwrap_or(ContractMode::Live);
+
+        // No-op if already in the requested mode — avoids spurious events.
+        if old_mode == new_mode {
+            return;
+        }
+
+        // Validate the transition.
+        let allowed = matches!(
+            (old_mode, new_mode),
+            (ContractMode::Live, ContractMode::Paused)
+                | (ContractMode::Live, ContractMode::Maintenance)
+                | (ContractMode::Paused, ContractMode::Live)
+                | (ContractMode::Maintenance, ContractMode::Live)
+        );
+        if !allowed {
+            panic_with_error!(&env, Error::InvalidModeTransition);
+        }
+
+        env.storage().instance().set(&DataKey::ContractMode, &new_mode);
+        Self::extend_instance_ttl(&env);
+
+        // Emit an auditable lifecycle event every time mode changes so
+        // the coordinator, indexers, and monitoring systems get a
+        // complete, on-chain record of governance actions.
+        env.events().publish((topic_mode(),), (old_mode, new_mode));
+    }
+
+    /// Return the current operational mode. Defaults to `Live` if the
+    /// key is absent (legacy deployments that pre-date this feature).
+    pub fn contract_mode(env: Env) -> ContractMode {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractMode)
+            .unwrap_or(ContractMode::Live)
+    }
+
+    // ---------------------------------------------------------------------
     // Core HTLC operations
     // -------------------------------------------------------------------------
 
@@ -517,7 +561,14 @@ impl HtlcContract {
         // Migration lock: refuse to create while a migration batch is running.
         Self::require_no_migration_lock(&env);
         sender.require_auth();
+        Self::require_create_claim_allowed(&env);
 
+        // Reject the HTLC contract's own address as an asset: transferring
+        // from the contract to itself would silently succeed but leave
+        // tokens stranded with no external balance change.
+        if asset == env.current_contract_address() {
+            panic_with_error!(&env, Error::InvalidAsset);
+        }
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -566,18 +617,34 @@ impl HtlcContract {
             .instance()
             .set(&DataKey::NextOrderId, &(order_id + 1));
 
-        let token_client = token::Client::new(&env, &asset);
+        // Classify the asset before any transfer so validation happens
+        // before value moves.
+        let native_token: Option<Address> = env.storage().instance().get(&DataKey::NativeToken);
+        let asset_class = match native_token.as_ref() {
+            Some(n) if n == &asset => AssetClass::Native,
+            _ => AssetClass::Token,
+        };
+
+        // Overflow-protected total: checked_add fires Error::Overflow
+        // before any token transfer, preventing locked funds being split
+        // across an overflow boundary.
         let total = amount
             .checked_add(safety_deposit)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
-        token_client.transfer(&sender, &env.current_contract_address(), &total);
+
+        // Single canonical settlement path: all asset classes route through
+        // settle_transfer so there is exactly one transfer site per direction.
+        // token::Client honours sender.require_auth().
+        Self::settle_transfer(&env, &asset, &sender, &env.current_contract_address(), total);
 
         let order = Order {
             id: order_id,
+            version: 1,
             sender: sender.clone(),
             beneficiary: beneficiary.clone(),
             refund_address: refund_address.clone(),
             asset: asset.clone(),
+            asset_class,
             amount,
             safety_deposit,
             hashlock: hashlock.clone(),
@@ -611,6 +678,7 @@ impl HtlcContract {
         // Schema gate: any attempt to deserialise an Order must be version-safe.
         migration::require_current_schema(&env);
         caller.require_auth();
+        Self::require_create_claim_allowed(&env);
 
         let mut order: Order = env
             .storage()
@@ -630,18 +698,12 @@ impl HtlcContract {
             panic_with_error!(&env, Error::InvalidPreimage);
         }
 
-        let token_client = token::Client::new(&env, &order.asset);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &order.beneficiary,
-            &order.amount,
-        );
+        // Canonical settlement: all asset classes route through settle_transfer.
+        // Locked amount goes to beneficiary.
+        Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &order.beneficiary, order.amount);
+        // Safety deposit goes to whoever submitted the claim tx.
         if order.safety_deposit > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &caller,
-                &order.safety_deposit,
-            );
+            Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &caller, order.safety_deposit);
         }
 
         order.status = OrderStatus::Claimed;
@@ -669,6 +731,7 @@ impl HtlcContract {
         // Schema gate: same rationale as claim_order.
         migration::require_current_schema(&env);
         caller.require_auth();
+        Self::require_refund_allowed(&env);
 
         let mut order: Order = env
             .storage()
@@ -683,18 +746,10 @@ impl HtlcContract {
             panic_with_error!(&env, Error::NotExpired);
         }
 
-        let token_client = token::Client::new(&env, &order.asset);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &order.refund_address,
-            &order.amount,
-        );
+        // Canonical settlement: all asset classes route through settle_transfer.
+        Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &order.refund_address, order.amount);
         if order.safety_deposit > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &caller,
-                &order.safety_deposit,
-            );
+            Self::settle_transfer(&env, &order.asset, &env.current_contract_address(), &caller, order.safety_deposit);
         }
 
         order.status = OrderStatus::Refunded;
@@ -774,7 +829,29 @@ impl HtlcContract {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
-    // -------------------------------------------------------------------------
+    /// Register the native XLM token contract address. Orders whose `asset`
+    /// matches this address are classified as `AssetClass::Native`; all
+    /// others remain `AssetClass::Token`. Pass `None` semantics by calling
+    /// `clear_native_token`.
+    pub fn set_native_token(env: Env, native: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::NativeToken, &native);
+        Self::extend_instance_ttl(&env);
+    }
+
+    /// Remove the native token binding (all future orders are classified
+    /// as `AssetClass::Token`).
+    pub fn clear_native_token(env: Env) {
+        Self::require_admin(&env);
+        env.storage().instance().remove(&DataKey::NativeToken);
+        Self::extend_instance_ttl(&env);
+    }
+
+    pub fn native_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NativeToken)
+    }
+
+    // ---------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
@@ -815,5 +892,51 @@ impl HtlcContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialised));
         admin.require_auth();
+    }
+
+    /// Block `create_order` and `claim_order` when the contract is not Live.
+    ///
+    /// Both operations move new value into or through the contract, so they
+    /// must be gated identically.  `refund_order` uses the more permissive
+    /// [`require_refund_allowed`] because returning locked funds to users
+    /// must remain possible even during a maintenance window.
+    fn require_create_claim_allowed(env: &Env) {
+        let mode: ContractMode = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractMode)
+            .unwrap_or(ContractMode::Live);
+        match mode {
+            ContractMode::Live => {}
+            ContractMode::Paused => panic_with_error!(env, Error::ContractPaused),
+            ContractMode::Maintenance => panic_with_error!(env, Error::ContractInMaintenance),
+        }
+    }
+
+    /// Block `refund_order` only when the contract is fully Paused.
+    ///
+    /// Refunds are permitted during Maintenance so users with expiring
+    /// orders can always recover their locked funds regardless of any
+    /// scheduled downtime.
+    fn require_refund_allowed(env: &Env) {
+        let mode: ContractMode = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractMode)
+            .unwrap_or(ContractMode::Live);
+        if mode == ContractMode::Paused {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Canonical single-path settlement helper.
+    ///
+    /// All token movements (create, claim, refund) route through this
+    /// function so there is exactly one transfer call site per direction.
+    /// Both `AssetClass::Native` and `AssetClass::Token` use `token::Client`
+    /// because Soroban's native XLM token contract exposes the same
+    /// SEP-41 interface as any other SAC.
+    fn settle_transfer(env: &Env, asset: &Address, from: &Address, to: &Address, amount: i128) {
+        token::Client::new(env, asset).transfer(from, to, &amount);
     }
 }

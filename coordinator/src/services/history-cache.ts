@@ -48,7 +48,7 @@ export class HistoryCache {
    * Generate cache key from request parameters
    */
   private makeCacheKey(address: string, limit: number, cursor?: string): string {
-    return `${address}:${limit}:${cursor || 'first'}`;
+    return `${address.toLowerCase()}:${limit}:${cursor || 'first'}`;
   }
 
   /**
@@ -74,10 +74,13 @@ export class HistoryCache {
    * Store result in cache
    */
   set(address: string, limit: number, cursor: string | undefined, result: OrderHistoryResult): void {
-    // Don't cache if at max size (simple eviction strategy)
+    // If cache is full, evict the oldest entry (simple LRU approximation using insertion order)
     if (this.cache.size >= this.maxSize) {
-      this.log.debug({ cacheSize: this.cache.size }, "Cache at max size, not caching new entry");
-      return;
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) {
+        this.cache.delete(oldestKey);
+        this.log.debug({ evictedKey: oldestKey }, "Evicted oldest cache entry to make room");
+      }
     }
 
     const key = this.makeCacheKey(address, limit, cursor);
@@ -98,10 +101,11 @@ export class HistoryCache {
    * Call this when new orders are created for the address.
    */
   invalidateAddress(address: string): void {
+    const normalizedAddress = address.toLowerCase();
     let deletedCount = 0;
     
     for (const [key, _] of this.cache.entries()) {
-      if (key.startsWith(`${address}:`)) {
+      if (key.startsWith(`${normalizedAddress}:`)) {
         this.cache.delete(key);
         deletedCount++;
       }

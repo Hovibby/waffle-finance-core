@@ -91,6 +91,20 @@ export interface QuoteServiceOptions {
   maxStaleTtlMs?: number;
 }
 
+function assertPositiveTtl(name: string, value: number | undefined): number {
+  const resolved = value ?? {
+    freshTtlMs: DEFAULT_FRESH_TTL_MS,
+    staleTtlMs: DEFAULT_STALE_TTL_MS,
+    maxStaleTtlMs: DEFAULT_MAX_STALE_TTL_MS,
+  }[name];
+
+  if (!Number.isFinite(resolved) || resolved <= 0) {
+    throw new RangeError(`${name} must be a positive number, got ${resolved}`);
+  }
+
+  return resolved;
+}
+
 const DEFAULT_FRESH_TTL_MS = 15_000;
 const DEFAULT_STALE_TTL_MS = 60_000;
 const DEFAULT_MAX_STALE_TTL_MS = 5 * 60_000;
@@ -130,9 +144,9 @@ export class QuoteService {
 
   constructor(log: Logger, opts: QuoteServiceOptions = {}) {
     this.log = log;
-    this.freshTtlMs = opts.freshTtlMs ?? DEFAULT_FRESH_TTL_MS;
-    this.staleTtlMs = opts.staleTtlMs ?? DEFAULT_STALE_TTL_MS;
-    this.maxStaleTtlMs = opts.maxStaleTtlMs ?? DEFAULT_MAX_STALE_TTL_MS;
+    this.freshTtlMs = assertPositiveTtl("freshTtlMs", opts.freshTtlMs);
+    this.staleTtlMs = assertPositiveTtl("staleTtlMs", opts.staleTtlMs);
+    this.maxStaleTtlMs = assertPositiveTtl("maxStaleTtlMs", opts.maxStaleTtlMs);
   }
 
   // -------------------------------------------------------------------------
@@ -150,6 +164,41 @@ export class QuoteService {
   async getQuote(pair: string): Promise<QuoteSnapshot> {
     const entry = await this._resolve(pair);
     return this._toSnapshot(entry);
+  }
+
+  /**
+   * Evict a pair from the in-memory cache, forcing the next caller to block
+   * on a fresh upstream fetch.  Safe to call from operator tooling or tests.
+   * If the pair is not cached this is a no-op.
+   */
+  invalidate(pair: string): void {
+    this.cache.delete(pair);
+    this.log.info({ pair }, "quote cache invalidated");
+  }
+
+  /**
+   * Return a snapshot of the current cache state for observability.
+   *
+   * Each entry includes the pair key, how old the cached data is, whether it
+   * is a fallback value, and its staleness classification at the moment of the
+   * call.  Useful for health-check endpoints and dashboards.
+   */
+  getCacheStats(): Record<string, { pair: string; ageMs: number; isFallback: boolean; staleness: QuoteStaleness }> {
+    const now = Date.now();
+    const stats: Record<string, { pair: string; ageMs: number; isFallback: boolean; staleness: QuoteStaleness }> = {};
+    for (const [key, entry] of this.cache) {
+      const ageMs = now - entry.fetchedAt;
+      let staleness: QuoteStaleness;
+      if (entry.isFallback) {
+        staleness = "fallback";
+      } else if (ageMs < this.freshTtlMs) {
+        staleness = "fresh";
+      } else {
+        staleness = "stale";
+      }
+      stats[key] = { pair: entry.pair, ageMs, isFallback: entry.isFallback, staleness };
+    }
+    return stats;
   }
 
   /**
