@@ -947,3 +947,226 @@ describe("Solana settlement - integration scenarios", () => {
     expect(requiredCoverage).toBeGreaterThanOrEqual(85);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8.  parseSolanaHtlcLogs — JSON parse error observability (TD-061)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("parseSolanaHtlcLogs - JSON parse error metric", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("increments listenerErrorsTotal parse_error when a log line contains malformed JSON", async () => {
+    const { listenerErrorsTotal } = await import("../src/metrics.js");
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    // Read the counter value before and after to confirm it was incremented.
+    // prom-client Counter.get() returns the current sample value.
+    const before = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    const logs = [
+      "Program log: Instruction: OrderCreated",
+      "Program log: {not: valid, json}", // malformed — must increment metric
+      'Program log: {"orderId":"OrderPDA111","hashlock":"0xabab","timelock":9999}',
+    ];
+
+    const event = parseSolanaHtlcLogs("sigA", logs, 500);
+
+    const after = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    // Counter incremented by exactly one for the single malformed line.
+    expect(after - before).toBe(1);
+
+    // Processing remains resilient — the valid line is decoded correctly.
+    expect(event).not.toBeNull();
+    expect(event?.type).toBe("created");
+  });
+
+  it("increments parse_error once per malformed line, not once per batch", async () => {
+    const { listenerErrorsTotal } = await import("../src/metrics.js");
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    const before = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    // Two malformed lines in the same batch.
+    const logs = [
+      "Program log: Instruction: OrderCreated",
+      "Program log: {bad: json, line 1}",
+      "Program log: {also: bad, json 2}",
+      'Program log: {"orderId":"OrderPDA111","hashlock":"0xabab","timelock":9999}',
+    ];
+
+    parseSolanaHtlcLogs("sigB", logs, 501);
+
+    const after = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    // One increment per malformed line — two in total.
+    expect(after - before).toBe(2);
+  });
+
+  it("does not increment parse_error when all log lines are valid", async () => {
+    const { listenerErrorsTotal } = await import("../src/metrics.js");
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    const before = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    const logs = [
+      "Program log: Instruction: OrderRefunded",
+      'Program log: {"orderId":"OrderPDA222"}',
+    ];
+
+    parseSolanaHtlcLogs("sigC", logs, 502);
+
+    const after = (await (listenerErrorsTotal as any).get()).values.find(
+      (v: any) => v.labels?.error_type === "parse_error" && v.labels?.chain === "solana",
+    )?.value ?? 0;
+
+    expect(after - before).toBe(0);
+  });
+
+  it("valid instructions after a malformed line are still processed (byte-for-byte unchanged)", async () => {
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+    const logs = [
+      "Program log: Instruction: OrderClaimed",
+      "Program log: {oops: not valid json}",
+      'Program log: {"orderId":"OrderPDA333","preimage":"0xdeadbeef"}',
+    ];
+
+    const event = parseSolanaHtlcLogs("sigD", logs, 503);
+
+    expect(event).not.toBeNull();
+    expect(event?.type).toBe("claimed");
+    if (event?.type === "claimed") {
+      expect(event.orderId).toBe("OrderPDA333");
+      expect(event.preimage).toBe("0xdeadbeef");
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9.  parseSolanaHtlcLogs — unknown instruction name (TD-062)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("parseSolanaHtlcLogs - unknown instruction name", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns null for an unrecognised instruction name", async () => {
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    // Only the instruction name is changed — everything else is a valid payload.
+    const logs = [
+      "Program log: Instruction: AdminTransfer", // unknown name
+      'Program log: {"orderId":"OrderPDA444","hashlock":"0xabcd","timelock":9999}',
+    ];
+
+    const event = parseSolanaHtlcLogs("sigE", logs, 600);
+
+    // Unknown instructions must be silently ignored: no event returned.
+    expect(event).toBeNull();
+  });
+
+  it("does not call any HTLC handler when instruction is unknown", async () => {
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    const onOrderCreated  = vi.fn();
+    const onOrderClaimed  = vi.fn();
+    const onOrderRefunded = vi.fn();
+
+    const logs = [
+      "Program log: Instruction: UnknownOpcode",
+      'Program log: {"orderId":"OrderPDA555","hashlock":"0xffff","timelock":1234}',
+    ];
+
+    const event = parseSolanaHtlcLogs("sigF", logs, 601);
+
+    // Callers check for null before dispatching, so no handler is invoked.
+    if (event !== null) {
+      switch (event.type) {
+        case "created":  onOrderCreated(event);  break;
+        case "claimed":  onOrderClaimed(event);  break;
+        case "refunded": onOrderRefunded(event); break;
+      }
+    }
+
+    expect(onOrderCreated).not.toHaveBeenCalled();
+    expect(onOrderClaimed).not.toHaveBeenCalled();
+    expect(onOrderRefunded).not.toHaveBeenCalled();
+  });
+
+  it("does not increment any event metric for an unknown instruction", async () => {
+    const { eventsTotal } = await import("../src/metrics.js");
+    const incSpy = vi.spyOn(eventsTotal, "inc");
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    const logs = [
+      "Program log: Instruction: ConfigUpdate",
+      'Program log: {"orderId":"OrderPDA666"}',
+    ];
+
+    // parseSolanaHtlcLogs itself does not touch metrics — the caller
+    // (SolanaListener.dispatch) is responsible for metric increments.
+    // Verify the function returns null so the caller never reaches the
+    // metric increment path.
+    const event = parseSolanaHtlcLogs("sigG", logs, 602);
+    expect(event).toBeNull();
+
+    // No eventsTotal increment should come from this call.
+    const eventCalls = incSpy.mock.calls.filter(
+      (c) => (c[0] as any)?.chain === "solana",
+    );
+    expect(eventCalls.length).toBe(0);
+
+    incSpy.mockRestore();
+  });
+
+  it("known instructions in the same batch are unaffected by an earlier unknown one", async () => {
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+
+    // A batch where we process two transactions independently.
+    const unknownLogs = [
+      "Program log: Instruction: FutureExtension",
+      'Program log: {"orderId":"OrderPDA777"}',
+    ];
+    const knownLogs = [
+      "Program log: Instruction: OrderRefunded",
+      'Program log: {"orderId":"OrderPDA888"}',
+    ];
+
+    const unknownEvent = parseSolanaHtlcLogs("sigH1", unknownLogs, 603);
+    const knownEvent   = parseSolanaHtlcLogs("sigH2", knownLogs,   603);
+
+    expect(unknownEvent).toBeNull();
+    expect(knownEvent).not.toBeNull();
+    expect(knownEvent?.type).toBe("refunded");
+  });
+
+  it("is independent of live Solana RPC — no network calls are made", async () => {
+    // parseSolanaHtlcLogs is a pure function that never instantiates a
+    // Connection or performs any I/O.  Confirming the Connection constructor
+    // is not called proves RPC independence.
+    const { parseSolanaHtlcLogs } = await import("../src/listeners/solana.js");
+    const connectionCtorSpy = vi.mocked(Connection);
+    const callsBefore = connectionCtorSpy.mock.calls.length;
+
+    const logs = [
+      "Program log: Instruction: WhateverUnknown",
+    ];
+    parseSolanaHtlcLogs("sigI", logs, 604);
+
+    // No new Connection instances created by the pure parser.
+    expect(connectionCtorSpy.mock.calls.length).toBe(callsBefore);
+  });
+});

@@ -241,6 +241,17 @@ export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmRes
     feeBumpCapStroops = DEFAULT_FEE_BUMP_CAP_STROOPS,
   } = args;
 
+  // ── Validate feeBumpCapStroops ─────────────────────────────────────────
+  // A cap of 0 would cause the very first fee-bump to exceed it and abort
+  // immediately. A negative cap (not possible with bigint, but guard anyway)
+  // would be nonsensical. Reject early so callers get a clear error.
+  if (feeBumpCapStroops <= 0n) {
+    throw new HorizonTerminalError(
+      `[xlm-refund] Invalid feeBumpCapStroops=${feeBumpCapStroops}: must be a positive bigint (> 0 stroops).`,
+      'invalid_fee_bump_cap'
+    );
+  }
+
   // ── Idempotency fast-path ──────────────────────────────────────────────
   if (ledger) {
     const existing = ledger.getEntry(orderId);
@@ -676,7 +687,19 @@ export function stroopsToXlmString(stroops: bigint): string {
 export function parseFallbackStroops(value: string | number): bigint {
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || value <= 0) return 0n;
-    if (value >= 1e7) return BigInt(Math.round(value));
+    if (value >= 1e7) {
+      // Guard against silent precision loss: values above Number.MAX_SAFE_INTEGER
+      // cannot be exactly represented as integers before BigInt() sees them, so
+      // Math.round() would silently produce a wrong stroop count.
+      if (!Number.isSafeInteger(Math.round(value))) {
+        throw new RangeError(
+          `[xlm-refund] parseFallbackStroops: value ${value} exceeds ` +
+          `Number.MAX_SAFE_INTEGER (${Number.MAX_SAFE_INTEGER}) and cannot be ` +
+          `converted to a precise stroop count. Pass a string instead.`
+        );
+      }
+      return BigInt(Math.round(value));
+    }
     // Treat as XLM decimal.
     return xlmStringToStroops(value.toFixed(7));
   }

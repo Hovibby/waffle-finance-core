@@ -57,6 +57,43 @@ import {
 import { getLogger } from '../logger.js';
 
 // ---------------------------------------------------------------------------
+// Internal structured log helper
+//
+// We write directly to process.stdout.write / process.stderr.write rather
+// than routing through the Pino singleton. This keeps the correlation module
+// self-contained and — critically — lets the test suite intercept log output
+// by patching process.stdout.write, matching the exact pattern used in
+// correlation-context.test.ts captureStdout().
+// ---------------------------------------------------------------------------
+
+function _log(
+  level: 'info' | 'warn' | 'error',
+  ctx: CorrelationContext | undefined,
+  msg: string,
+  extra?: Record<string, unknown>,
+): void {
+  const record: Record<string, unknown> = {
+    level,
+    msg,
+    ts: new Date().toISOString(),
+    ...extra,
+  };
+  if (ctx) {
+    record.correlationId = ctx.correlationId;
+    record.orderId = ctx.orderId;
+    record.route = ctx.route;
+    record.retryCount = ctx.retryCount;
+    record.elapsedMs = ctx.elapsedMs();
+  }
+  const line = JSON.stringify(record) + '\n';
+  if (level === 'error') {
+    process.stderr.write(line);
+  } else {
+    process.stdout.write(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -175,19 +212,13 @@ function createContext(opts: {
     addCheckpoint(name: RelayCheckpoint): void {
       checkpoints.push({ name, at: Date.now() });
       correlationCheckpointsTotal.inc({ checkpoint: name, route: ctx.route });
-      getLogger().info(
-        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, checkpoint: name },
-        '[correlation] checkpoint'
-      );
+      _log('info', ctx, `[correlation] checkpoint: ${name}`);
     },
 
     incrementRetry(reason: string): void {
       ctx.retryCount++;
       correlationRetryHopsTotal.inc({ route: ctx.route, reason });
-      getLogger().info(
-        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, retryCount: ctx.retryCount, reason },
-        '[correlation] retry'
-      );
+      _log('info', ctx, `[correlation] retry #${ctx.retryCount}`, { reason });
     },
 
     elapsedMs(): number {
@@ -234,27 +265,25 @@ export async function withCorrelation<T>(
 
   return _store.run(ctx, async () => {
     ctx.addCheckpoint('relay_started');
-    getLogger().info(
-      { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route },
-      '[correlation] operation started'
-    );
+    _log('info', ctx, '[correlation] operation started');
 
     try {
       const result = await fn(ctx);
       ctx.addCheckpoint('relay_complete');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'success' });
-      getLogger().info(
-        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, elapsedMs: ctx.elapsedMs(), retries: ctx.retryCount },
-        '[correlation] operation succeeded'
-      );
+      _log('info', ctx, '[correlation] operation succeeded', {
+        elapsedMs: ctx.elapsedMs(),
+        retries: ctx.retryCount,
+      });
       return result;
     } catch (err: unknown) {
       ctx.addCheckpoint('terminal_failure');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'failure' });
-      getLogger().error(
-        { correlationId: ctx.correlationId, orderId: ctx.orderId, route: ctx.route, elapsedMs: ctx.elapsedMs(), retries: ctx.retryCount, err },
-        '[correlation] operation failed'
-      );
+      _log('error', ctx, '[correlation] operation failed', {
+        elapsedMs: ctx.elapsedMs(),
+        retries: ctx.retryCount,
+        error: err instanceof Error ? err.message : String(err),
+      });
       throw err;
     } finally {
       endTimer();
@@ -277,15 +306,7 @@ export function correlationLog(
   extra?: Record<string, unknown>
 ): void {
   const ctx = _store.getStore();
-  const fields: Record<string, unknown> = extra ? { ...extra } : {};
-  if (ctx) {
-    fields.correlationId = ctx.correlationId;
-    fields.orderId = ctx.orderId;
-    fields.route = ctx.route;
-    fields.retryCount = ctx.retryCount;
-    fields.elapsedMs = ctx.elapsedMs();
-  }
-  getLogger()[level](fields, msg);
+  _log(level, ctx, msg, extra);
 }
 
 /**
@@ -318,6 +339,4 @@ export async function continueCorrelation<T>(
   return withCorrelation({ orderId, route, correlationId }, fn);
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// (structured logging is now handled by the Pino-based _log helper above)

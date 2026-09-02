@@ -47,13 +47,27 @@ const HISTORY_WINDOW_PATTERNS = [
   /oldest ledger/i,
 ];
 
+/**
+ * Safely converts an arbitrary thrown value to a string for pattern matching.
+ * Falls back to the constructor name when the value is not serialisable (e.g.
+ * circular references would make JSON.stringify throw and mask the original
+ * classification error).
+ */
+function safeErrorString(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    // Non-serialisable value (e.g. circular object).  Use a best-effort
+    // string that at least preserves the constructor name so callers can
+    // still see what kind of thing was thrown.
+    return Object.prototype.toString.call(err);
+  }
+}
+
 function isHistoryWindowError(err: unknown): boolean {
-  const msg =
-    err instanceof Error
-      ? err.message
-      : typeof err === "string"
-        ? err
-        : JSON.stringify(err);
+  const msg = safeErrorString(err);
   return HISTORY_WINDOW_PATTERNS.some((re) => re.test(msg));
 }
 
@@ -385,6 +399,7 @@ export class SorobanListener {
           });
           this.log.warn({ err }, "Soroban event handler threw");
           // Do NOT advance dedup on handler error — allow retry on next poll.
+          throw err;
         }
       }
     }

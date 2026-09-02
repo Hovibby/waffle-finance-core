@@ -206,6 +206,71 @@ describe("SorobanListener lifecycle", () => {
     await listener.start(noopHandlers);
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("restart clears the previous timer so only one schedule is active", async () => {
+    // Verifies the stop/start path: starting a second time must cancel the
+    // timer created by the first start so there is never more than one
+    // outstanding poll schedule after a restart.
+    const store    = new SorobanCursorStore({ storageDir: TEST_DIR });
+    const listener = new SorobanListener(BASE_CFG, 1_000, SILENT_LOG, { cursorStore: store });
+
+    const server = makeMockServer({ events: [], cursor: "0000000000000099" });
+    injectServer(listener, server);
+
+    // First start — spawns one tick which, after resolving, sets one timer.
+    await listener.start(noopHandlers);
+    await Promise.resolve(); // let the first tick complete
+    const afterFirstStart = vi.getTimerCount();
+
+    // Second start — must cancel the first timer before scheduling a new one.
+    await listener.start(noopHandlers);
+    await Promise.resolve();
+    const afterRestart = vi.getTimerCount();
+
+    // At most one timer active at any point.
+    expect(afterFirstStart).toBeLessThanOrEqual(1);
+    expect(afterRestart).toBeLessThanOrEqual(1);
+
+    // Stopping eliminates all timers.
+    listener.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stopping after restart prevents future poll callbacks", async () => {
+    const store    = new SorobanCursorStore({ storageDir: TEST_DIR });
+    const listener = new SorobanListener(BASE_CFG, 50, SILENT_LOG, { cursorStore: store });
+
+    const handlers = { onOrderCreated: vi.fn(), onOrderClaimed: vi.fn(), onOrderRefunded: vi.fn() };
+    const event    = fakeRpcEvent(createdTopics(), createdValue(), 200, "txrestartstop");
+    const server   = makeMockServer({ events: [event], cursor: "0000000000000099" });
+    injectServer(listener, server);
+
+    // start → let first tick complete → stop
+    await listener.start(handlers);
+    await Promise.resolve(); // flush microtasks so the async tick completes
+    listener.stop();
+    // No pending timers immediately after stop.
+    expect(vi.getTimerCount()).toBe(0);
+
+    const countAfterFirstStop = handlers.onOrderCreated.mock.calls.length;
+
+    // Confirm no phantom timer fires after advancing fake time.
+    vi.advanceTimersByTime(200);
+    expect(handlers.onOrderCreated.mock.calls.length).toBe(countAfterFirstStop);
+
+    // Restart → let first tick complete → stop again.
+    await listener.start(handlers);
+    await Promise.resolve();
+    listener.stop();
+    // No pending timers after second stop either.
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.advanceTimersByTime(200);
+    const countAfterSecondStop = handlers.onOrderCreated.mock.calls.length;
+
+    // At most 2 dispatches total (one per start's first tick).
+    expect(countAfterSecondStop).toBeLessThanOrEqual(2);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -281,6 +346,57 @@ describe("SorobanListener cursor persistence", () => {
     const callArg = (server.getEvents as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(callArg?.startLedger).toBe(499);
     expect(callArg?.cursor).toBeUndefined();
+    listener.stop();
+  });
+
+  it("does not advance cursor when a handler throws an error, allowing retry", async () => {
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+    store.save("test-handler-fail", "0000000000000010");
+    const server = makeMockServer({
+      events: [fakeRpcEvent(createdTopics(), createdValue())],
+      cursor: "0000000000000011",
+    });
+    // Set a very short poll interval so it retries quickly
+    const listener = new SorobanListener(BASE_CFG, 10, SILENT_LOG, {
+      cursorStore: store, cursorLabel: "test-handler-fail",
+    });
+    injectServer(listener, server);
+    
+    // Make the handler throw on the first call, succeed on the second
+    let calls = 0;
+    let firstCallTime = 0;
+    const handlers = {
+      onOrderCreated: vi.fn().mockImplementation(() => {
+        calls++;
+        if (calls === 1) {
+            firstCallTime = Date.now();
+            throw new Error("handler failed");
+        }
+      }),
+      onOrderClaimed: vi.fn(),
+      onOrderRefunded: vi.fn(),
+    };
+    
+    await listener.start(handlers);
+    
+    // Wait for the first call to fail
+    await vi.waitFor(() => {
+      expect(calls).toBeGreaterThanOrEqual(1);
+    });
+    
+    // Cursor should NOT be advanced because the handler threw
+    expect(store.load("test-handler-fail")).toBe("0000000000000010");
+    expect(listener.getCursor()).toBe("0000000000000010");
+    
+    // Wait for the second call to succeed
+    await vi.waitFor(() => {
+      expect(calls).toBeGreaterThanOrEqual(2);
+    });
+    
+    // Cursor should now be advanced
+    expect(store.load("test-handler-fail")).toBe("0000000000000011");
+    expect(listener.getCursor()).toBe("0000000000000011");
+    
     listener.stop();
   });
 });
@@ -637,6 +753,42 @@ describe("SorobanListener deduplication", () => {
     expect(handlers.onOrderCreated).toHaveBeenCalledOnce();
     listener.stop();
   });
+
+  it("same-batch dedup: duplicate suppressed, distinct event in same batch still dispatches", async () => {
+    // This fixture explicitly models provider replay / pagination overlap where
+    // the RPC returns the same event twice alongside a different event.
+    // Expected: the duplicate fires exactly once, the distinct event fires once,
+    // cursor advances to the value returned by the batch.
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+
+    const dupEvent      = fakeRpcEvent(createdTopics(),  createdValue(),  200, "txsame");
+    const distinctEvent = fakeRpcEvent(claimedTopics(),  claimedValue(),  201, "txother");
+
+    const server = makeMockServer({
+      // Two identical entries simulate a duplicated event in the same batch;
+      // the third entry is a distinct event that must still be dispatched.
+      events: [dupEvent, dupEvent, distinctEvent],
+      cursor: "0000000000000060",
+    });
+    const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, { cursorStore: store });
+    injectServer(listener, server);
+
+    const handlers = {
+      onOrderCreated:  vi.fn(),
+      onOrderClaimed:  vi.fn(),
+      onOrderRefunded: vi.fn(),
+    };
+    await listener.start(handlers);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Duplicate is suppressed — exactly one created callback.
+    expect(handlers.onOrderCreated).toHaveBeenCalledOnce();
+    // Distinct event is dispatched independently.
+    expect(handlers.onOrderClaimed).toHaveBeenCalledOnce();
+    // Cursor advanced to the value the RPC returned for this batch.
+    expect(listener.getCursor()).toBe("0000000000000060");
+    listener.stop();
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -736,6 +888,65 @@ describe("SorobanListener stale-cursor / history-window overflow", () => {
     await new Promise((r) => setTimeout(r, 50));
     // Cursor must NOT have been cleared — it's not a history-window error.
     expect(listener.getCursor()).toBe("0000000000000010");
+    listener.stop();
+  });
+
+  it("classifies a circular-reference thrown value without throwing", async () => {
+    // Build a circular object — JSON.stringify would throw on this.
+    const circular: Record<string, unknown> = {};
+    circular["self"] = circular;
+
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+    store.save("test-circular", "0000000000000001");
+
+    let callCount = 0;
+    const getEventsImpl = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Throw the circular object directly (not wrapped in Error).
+        // eslint-disable-next-line @typescript-eslint/no-throw-literal
+        throw circular;
+      }
+      return { events: [], cursor: "0000000000000999" };
+    };
+    const server = {
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 1000 }),
+      getEvents: vi.fn().mockImplementation(getEventsImpl),
+    };
+    const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
+      cursorStore: store, cursorLabel: "test-circular",
+    });
+    injectServer(listener, server);
+
+    // Must resolve without throwing — the circular object should be handled
+    // gracefully and treated as a non-history-window error (rethrown), but
+    // safeErrorString itself must not throw during classification.
+    await expect(
+      listener.start(noopHandlers).then(() => new Promise((r) => setTimeout(r, 50)))
+    ).resolves.toBeUndefined();
+
+    // Cursor must NOT have been cleared — circular object is not a
+    // history-window error, so it propagates as a normal poll failure.
+    expect(listener.getCursor()).toBe("0000000000000001");
+    listener.stop();
+  });
+
+  it("classifies a plain Error as a non-history-window error and does not clear cursor", async () => {
+    const store = new SorobanCursorStore({ storageDir: TEST_DIR });
+    store.save("test-plain-error", "0000000000000005");
+
+    const server = {
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 100 }),
+      getEvents: vi.fn().mockRejectedValue(new Error("network timeout")),
+    };
+    const listener = new SorobanListener(BASE_CFG, 60_000, SILENT_LOG, {
+      cursorStore: store, cursorLabel: "test-plain-error",
+    });
+    injectServer(listener, server);
+    await listener.start(noopHandlers);
+    await new Promise((r) => setTimeout(r, 50));
+    // Cursor must NOT be cleared — generic errors are not history-window errors.
+    expect(listener.getCursor()).toBe("0000000000000005");
     listener.stop();
   });
 

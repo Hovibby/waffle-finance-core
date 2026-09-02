@@ -128,7 +128,12 @@ export function parseSolanaHtlcLogs(
     if (jsonMatch) {
       try {
         Object.assign(payload, JSON.parse(jsonMatch[0]));
-      } catch { /* not JSON – skip */ }
+      } catch {
+        // Malformed JSON in a program log line — not a whole-batch failure.
+        // The metric is incremented here so operators can alert on repeated
+        // parse errors without them being invisible in production.
+        listenerErrorsTotal.inc({ chain: CHAIN, error_type: "parse_error" });
+      }
     }
   }
 

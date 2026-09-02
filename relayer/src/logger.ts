@@ -1,36 +1,14 @@
 /**
  * @fileoverview Structured Pino logger for the WaffleFinance relayer.
  *
- * Design mirrors the coordinator's logger.ts so that log lines from both
- * services share the same JSON schema and can be aggregated by the same
- * pipeline (e.g. CloudWatch Logs Insights, Grafana Loki).
+ * Mirrors the coordinator's logger pattern so logs from both services share
+ * the same JSON schema and can be aggregated/correlated in a single sink.
  *
- * Correlation injection
- * ---------------------
- * Every log line produced inside a `withCorrelation` scope automatically
- * carries the following fields via Pino's `mixin()` hook:
- *
- *   correlationId  — stable ID for the full relay operation
- *   orderId        — the order this relay operation serves
- *   route          — bridge direction (eth_to_xlm | xlm_to_eth | …)
- *   retryCount     — how many times this operation has been retried
- *
- * Outside a correlation scope (e.g. startup, background timers) those
- * fields are simply omitted — no sentinel values, no noise.
- *
- * Structured fields schema
- * ------------------------
- * Critical paths MUST log the following fields as top-level JSON keys,
- * NOT as string interpolation, so they are indexable:
- *
- *   orderId        string   — coordinator-assigned order identifier
- *   orderHash      string   — on-chain hash of the order
- *   chain          string   — "ethereum" | "stellar" | "solana"
- *   direction      string   — "eth_to_xlm" | "xlm_to_eth" | …
- *   requestId      string   — correlates relayer logs with coordinator logs
- *   txHash         string   — on-chain transaction hash
- *   amount         string   — always a string (bigint-safe)
- *   elapsedMs      number   — operation duration
+ * Structured fields included on every line:
+ *   - service:    always "wafflefinance-relayer"
+ *   - requestId:  injected from AsyncLocalStorage (coordinator correlation)
+ *   - correlationId / orderId / route: injected from the relay correlation
+ *     context when present (see correlation-context.ts)
  *
  * Usage
  * -----
@@ -39,86 +17,68 @@
  *
  * const logger = getLogger();
  *
- * // Plain log
- * logger.info('relay started');
+ * // Plain message
+ * logger.info('Relayer started');
  *
- * // Structured fields (preferred — indexable by log aggregators)
- * logger.info({ orderId, txHash, chain: 'ethereum' }, 'ETH transaction confirmed');
+ * // Structured fields first, message second (Pino convention)
+ * logger.info({ orderId, orderHash, chain: 'ethereum' }, 'Escrow created');
+ * logger.warn({ orderId, direction }, 'Route rejected');
+ * logger.error({ orderId, err }, 'Settlement failed');
+ * ```
  *
- * // Child logger scoped to a subsystem
- * const log = getLogger().child({ service: 'refund-watchdog' });
- * log.warn({ orderId, ageSecs }, 'order stale — attempting refund');
+ * Child loggers
+ * -------------
+ * Bind a sub-component name so every line carries the component label:
+ * ```ts
+ * const log = getLogger().child({ component: 'pricing-service' });
+ * log.info({ xlmUsdPrice, ethUsdPrice }, 'Prices refreshed from CoinGecko');
  * ```
  */
 
 import pino, { type Logger } from 'pino';
-import { getCorrelation } from './correlation/correlation-context.js';
+import { getRequestId } from './request-context.js';
+import { correlationFields } from './correlation/correlation-context.js';
 
 let cached: Logger | null = null;
 
 /**
- * Return (or create) the process-wide Pino logger for the relayer.
+ * Return the singleton Pino logger, creating it on first call.
  *
- * The singleton is initialised on first call and re-used on every
- * subsequent call, so it is safe to import and call `getLogger()` at
- * module scope in any file — no circular-init risk.
- *
- * @param level  Log level override.  Reads LOG_LEVEL env var when omitted;
- *               falls back to "info" in production and "debug" in development.
+ * @param level  Log level (defaults to the LOG_LEVEL env var or 'info').
  */
-export function getLogger(level?: string): Logger {
+export function getLogger(level: string = process.env.LOG_LEVEL ?? 'info'): Logger {
   if (!cached) {
-    const resolvedLevel =
-      level ??
-      process.env.LOG_LEVEL ??
-      (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
-
     cached = pino({
-      level: resolvedLevel,
+      level,
       base: { service: 'wafflefinance-relayer' },
-      // Inject the active correlation context into every log line at
-      // write time.  Because `withCorrelation` wraps each relay
-      // operation in an AsyncLocalStorage context, this picks up the
-      // correct IDs even for log calls deep inside service methods —
-      // identical to the coordinator's requestId injection pattern.
+      // Inject active request/correlation IDs at write time so they appear on
+      // every log line without callers having to pass them explicitly.
+      // AsyncLocalStorage guarantees the correct IDs are picked up even deep
+      // inside service and repository methods.
       mixin() {
-        const ctx = getCorrelation();
-        if (!ctx) return {};
-        return {
-          correlationId: ctx.correlationId,
-          orderId: ctx.orderId,
-          route: ctx.route,
-          retryCount: ctx.retryCount,
-        };
+        const fields: Record<string, unknown> = {};
+
+        // Coordinator request ID (for HTTP-originated operations)
+        const requestId = getRequestId();
+        if (requestId) fields.requestId = requestId;
+
+        // Relay correlation fields (orderId, correlationId, route, retryCount)
+        const corr = correlationFields();
+        if (corr.correlationId) Object.assign(fields, corr);
+
+        return fields;
       },
-      // Redact secrets that might accidentally appear in log fields.
-      // The sanitizeForLog() utility handles Error objects; this covers
-      // any raw field value that slips through as a plain string.
-      redact: {
-        paths: ['privateKey', 'secretKey', 'relayerSecret', 'secret', 'preimage'],
-        censor: '[REDACTED]',
-      },
-      // Serializer for Error objects — includes message + stack without
-      // leaking the raw private-key patterns that sanitizeForLog strips.
-      serializers: {
-        err: pino.stdSerializers.err,
-        error: pino.stdSerializers.err,
-      },
-      // ISO timestamp so log lines are human-readable without a parser.
-      timestamp: pino.stdTimeFunctions.isoTime,
     });
   }
   return cached;
 }
 
 /**
- * Reset the cached logger instance.
- *
- * Only intended for use in tests that need a fresh logger with a
- * different level or destination.  Not safe to call in production.
+ * Reset the cached logger. Only used in tests to re-create with a different
+ * level without restarting the process.
  *
  * @internal
  */
-export function _resetLogger(): void {
+export function _resetLoggerCache(): void {
   cached = null;
 }

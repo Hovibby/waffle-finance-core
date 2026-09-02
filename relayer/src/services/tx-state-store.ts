@@ -641,6 +641,19 @@ export class TxStateStore {
           typeof persisted.state === 'string' &&
           !this.records.has(persisted.orderId)
         ) {
+          // Validate block number fields: must be nonnegative finite integers when present.
+          if (!_isValidBlockNumber(persisted.minedBlock)) {
+            process.stderr.write(
+              JSON.stringify({
+                level: 'warn',
+                msg: '[tx-state] rejecting persisted record with invalid minedBlock',
+                orderId: persisted.orderId,
+                minedBlock: persisted.minedBlock,
+              }) + '\n',
+            );
+            continue;
+          }
+
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           const { savedAt: _savedAt, ...record } = persisted;
           this.records.set(record.orderId, record as TxStateRecord);
@@ -648,6 +661,25 @@ export class TxStateStore {
       } catch { /* corrupted file — skip */ }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true if `value` is a valid persisted block number:
+ * undefined/absent (field not yet set), OR a finite nonnegative safe integer.
+ * Rejects negative numbers, fractional numbers, NaN, and Infinity.
+ */
+function _isValidBlockNumber(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= 0
+  );
 }
 
 // ---------------------------------------------------------------------------
