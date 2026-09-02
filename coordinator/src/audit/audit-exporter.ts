@@ -193,7 +193,7 @@ export class AuditExporter {
   async validateOrderSequences(
     orderIds: string[],
   ): Promise<{ orderId: string; issue: string }[]> {
-    const TERMINAL = new Set(['completed', 'refunded', 'failed']);
+    const TERMINAL = new Set(['completed', 'refunded', 'failed', 'expired']);
     const discrepancies: { orderId: string; issue: string }[] = [];
 
     for (const orderId of orderIds) {
@@ -224,7 +224,27 @@ export class AuditExporter {
           continue;
         }
 
-        if (!payload || !payload.toStatus) continue;
+        // Guard: payload must be a non-null object with a string toStatus
+        if (!payload || typeof payload.toStatus !== 'string') {
+          discrepancies.push({
+            orderId,
+            issue: `Entry id=${entry.id} is malformed: missing or invalid toStatus`,
+          });
+          continue;
+        }
+
+        // Guard: if fromStatus is present it must be a string or null/undefined
+        if (
+          payload.fromStatus !== null &&
+          payload.fromStatus !== undefined &&
+          typeof payload.fromStatus !== 'string'
+        ) {
+          discrepancies.push({
+            orderId,
+            issue: `Entry id=${entry.id} is malformed: invalid fromStatus type`,
+          });
+          continue;
+        }
 
         // Check: first entry must be announced
         if (lastStatus === null && payload.toStatus !== 'announced') {
