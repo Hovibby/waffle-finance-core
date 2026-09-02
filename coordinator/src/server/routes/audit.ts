@@ -29,7 +29,8 @@ import { Router, type Request, type Response } from "express";
 import type { Logger } from "pino";
 import type { AuditRepository } from "../../audit/audit-repo.js";
 import type { AuditExporter } from "../../audit/audit-exporter.js";
-import type { AuditEventType } from "../../audit/audit-log.js";
+import { AUDIT_EVENT_TYPES, type AuditEventType } from "../../audit/audit-log.js";
+import { validationError } from "../errors.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -81,10 +82,32 @@ function parsePositiveIntParam(val: unknown, paramName: string, defaultVal: numb
   return n;
 }
 
-function parseEventTypes(val: unknown): AuditEventType[] | undefined {
+/**
+ * Parse a nonnegative integer query param (cursors, timestamps). Returns
+ * `null` if the value is present but negative, so the caller can respond
+ * with a 400 rather than silently passing it through to the repository.
+ */
+function parseNonNegativeIntParam(val: unknown, defaultVal: number): number | null {
+  const n = parseIntParam(val, defaultVal);
+  return n < 0 ? null : n;
+}
+
+/** Set of all known audit event types, used to validate untrusted query input at runtime. */
+const AUDIT_EVENT_TYPE_SET = new Set<string>(AUDIT_EVENT_TYPES);
+
+/**
+ * Parse a comma-separated `eventTypes` query param, validating each entry
+ * against the known event taxonomy. Returns `null` if any entry is not a
+ * recognized event type, so the caller can respond with a 400.
+ */
+function parseEventTypes(val: unknown): AuditEventType[] | undefined | null {
   if (!val || typeof val !== 'string') return undefined;
   const parts = val.split(',').map((s) => s.trim()).filter(Boolean);
-  return parts.length > 0 ? (parts as AuditEventType[]) : undefined;
+  if (parts.length === 0) return undefined;
+  for (const part of parts) {
+    if (!AUDIT_EVENT_TYPE_SET.has(part)) return null;
+  }
+  return parts as AuditEventType[];
 }
 
 // ─── Route factory ────────────────────────────────────────────────────────────
@@ -112,10 +135,34 @@ export function auditRoutes(
       const until = req.query['until'] !== undefined
         ? parseIntParam(req.query['until'], 'until', 0)
         : undefined;
+
+      if (afterId === null || since === null || until === null) {
+        res.status(400).json(validationError(
+          [{ message: 'afterId, since, and until must be nonnegative' }],
+          'Cursor and timestamp parameters must be nonnegative',
+        ));
+        return;
+      }
+
+      if (since !== undefined && until !== undefined && since > until) {
+        res.status(400).json(validationError(
+          [{ message: 'since must not be later than until' }],
+          'Invalid time range: since must not be later than until',
+        ));
+        return;
+      }
+
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
       const eventTypes = parseEventTypes(req.query['eventTypes']);
+      if (eventTypes === null) {
+        res.status(400).json(validationError(
+          [{ message: 'eventTypes contains an unrecognized event type' }],
+          'Unknown event type in eventTypes filter',
+        ));
+        return;
+      }
       const includeCount = req.query['count'] === 'true';
 
       const page = await repo.query({
@@ -239,6 +286,23 @@ export function auditRoutes(
       const until = req.query['until'] !== undefined
         ? parseIntParam(req.query['until'], 'until', 0)
         : undefined;
+
+      if (afterId === null || since === null || until === null) {
+        res.status(400).json(validationError(
+          [{ message: 'afterId, since, and until must be nonnegative' }],
+          'Cursor and timestamp parameters must be nonnegative',
+        ));
+        return;
+      }
+
+      if (since !== undefined && until !== undefined && since > until) {
+        res.status(400).json(validationError(
+          [{ message: 'since must not be later than until' }],
+          'Invalid time range: since must not be later than until',
+        ));
+        return;
+      }
+
       const orderId = typeof req.query['orderId'] === 'string'
         ? req.query['orderId']
         : undefined;
