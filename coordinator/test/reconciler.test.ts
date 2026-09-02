@@ -381,3 +381,74 @@ describe("Reconciler — Soroban event replay", () => {
     expect(updated?.status).toBe("announced");
   });
 });
+
+// ── #576: unsafe numeric conversion guard ─────────────────────────────────────
+
+describe("Reconciler — #576: unsafe integer guard", () => {
+  it("skips an ETH OrderCreated event with an unsafe block number and does not mutate order state", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders);
+
+    const reconciler = new Reconciler(BASE_CFG, orders, log);
+
+    const { createPublicClient } = await import("viem");
+    const mockClient = (createPublicClient as MockedFunction<any>).mock.results.at(-1)?.value;
+
+    // blockNumber larger than Number.MAX_SAFE_INTEGER — would be silently rounded otherwise
+    const UNSAFE_BLOCK = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    mockClient.getLogs.mockImplementation(async ({ event }: any) => {
+      if (event?.name === "OrderCreated") {
+        return [
+          {
+            args: { orderId: 1n, hashlock: HASHLOCK, timelock: 9999n },
+            transactionHash: "0xdeadbeef",
+            blockNumber: UNSAFE_BLOCK,
+          },
+        ];
+      }
+      return [];
+    });
+
+    await reconciler.run();
+
+    // Run must succeed (no throw)
+    expect(reconciler.getStatus().lastRunOk).toBe(true);
+    // Order must NOT have been advanced — unsafe block was rejected
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+    expect(updated?.srcOrderId).toBeNull();
+    // No events replayed
+    expect(reconciler.getStatus().eventsReplayed).toBe(0);
+  });
+
+  it("skips an ETH OrderCreated event with an unsafe timelock and does not mutate order state", async () => {
+    const orders = await freshOrders();
+    const order = await seedOrder(orders);
+
+    const reconciler = new Reconciler(BASE_CFG, orders, log);
+
+    const { createPublicClient } = await import("viem");
+    const mockClient = (createPublicClient as MockedFunction<any>).mock.results.at(-1)?.value;
+
+    const UNSAFE_TIMELOCK = BigInt(Number.MAX_SAFE_INTEGER) + 100n;
+    mockClient.getLogs.mockImplementation(async ({ event }: any) => {
+      if (event?.name === "OrderCreated") {
+        return [
+          {
+            args: { orderId: 1n, hashlock: HASHLOCK, timelock: UNSAFE_TIMELOCK },
+            transactionHash: "0xdeadbeef",
+            blockNumber: 100n,
+          },
+        ];
+      }
+      return [];
+    });
+
+    await reconciler.run();
+
+    expect(reconciler.getStatus().lastRunOk).toBe(true);
+    const updated = await orders.get(order.publicId);
+    expect(updated?.status).toBe("announced");
+    expect(reconciler.getStatus().eventsReplayed).toBe(0);
+  });
+});

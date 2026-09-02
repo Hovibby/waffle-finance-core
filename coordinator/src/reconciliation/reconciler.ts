@@ -63,6 +63,47 @@ export interface ReconciliationStatus {
   eventsReplayed: number;
 }
 
+/**
+ * Structured error recorded when a numeric field (block number, timelock, etc.)
+ * exceeds the safe JS integer range and cannot be safely converted.
+ */
+export interface ReconciliationNumericError {
+  code: "UNSAFE_INTEGER";
+  chain: "ethereum" | "stellar" | "solana";
+  field: string;
+  rawValue: unknown;
+  context: string;
+}
+
+/**
+ * Convert a bigint or number to a JS safe integer.
+ *
+ * Returns `null` and emits a structured error when the value is outside the
+ * `Number.MAX_SAFE_INTEGER` range, preventing silent precision loss that would
+ * corrupt block-cursor or timelock comparisons.
+ */
+function safeToNumber(
+  value: bigint | number | undefined | null,
+  field: string,
+  context: string,
+  chain: "ethereum" | "stellar" | "solana",
+  onError: (err: ReconciliationNumericError) => void
+): number | null {
+  if (value == null) return null;
+  const n = typeof value === "bigint" ? Number(value) : value;
+  if (!Number.isFinite(n) || !Number.isSafeInteger(n)) {
+    onError({
+      code: "UNSAFE_INTEGER",
+      chain,
+      field,
+      rawValue: value,
+      context,
+    });
+    return null;
+  }
+  return n;
+}
+
 export class Reconciler {
   private readonly log: Logger;
   private readonly ethClient: PublicClient;
@@ -285,7 +326,18 @@ export class Reconciler {
           continue;
         }
 
-        const blockNum = Number(log.blockNumber ?? 0n);
+        const blockNum = safeToNumber(
+          log.blockNumber ?? 0n,
+          "blockNumber",
+          `ETH OrderCreated hashlock=${args.hashlock}`,
+          "ethereum",
+          (e) => this.log.warn(e, "reconciler: unsafe block number — skipping ETH OrderCreated")
+        );
+        if (blockNum === null) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "unsafe_integer" });
+          continue;
+        }
+
         if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
@@ -294,7 +346,7 @@ export class Reconciler {
         const decision = decideDispatch({
           path: "replay",
           mutation: "src_lock",
-          incomingSequence: Number(log.blockNumber ?? 0n),
+          incomingSequence: blockNum,
           existingSequence: order.srcLockBlock ?? null,
           alreadyApplied: order.srcOrderId !== null,
         });
@@ -316,12 +368,24 @@ export class Reconciler {
           continue;
         }
 
+        const timelockNum = safeToNumber(
+          args.timelock,
+          "timelock",
+          `ETH OrderCreated hashlock=${args.hashlock}`,
+          "ethereum",
+          (e) => this.log.warn(e, "reconciler: unsafe timelock — skipping ETH OrderCreated")
+        );
+        if (timelockNum === null) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "unsafe_integer" });
+          continue;
+        }
+
         await this.orders.recordSrcLock({
           publicId: order.publicId,
           orderId: args.orderId.toString(),
           txHash: log.transactionHash ?? "0x",
           blockNumber: blockNum,
-          timelock: Number(args.timelock)
+          timelock: timelockNum,
         });
         await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
         n++;
@@ -330,8 +394,14 @@ export class Reconciler {
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
-          const blockNum = Number(log.blockNumber ?? 0n);
-          if (args?.hashlock) {
+          const blockNum = safeToNumber(
+            log.blockNumber ?? 0n,
+            "blockNumber",
+            `ETH OrderCreated catch hashlock=${args?.hashlock}`,
+            "ethereum",
+            () => {}
+          );
+          if (blockNum !== null && args?.hashlock) {
             const order = await this.orders.findByHashlock(args.hashlock);
             if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
           }
@@ -355,7 +425,18 @@ export class Reconciler {
           continue;
         }
 
-        const blockNum = Number(log.blockNumber ?? 0n);
+        const blockNum = safeToNumber(
+          log.blockNumber ?? 0n,
+          "blockNumber",
+          `ETH OrderClaimed orderId=${args.orderId}`,
+          "ethereum",
+          (e) => this.log.warn(e, "reconciler: unsafe block number — skipping ETH OrderClaimed")
+        );
+        if (blockNum === null) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "unsafe_integer" });
+          continue;
+        }
+
         if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
@@ -395,11 +476,13 @@ export class Reconciler {
       } catch (err: any) {
         if (err?.message?.includes("cannot record") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
-          const blockNum = Number(log.blockNumber ?? 0n);
-          const order = args?.orderId
-            ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
-            : null;
-          if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
+          const blockNum = safeToNumber(log.blockNumber ?? 0n, "blockNumber", "ETH OrderClaimed catch", "ethereum", () => {});
+          if (blockNum !== null) {
+            const order = args?.orderId
+              ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
+              : null;
+            if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
+          }
           continue;
         }
         this.log.warn({ err }, "reconciler: ETH claimed replay error");
@@ -420,7 +503,18 @@ export class Reconciler {
           continue;
         }
 
-        const blockNum = Number(log.blockNumber ?? 0n);
+        const blockNum = safeToNumber(
+          log.blockNumber ?? 0n,
+          "blockNumber",
+          `ETH OrderRefunded orderId=${args.orderId}`,
+          "ethereum",
+          (e) => this.log.warn(e, "reconciler: unsafe block number — skipping ETH OrderRefunded")
+        );
+        if (blockNum === null) {
+          reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "unsafe_integer" });
+          continue;
+        }
+
         if (isEventBehindOrderCursor(order.lastEthBlock, blockNum)) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "cursor_already_processed" });
           continue;
@@ -457,11 +551,13 @@ export class Reconciler {
       } catch (err: any) {
         if (err?.message?.includes("cannot transition") || err?.message?.includes("terminal")) {
           reconciliationEventsSkipped.inc({ chain: "ethereum", reason: "already_applied" });
-          const blockNum = Number(log.blockNumber ?? 0n);
-          const order = args?.orderId
-            ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
-            : null;
-          if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
+          const blockNum = safeToNumber(log.blockNumber ?? 0n, "blockNumber", "ETH OrderRefunded catch", "ethereum", () => {});
+          if (blockNum !== null) {
+            const order = args?.orderId
+              ? await this.orders.findBySrcOrderId("ethereum", args.orderId.toString())
+              : null;
+            if (order) await this.advanceOrderCursor(order.publicId, "ethereum", blockNum);
+          }
           continue;
         }
         this.log.warn({ err }, "reconciler: ETH refunded replay error");

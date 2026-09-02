@@ -108,6 +108,42 @@ export const TESTNET_ESCROW_FACTORY_ABI = [
   'event EscrowRefunded(uint256 indexed escrowId, address indexed refundee, uint256 amount, uint256 safetyDeposit)',
 ] as const;
 
+/**
+ * Resolver registry ABI for authorization checks and updates.
+ */
+export const RESOLVER_REGISTRY_ABI = [
+  'function authorizeResolver(address resolver) external',
+  'function authorizedResolvers(address resolver) external view returns (bool)',
+  'function isResolverAuthorized(address resolver) external view returns (bool)',
+] as const;
+
+// ---------------------------------------------------------------------------
+// Network Adapter Interface
+// ---------------------------------------------------------------------------
+
+export interface NetworkAdapter {
+  getMode(): NetworkMode;
+  getChainId(): number;
+  getEscrowFactoryAddress(): string;
+  getHtlcBridgeAddress(): string;
+  getStellarPassphrase(): string;
+  getStellarHorizonUrl(): string;
+  getEscrowFactoryABI(): typeof MAINNET_ESCROW_FACTORY_ABI | typeof TESTNET_ESCROW_FACTORY_ABI;
+}
+
+export function createNetworkAdapter(mode: NetworkMode = 'testnet'): NetworkAdapter {
+  const config = NETWORK_CONFIG[mode];
+  return {
+    getMode: () => mode,
+    getChainId: () => config.ethereum.chainId,
+    getEscrowFactoryAddress: () => config.ethereum.escrowFactory,
+    getHtlcBridgeAddress: () => config.ethereum.htlcBridge,
+    getStellarPassphrase: () => config.stellar.networkPassphrase,
+    getStellarHorizonUrl: () => config.stellar.horizonUrl,
+    getEscrowFactoryABI: () => getEscrowFactoryABI(mode === 'mainnet'),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------

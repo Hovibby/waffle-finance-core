@@ -129,6 +129,15 @@ export class AuditRepository {
    * This is the only write path — entries are never updated or deleted.
    */
   async append(input: AuditEntryInput): Promise<number> {
+    // Validate that payloadJson is parseable JSON before hitting the database.
+    // Malformed JSON stored in the audit table would cause downstream export
+    // and replay code to fail far from the original write.
+    try {
+      JSON.parse(input.payloadJson);
+    } catch {
+      throw new SyntaxError(`AuditRepository.append: payloadJson is not valid JSON: ${input.payloadJson}`);
+    }
+
     const result = await stmtRun(this.insertStmt, {
       schemaVersion: AUDIT_SCHEMA_VERSION,
       eventType: input.eventType,
@@ -182,6 +191,9 @@ export class AuditRepository {
    * stable even if new entries are appended while a consumer is paginating.
    */
   async query(opts: AuditQueryOptions = {}): Promise<AuditPage> {
+    if (opts.limit !== undefined && opts.limit <= 0) {
+      throw new RangeError(`AuditRepository.query: limit must be a positive integer, got ${opts.limit}`);
+    }
     const limit = Math.min(opts.limit ?? 100, 1000);
     const fetchLimit = limit + 1; // fetch one extra to detect hasMore
 
