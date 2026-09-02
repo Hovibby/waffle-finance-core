@@ -1,10 +1,46 @@
-import { useCallback, useEffect, useState } from 'react';
+/**
+ * useEthereumWallet — wagmi v2 implementation (issue #470)
+ *
+ * Replaces the previous raw window.ethereum approach with wagmi v2 hooks:
+ *   - useAccount        → address, connection status, connector
+ *   - useConnect        → trigger wallet connect modal / injected connector
+ *   - useDisconnect     → clean wallet disconnect
+ *   - useSwitchChain    → programmatic chain switching (wallet_switchEthereumChain)
+ *   - useChainId        → currently active chain ID
+ *
+ * The public API surface is kept intentionally compatible with the old hook so
+ * call-sites in App.tsx and BridgeFormContainer.tsx require minimal changes:
+ *   { isConnected, address, chainId, isLoading, error, errorCode, hint,
+ *     phase, lastTransitionAt, isInstalled, connect, disconnect }
+ *
+ * Error codes are preserved verbatim so existing tests and UI error paths
+ * continue to work without modification.
+ */
 
-export type ConnectionPhase = 'idle' | 'checking' | 'requesting_permission' | 'connected' | 'error';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  useAccount,
+  useConnect,
+  useDisconnect,
+  useSwitchChain,
+  useChainId,
+  useConnectors,
+} from 'wagmi';
+import { mainnet, sepolia } from 'wagmi/chains';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export type ConnectionPhase =
+  | 'idle'
+  | 'checking'
+  | 'requesting_permission'
+  | 'connected'
+  | 'error';
 
 export interface EthereumWalletState {
   isConnected: boolean;
   address: string | null;
+  /** Active chain ID as a lowercase hex string e.g. "0xaa36a7", or null. */
   chainId: string | null;
   isLoading: boolean;
   error: string | null;
@@ -12,176 +48,218 @@ export interface EthereumWalletState {
   hint: string | null;
   phase: ConnectionPhase;
   lastTransitionAt: number | null;
+  /** True when at least one EIP-1193 injected provider (MetaMask) is detected. */
   isInstalled: boolean;
 }
 
-const INITIAL_STATE: EthereumWalletState = {
-  isConnected: false,
-  address: null,
-  chainId: null,
-  isLoading: false,
-  error: null,
-  errorCode: null,
-  hint: null,
-  phase: 'idle',
-  lastTransitionAt: null,
-  isInstalled: false,
+// ── Expected chain IDs per app network mode ───────────────────────────────────
+
+const EXPECTED_CHAIN_IDS: Record<string, number[]> = {
+  testnet: [sepolia.id],   // 11155111
+  mainnet: [mainnet.id],   // 1
 };
 
-function transition(prev: EthereumWalletState, patch: Partial<EthereumWalletState>): EthereumWalletState {
-  return {
-    ...prev,
-    ...patch,
-    lastTransitionAt: Date.now(),
-    phase: patch.phase ?? prev.phase,
-  };
+/** Convert a wagmi numeric chain ID to the canonical lowercase hex string. */
+function toHexChainId(id: number): string {
+  return `0x${id.toString(16)}`;
 }
 
+// ── Hook ──────────────────────────────────────────────────────────────────────
+
 export function useEthereumWallet() {
-  const [state, setState] = useState<EthereumWalletState>(INITIAL_STATE);
+  // ── wagmi v2 primitives ─────────────────────────────────────────────────
+  const { address, isConnected, isConnecting, isReconnecting } = useAccount();
+  const { connect, isPending: connectPending, error: connectError } = useConnect();
+  const { disconnect: wagmiDisconnect } = useDisconnect();
+  const { switchChain, isPending: switchPending, error: switchError } = useSwitchChain();
+  const activeChainId = useChainId();
+  const connectors = useConnectors();
 
-  const setError = useCallback((code: string, message: string, hint?: string) => {
-    setState((prev) =>
-      transition(prev, {
-        error: message,
-        errorCode: code,
-        hint: hint ?? prev.hint,
-        phase: 'error',
-        isLoading: false,
-      })
-    );
-  }, []);
+  // ── Derived state ───────────────────────────────────────────────────────
+  const hexChainId = activeChainId ? toHexChainId(activeChainId) : null;
 
+  /** True when an injected EIP-1193 provider (MetaMask) is registered with wagmi. */
+  const isInstalled = useMemo(
+    () => connectors.some((c) => c.type === 'injected'),
+    [connectors],
+  );
+
+  // ── Local error / hint state ────────────────────────────────────────────
+  // wagmi surfaces raw connector errors; we translate them into the
+  // structured error codes the rest of the app already understands.
+  const [localError, setLocalError] = useState<{
+    message: string;
+    code: string;
+    hint: string;
+  } | null>(null);
+
+  // Clear local error whenever the account connects successfully.
   useEffect(() => {
-    const provider = typeof window !== 'undefined' ? window.ethereum : undefined;
-    const installed = !!provider;
-    setState((prev) => transition(prev, { isInstalled: installed, phase: installed ? 'checking' : 'idle' }));
-
-    if (!provider) {
-      setError(
-        'metamask_unavailable',
-        'MetaMask not found.',
-        'Install MetaMask from metamask.io and reload the page.'
-      );
-      return;
+    if (isConnected) {
+      setLocalError(null);
     }
+  }, [isConnected]);
 
-    const check = async () => {
-      try {
-        const accounts = await provider.request({ method: 'eth_accounts' });
-        const chainId = await provider.request({ method: 'eth_chainId' }).catch(() => null);
-        if (accounts.length > 0) {
-          setState((prev) =>
-            transition(prev, {
-              isConnected: true,
-              address: accounts[0],
-              chainId: chainId as string | null,
-              error: null,
-              errorCode: null,
-              hint: null,
-              phase: 'connected',
-            })
-          );
-        } else {
-          setState((prev) => transition(prev, { phase: 'idle' }));
-        }
-      } catch (err) {
-        setError(
-          'ethereum_check_failed',
-          err instanceof Error ? err.message : 'Failed to check MetaMask state',
-          'Refresh the page. If accounts are locked, unlock MetaMask and try again.'
-        );
-      }
-    };
+  // Translate wagmi connect errors into structured codes.
+  useEffect(() => {
+    if (!connectError) return;
 
-    check();
+    const msg = connectError.message ?? '';
+    const code = (connectError as any).code ?? 0;
 
-    const handleAccountsChanged = (accounts: string[]) => {
-      setState((prev) => {
-        if (accounts.length === 0) {
-          return transition(prev, { isConnected: false, address: null, phase: 'idle' });
-        }
-        return transition(prev, {
-          isConnected: true,
-          address: accounts[0],
-          error: null,
-          errorCode: null,
-          hint: null,
-          phase: 'connected',
-        });
+    if (code === -32002 || msg.includes('already pending')) {
+      setLocalError({
+        code: 'wallet_locked',
+        message: 'MetaMask is locked. Please unlock it and try again.',
+        hint: 'Open MetaMask, enter your password to unlock, then retry.',
       });
-    };
+    } else if (code === 4001 || msg.toLowerCase().includes('rejected')) {
+      setLocalError({
+        code: 'metamask_connect_failed',
+        message: connectError.message ?? 'MetaMask connection failed',
+        hint: 'You rejected the connection request in MetaMask.',
+      });
+    } else if (msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('no provider')) {
+      setLocalError({
+        code: 'metamask_unavailable',
+        message: 'MetaMask not found.',
+        hint: 'Install MetaMask from metamask.io and reload the page.',
+      });
+    } else {
+      setLocalError({
+        code: 'metamask_connect_failed',
+        message: connectError.message ?? 'MetaMask connection failed',
+        hint: 'Check the MetaMask popup and try again.',
+      });
+    }
+  }, [connectError]);
 
-    const handleChainChanged = (chainId: string) => {
-      setState((prev) =>
-        transition(prev, {
-          chainId,
-          error: null,
-          errorCode: null,
-          hint: null,
-          phase: prev.isConnected ? 'connected' : prev.phase,
-        })
+  // Translate wagmi switch-chain errors.
+  useEffect(() => {
+    if (!switchError) return;
+    const code = (switchError as any).code ?? 0;
+    if (code === 4001 || switchError.message?.toLowerCase().includes('rejected')) {
+      setLocalError({
+        code: 'network_mismatch',
+        message: 'Network switch rejected by user.',
+        hint: 'Accept the network switch request in MetaMask and try again.',
+      });
+    } else {
+      setLocalError({
+        code: 'network_mismatch',
+        message: switchError.message ?? 'Network switch failed.',
+        hint: 'Switch the network manually in MetaMask and try again.',
+      });
+    }
+  }, [switchError]);
+
+  // ── Network-mismatch detection ──────────────────────────────────────────
+  // Run a network-mismatch check after a successful connection so the UI
+  // surfaces an actionable error when the wallet is on the wrong chain.
+  useEffect(() => {
+    if (!isConnected || !activeChainId) return;
+
+    const networkMode =
+      (import.meta as any).env?.VITE_NETWORK_MODE ??
+      (import.meta as any).env?.VITE_NETWORK ??
+      'testnet';
+    const expectedIds = EXPECTED_CHAIN_IDS[networkMode] ?? EXPECTED_CHAIN_IDS['testnet'];
+
+    if (!expectedIds.includes(activeChainId)) {
+      const expected = networkMode === 'mainnet' ? 'Ethereum Mainnet' : 'Sepolia testnet';
+      setLocalError({
+        code: 'network_mismatch',
+        message: `MetaMask is connected to the wrong network (chain ID ${toHexChainId(activeChainId)}).`,
+        hint: `Switch MetaMask to ${expected} and try again.`,
+      });
+    } else {
+      // Chain is correct — clear any stale network-mismatch error.
+      setLocalError((prev) =>
+        prev?.code === 'network_mismatch' ? null : prev,
       );
-    };
+    }
+  }, [isConnected, activeChainId]);
 
-    const handleDisconnect = () => {
-      setState((prev) => transition(prev, { isConnected: false, address: null, phase: 'idle' }));
-    };
+  // ── Derived phase ───────────────────────────────────────────────────────
+  const phase: ConnectionPhase = useMemo(() => {
+    if (localError) return 'error';
+    if (isConnected) return 'connected';
+    if (isConnecting || isReconnecting || connectPending) return 'requesting_permission';
+    if (!isInstalled) return 'idle';
+    return 'idle';
+  }, [localError, isConnected, isConnecting, isReconnecting, connectPending, isInstalled]);
 
-    provider.on('accountsChanged', handleAccountsChanged as any);
-    provider.on('chainChanged', handleChainChanged as any);
-    provider.on('disconnect', handleDisconnect as any);
+  const isLoading = isConnecting || isReconnecting || connectPending || switchPending;
 
-    return () => {
-      provider.removeListener('accountsChanged', handleAccountsChanged as any);
-      provider.removeListener('chainChanged', handleChainChanged as any);
-      provider.removeListener('disconnect', handleDisconnect as any);
-    };
-  }, [setError]);
+  // ── connect() ───────────────────────────────────────────────────────────
+  // Prefer the injected (MetaMask) connector; fall back to the first available.
+  const connect_ = useCallback(async () => {
+    setLocalError(null);
 
-  const connect = useCallback(async () => {
-    const provider = typeof window !== 'undefined' ? window.ethereum : undefined;
-    if (!provider) {
-      setError('metamask_unavailable', 'MetaMask not found.', 'Install MetaMask and reload.');
+    if (!isInstalled) {
+      setLocalError({
+        code: 'metamask_unavailable',
+        message: 'MetaMask not found.',
+        hint: 'Install MetaMask from metamask.io and reload the page.',
+      });
       return;
     }
 
-    setState((prev) => transition(prev, { isLoading: true, error: null, errorCode: null, hint: null, phase: 'requesting_permission' }));
-    try {
-      const accounts = await provider.request({ method: 'eth_requestAccounts' });
-      const chainId = await provider.request({ method: 'eth_chainId' }).catch(() => null);
-      if (accounts.length > 0) {
-        setState((prev) =>
-          transition(prev, {
-            isConnected: true,
-            address: accounts[0],
-            chainId: chainId as string | null,
-            isLoading: false,
-            error: null,
-            errorCode: null,
-            hint: null,
-            phase: 'connected',
-          })
-        );
-      }
-    } catch (err: any) {
-      setError(
-        'metamask_connect_failed',
-        err?.message ?? 'MetaMask connection failed',
-        err?.code === 4001
-          ? 'You rejected the connection request in MetaMask.'
-          : 'Check the MetaMask popup and try again.'
-      );
+    const injected = connectors.find((c) => c.type === 'injected') ?? connectors[0];
+    if (!injected) {
+      setLocalError({
+        code: 'metamask_unavailable',
+        message: 'No wallet connector found.',
+        hint: 'Install MetaMask and reload.',
+      });
+      return;
     }
-  }, [setError]);
 
+    try {
+      connect({ connector: injected });
+    } catch (err: any) {
+      // Synchronous throw — wagmi also surfaces async errors via connectError.
+      setLocalError({
+        code: 'metamask_connect_failed',
+        message: err?.message ?? 'MetaMask connection failed',
+        hint: 'Check the MetaMask popup and try again.',
+      });
+    }
+  }, [connect, connectors, isInstalled]);
+
+  // ── disconnect() ────────────────────────────────────────────────────────
   const disconnect = useCallback(() => {
-    setState((prev) => transition(prev, { isConnected: false, address: null, isLoading: false, error: null, errorCode: null, hint: null, phase: 'idle' }));
-  }, []);
+    setLocalError(null);
+    wagmiDisconnect();
+  }, [wagmiDisconnect]);
 
+  // ── switchToExpectedChain() ─────────────────────────────────────────────
+  // Exposed so callers (e.g. BridgeFormContainer) can programmatically
+  // request a chain switch without triggering a full reconnect.
+  const switchToExpectedChain = useCallback(
+    (networkMode: 'mainnet' | 'testnet' = 'testnet') => {
+      const targetId = networkMode === 'mainnet' ? mainnet.id : sepolia.id;
+      switchChain({ chainId: targetId });
+    },
+    [switchChain],
+  );
+
+  // ── Return ──────────────────────────────────────────────────────────────
   return {
-    ...state,
-    connect,
+    // State
+    isConnected,
+    address: address ?? null,
+    chainId: hexChainId,
+    isLoading,
+    error: localError?.message ?? null,
+    errorCode: localError?.code ?? null,
+    hint: localError?.hint ?? null,
+    phase,
+    lastTransitionAt: null, // retained for API compat; wagmi manages its own timestamps
+    isInstalled,
+    // Actions
+    connect: connect_,
     disconnect,
+    switchToExpectedChain,
   };
 }

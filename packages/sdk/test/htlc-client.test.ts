@@ -331,14 +331,15 @@ describe("SorobanHTLCAdapter", () => {
         STELLAR_ADDR,
         BigInt(7),
         PREIMAGE,
-        fakeSigner
+        fakeSigner,
+        undefined, // orchestration config (not set on this adapter instance)
       );
     });
 
     it("handles a plain numeric orderId (no caller prefix)", async () => {
       mockClient.claimOrder.mockResolvedValue("tx");
       await adapter.claimOrder("5", PREIMAGE, fakeSigner);
-      expect(mockClient.claimOrder).toHaveBeenCalledWith("", BigInt(5), PREIMAGE, fakeSigner);
+      expect(mockClient.claimOrder).toHaveBeenCalledWith("", BigInt(5), PREIMAGE, fakeSigner, undefined);
     });
   });
 
@@ -351,7 +352,7 @@ describe("SorobanHTLCAdapter", () => {
       const result = await adapter.refundOrder(ref, fakeSigner);
 
       expect(result.txId).toBe("refund-tx");
-      expect(mockClient.refundOrder).toHaveBeenCalledWith(STELLAR_ADDR, BigInt(3), fakeSigner);
+      expect(mockClient.refundOrder).toHaveBeenCalledWith(STELLAR_ADDR, BigInt(3), fakeSigner, undefined);
     });
   });
 });

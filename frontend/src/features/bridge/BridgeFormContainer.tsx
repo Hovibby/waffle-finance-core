@@ -6,12 +6,15 @@ import {
   TransactionBuilder,
   Memo
 } from '@stellar/stellar-sdk';
-import { classifyRpcError, parseBalanceHex } from '@wafflefinance/sdk/shared-utils';
+import { useSendTransaction, useSwitchChain } from 'wagmi';
+import { mainnet, sepolia } from 'wagmi/chains';
+import { classifyRpcError } from '@wafflefinance/sdk/shared-utils';
 import { isTestnet, getCurrentNetwork } from '../../config/networks';
+import { selectApiBaseUrl, selectIsMockDataEnabled, selectSolanaRoutesEnabled } from '../../config/selectors';
 import { parseHtlcReceipt } from '../../lib/parseHtlcReceipt';
 import { sanitizeAmountInput } from '../../lib/sanitizeAmountInput';
-import { usePersistedBridgeDraft } from '../../hooks/usePersistedBridgeDraft';
-import { ArrowDownUp, CheckCircle2, Loader2, RefreshCw, Settings2 } from 'lucide-react';
+import { useBridgeOrchestration } from '../../hooks/useBridgeOrchestration';
+import { useBridgeErrorHandler } from '../../hooks/useBridgeErrorHandler';
 import {
   validateAmount,
   validateAssetPair,
@@ -28,6 +31,8 @@ import {
   type OrderSubmissionFailure,
 } from '../../lib/orderSubmissionFallback';
 import { useRouteDerivedValues } from '../../hooks/useRouteDerivedValues';
+import { useNetworkRouteValidator } from '../../hooks/useNetworkRouteValidator';
+import { ArrowDownUp, CheckCircle2, Loader2, RefreshCw, Settings2 } from 'lucide-react';
 
 export interface BridgeFormProps {
   ethAddress: string;
@@ -262,11 +267,9 @@ const updateTransactionStatus = (orderId: string, status: 'pending' | 'completed
 };
 
 const SEPOLIA_CHAIN_ID = '0xaa36a7'; // 11155111 in hex
-const PRODUCTION_API_BASE_URL = 'https://oversync-k36vx.ondigitalocean.app';
-const API_BASE_URL = import.meta.env.PROD
-  ? ''
-  : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
-const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
+const API_BASE_URL = selectApiBaseUrl();
+const ENABLE_MOCK_DATA = selectIsMockDataEnabled();
+const SOLANA_ROUTES_ENABLED = selectSolanaRoutesEnabled();
 
 function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; dstChain: SupportedChain } {
   const parts = dir.split('_to_');
@@ -276,17 +279,38 @@ function directionToChains(dir: BridgeDirection): { srcChain: SupportedChain; ds
 }
 
 export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, signStellarTransaction }: BridgeFormProps): React.JSX.Element {
-  const {
-    direction,
-    amount,
-    setDirection,
-    setAmount,
-    clearPersistedDraft,
-  } = usePersistedBridgeDraft({
+  // ── wagmi v2 hooks ──────────────────────────────────────────────────────
+  // sendTransactionAsync returns a tx hash immediately after the user signs;
+  // we then poll for the receipt exactly as before.
+  const { sendTransactionAsync } = useSendTransaction();
+  const { switchChainAsync } = useSwitchChain();
+
+  const orchestration = useBridgeOrchestration({
     ethAddress,
     stellarAddress,
     solanaAddress,
   });
+  const { direction, amount, setDirection, setAmount, isSubmitting, setIsSubmitting, orderCreated, setOrderCreated, orderId, setOrderId, statusMessage, setStatusMessage, balance, setBalance, activeQuote, setActiveQuote, fromToken, toToken, walletsReady, unsupportedReasonsByRoute, clearPersistedDraft, wasRestored } = orchestration;
+
+  const routeValidation = useNetworkRouteValidator({
+    direction,
+    ethAddress,
+    stellarAddress,
+    solanaAddress,
+  });
+
+  // useBridgeErrorHandler registers error-reporting side effects; called for
+  // its side-effects only.
+  useBridgeErrorHandler();
+
+  // Invalidate stale quote and amount when route validation fails after a network/route switch.
+  useEffect(() => {
+    if (!routeValidation.isValid) {
+      setActiveQuote(null);
+      setAmount('');
+      setStatusMessage(routeValidation.reason ?? 'Unsupported route');
+    }
+  }, [routeValidation.isValid, routeValidation.reason, setActiveQuote, setAmount, setStatusMessage]);
   const [networkInfo, setNetworkInfo] = useState(() => {
     const currentNetwork = getCurrentNetwork();
     const isTestnetMode = isTestnet();
@@ -419,11 +443,11 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     let cancelled = false;
 
     const fetchEthBalance = async (addr: string): Promise<string> => {
-      if (!window.ethereum) throw new Error('MetaMask not available');
-      // parseBalanceHex handles both `0x` prefixed hex and bare decimal text,
-      // so we behave identically across providers that return one or the other.
-      const raw = await window.ethereum.request({ method: 'eth_getBalance', params: [addr, 'latest'] });
-      return (Number(parseBalanceHex(raw)) / 1e18).toFixed(4);
+      // Use wagmi's public client via @wagmi/core for provider-agnostic balance reads.
+      const { getBalance } = await import('@wagmi/core');
+      const { wagmiConfig: cfg } = await import('../../config/wagmi');
+      const balanceResult = await getBalance(cfg, { address: addr as `0x${string}` });
+      return (Number(balanceResult.value) / 1e18).toFixed(4);
     };
 
     const fetchXlmBalance = async (addr: string): Promise<string> => {
@@ -667,67 +691,28 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     let result: any;
     
     try {
-      // For Solana-only routes, skip ETH network check and jump to SOL handling
+      // ── Chain check / switch via wagmi v2 ─────────────────────────────────
+      // useSwitchChain handles wallet_switchEthereumChain and
+      // wallet_addEthereumChain (4902) automatically.
       if (!isSolanaDirection) {
-      // Check network and switch if needed
-      console.log('🔗 Checking network...');
-      console.log('🔗 Expected network info:', networkInfo);
-      
-      const chainId = await window.ethereum?.request({ method: 'eth_chainId' });
-      console.log('🔗 Current chain ID:', chainId);
-      console.log('🔗 Expected chain ID:', networkInfo.expectedChainId);
-      
-      if (chainId !== networkInfo.expectedChainId) {
+        const targetChainId = networkInfo.isTestnet ? sepolia.id : mainnet.id;
         const networkName = networkInfo.isTestnet ? 'Sepolia Testnet' : 'Ethereum Mainnet';
-        console.log(`🔗 Switching to ${networkName}...`);
-        
+        console.log('🔗 Checking network...');
+
         try {
-          await window.ethereum?.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: networkInfo.expectedChainId }],
-          });
-          console.log(`✅ Successfully switched to ${networkName}`);
+          await switchChainAsync({ chainId: targetChainId });
+          console.log(`✅ Network confirmed / switched to ${networkName}`);
         } catch (switchError: any) {
-          console.log('🔄 Network switch error:', switchError);
-          if (switchError.code === 4902) {
-            // Network not added yet
-            const networkConfig = networkInfo.isTestnet ? {
-                chainId: SEPOLIA_CHAIN_ID,
-                chainName: 'Sepolia Testnet',
-                rpcUrls: ['https://ethereum-sepolia-rpc.publicnode.com'],
-                blockExplorerUrls: ['https://sepolia.etherscan.io'],
-                nativeCurrency: {
-                  name: 'SepoliaETH',
-                  symbol: 'SEP',
-                  decimals: 18
-                }
-            } : {
-              chainId: MAINNET_CHAIN_ID,
-              chainName: 'Ethereum Mainnet',
-              rpcUrls: ['https://ethereum-rpc.publicnode.com'],
-              blockExplorerUrls: ['https://etherscan.io'],
-              nativeCurrency: {
-                name: 'Ether',
-                symbol: 'ETH',
-                decimals: 18
-              }
-            };
-            
-            await window.ethereum?.request({
-              method: 'wallet_addEthereumChain',
-              params: [networkConfig],
-            });
-            console.log(`✅ Successfully added and switched to ${networkName}`);
-          } else {
-            console.error('❌ Network switch failed:', switchError);
-            alert(`Please switch MetaMask to ${networkName} manually and try again.`);
+          if (switchError?.code === 4001 || switchError?.message?.toLowerCase().includes('rejected')) {
             setIsSubmitting(false);
             setStatusMessage('');
+            alert(`Please switch MetaMask to ${networkName} and try again.`);
             return;
           }
+          // Non-rejection errors (e.g. missing chain) are surfaced but we try
+          // to proceed — MetaMask may have added it silently.
+          console.warn('⚠️ Chain switch warning:', switchError?.message);
         }
-      } else {
-        console.log('✅ Network is already correct');
       }
 
       // Create order request (used by both testnet and mainnet)
@@ -834,63 +819,18 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           // Log transaction details for debugging
           console.log('🔍 Transaction details (CONTRACT INTERACTION):', {
             ...transactionData,
-            from: ethAddress
-          });
-          
-          // Check user balance first
-          const balance = await window.ethereum?.request({
-            method: 'eth_getBalance',
-            params: [ethAddress, 'latest']
-          });
-          console.log('💰 User balance:', balance);
-          
-          // Additional balance checks
-          const balanceWei = BigInt(balance);
-          const valueWei = BigInt(transactionData.value);
-          const estimatedGasCost = BigInt('0x5208') * BigInt('20000000000'); // Rough estimate
-          
-          console.log('💰 Balance Analysis:', {
-            balanceETH: (Number(balanceWei) / 1e18).toFixed(6),
-            requiredETH: (Number(valueWei) / 1e18).toFixed(6),
-            estimatedGasCostETH: (Number(estimatedGasCost) / 1e18).toFixed(6),
-            totalNeededETH: (Number(valueWei + estimatedGasCost) / 1e18).toFixed(6),
-            hasSufficientBalance: balanceWei >= (valueWei + estimatedGasCost)
-          });
-          
-          // Estimate gas if not provided by relayer
-          let gasLimit = transactionData.gas;
-          if (!gasLimit) {
-            try {
-              const estimatedGas = await window.ethereum?.request({
-                method: 'eth_estimateGas',
-                params: [{
-                  ...transactionData,
-                  from: ethAddress
-                }]
-              });
-              gasLimit = `0x${Math.floor(parseInt(estimatedGas, 16) * 1.2).toString(16)}`; // Add 20% buffer
-              console.log('⛽ Estimated gas:', estimatedGas, 'Using:', gasLimit);
-            } catch (gasError) {
-              console.warn('⚠️ Gas estimation failed, using fallback:', gasError);
-              gasLimit = '0x493E0'; // 300000 fallback for contract interaction
-            }
-          }
-          
-          // ESCROW FACTORY DIRECT MODE: Using direct contract interaction
-          console.log('🏭 ESCROW FACTORY DIRECT MODE: Using direct contract transaction');
-          console.log('📋 Transaction details:', {
-            ...transactionData,
             from: ethAddress,
-            gas: gasLimit
           });
           
-          const txHash = await window.ethereum?.request({
-            method: 'eth_sendTransaction',
-            params: [{
-              ...transactionData,
-              from: ethAddress,
-              gas: gasLimit
-            }],
+          // ── Send ETH transaction via wagmi v2 ──────────────────────────
+          // sendTransactionAsync handles gas estimation, EIP-1559 fee
+          // selection, and surfaces the tx hash once the user signs.
+          // The value field from the relayer is a hex wei string.
+          const txHash = await sendTransactionAsync({
+            to: transactionData.to as `0x${string}`,
+            value: transactionData.value ? BigInt(transactionData.value) : undefined,
+            data: transactionData.data as `0x${string}` | undefined,
+            gas: transactionData.gas ? BigInt(transactionData.gas) : undefined,
           });
           
           // ALWAYS log transaction details (production too)
@@ -901,103 +841,45 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           // Update UI status
           setStatusMessage('Gönderiliyor...');
           setIsSubmitting(true);
-          
-          // Wait for transaction receipt to confirm success
-          let receipt = null;
-          let attempts = 0;
-          const maxAttempts = 120; // Wait max 2 minutes (1s * 120 = 120s)
-          
-          while (!receipt && attempts < maxAttempts) {
-            // Update status to show active waiting
-            setStatusMessage(`Confirming (${attempts}s)...`);
-            
-            try {
-              // First try to get receipt directly
-              receipt = await window.ethereum?.request({
-                method: 'eth_getTransactionReceipt',
-                params: [txHash]
-              });
-              
-              if (!receipt) {
-                // If no receipt, check if it's pending in mempool
-                const txStatus = await window.ethereum?.request({
-                  method: 'eth_getTransactionByHash',
-                  params: [txHash]
-                });
-                
-                if (txStatus && txStatus.blockNumber) {
-                  // Fallback: If we have a blockNumber but eth_getTransactionReceipt is lagging
-                  console.log('✅ Transaction confirmed via block number (receipt delayed)');
-                  receipt = { status: '0x1' }; // Assume success temporarily
-                  break;
-                }
-                
-                // Only log every 10 attempts to reduce spam
-                if ((attempts + 1) % 10 === 0 || attempts === 0) {
-                  console.log(`⏳ Waiting for confirmation... (${attempts + 1}/${maxAttempts})`);
-                }
-                await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-                attempts++;
-              } else {
-                console.log('✅ Transaction receipt found!');
-                break;
-              }
-            } catch (receiptError) {
-              console.warn('⚠️ Error getting receipt:', receiptError);
-              attempts++;
-              await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-          }
-          
-          if (!receipt) {
-            // Try alternative method - check transaction status directly
-            console.log('🔄 Receipt not found, trying alternative confirmation method...');
-            
-            try {
-              const txStatus = await window.ethereum?.request({
-                method: 'eth_getTransactionByHash',
-                params: [txHash]
-              });
 
-              if (txStatus && txStatus.blockNumber) {
-                console.log('✅ Transaction confirmed via alternative method!');
-                receipt = { status: '0x1' }; // Assume success if confirmed
-              } else {
-                // Receipt polling exhausted — classify via the typed fallback.
-                const timeout = classifyReceiptTimeout(txHash);
-                const fallbackRecord = buildFallbackRecord(timeout, {
-                  id: result.orderId || `receipt-timeout-${Date.now()}`,
-                  direction: 'eth-to-xlm',
-                  amount,
-                  estimatedAmount,
-                  srcAddress: ethAddress,
-                  dstAddress: stellarAddress,
-                });
-                saveFallbackToHistory(fallbackRecord);
-                throw new Error(timeout.message);
-              }
-            } catch (altError) {
-              if ((altError as Error).message?.includes('confirmation timed out') ||
-                  (altError as Error).message?.includes('timed out')) {
-                throw altError;
-              }
-              console.error('❌ Alternative confirmation also failed:', altError);
-              throw new Error('Transaction confirmation timeout');
-            }
+          // ── Wait for receipt via wagmi v2 public client ────────────────
+          // wagmi's getPublicClient / waitForTransactionReceipt handles
+          // polling, retry back-off, and reorg detection internally.
+          // We import the wagmi action directly to avoid adding a full
+          // viem dependency on the component level.
+          let receipt: { status: string; logs?: any[] } | null = null;
+          try {
+            setStatusMessage('Confirming...');
+            const { waitForTransactionReceipt } = await import('@wagmi/core');
+            const { wagmiConfig: cfg } = await import('../../config/wagmi');
+            const wagmiReceipt = await waitForTransactionReceipt(cfg, {
+              hash: txHash as `0x${string}`,
+              timeout: 120_000,
+            });
+            receipt = {
+              status: wagmiReceipt.status === 'success' ? '0x1' : '0x0',
+              logs: wagmiReceipt.logs as any[],
+            };
+          } catch (receiptErr: any) {
+            // Receipt polling exhausted — classify via the typed fallback.
+            const timeout = classifyReceiptTimeout(txHash);
+            const fallbackRecord = buildFallbackRecord(timeout, {
+              id: result.orderId || `receipt-timeout-${Date.now()}`,
+              direction: 'eth-to-xlm',
+              amount,
+              estimatedAmount,
+              srcAddress: ethAddress,
+              dstAddress: stellarAddress,
+            });
+            saveFallbackToHistory(fallbackRecord);
+            throw new Error(timeout.message);
           }
           
-          // Pull the full receipt (we may have only a {status} stub from the
-          // alt-path above). Logs are required to parse refund metadata and verify success.
+          // Pull refund metadata from receipt logs (already have the full receipt).
           let refundMeta: ReturnType<typeof parseHtlcReceipt> = null;
           try {
-            const fullReceipt = await window.ethereum?.request({
-              method: 'eth_getTransactionReceipt',
-              params: [txHash],
-            });
-            if (fullReceipt) {
-              // If we were falling back to { status: '0x1' }, now we update it to the true status
-              receipt = fullReceipt;
-              refundMeta = parseHtlcReceipt(fullReceipt.logs);
+            if (receipt?.logs) {
+              refundMeta = parseHtlcReceipt(receipt.logs);
               if (refundMeta) {
                 console.log('🛡️ Refund metadata captured:', refundMeta);
               } else {
@@ -1005,7 +887,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
               }
             }
           } catch (parseErr) {
-            console.warn('⚠️ Failed to load full receipt for refund metadata:', parseErr);
+            console.warn('⚠️ Failed to parse receipt logs for refund metadata:', parseErr);
           }
 
           // Check transaction status
@@ -1533,11 +1415,12 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
     clearPersistedDraft();
   };
 
-  const isSolanaDirection =
+  const isSolanaDirection = SOLANA_ROUTES_ENABLED && (
     direction === 'eth_to_sol' ||
     direction === 'sol_to_eth' ||
     direction === 'xlm_to_sol' ||
-    direction === 'sol_to_xlm';
+    direction === 'sol_to_xlm'
+  );
 
   return (
     <div className="w-full rounded-[1.25rem] p-4 swap-card-bg swap-card-border md:p-5 lg:p-6">
@@ -1650,6 +1533,9 @@ export default function BridgeForm({ ethAddress, stellarAddress, solanaAddress, 
           </div>
           {validationErrors.route && (
             <p className="mt-1.5 text-xs text-red-300">{validationErrors.route}</p>
+          )}
+          {routeValidation.reason && (
+            <p className="mt-1.5 text-xs text-red-300" role="alert">{routeValidation.reason}</p>
           )}
           {validationErrors.quote && (
             <p className="mt-1.5 text-xs text-amber-300" role="alert">{validationErrors.quote}</p>

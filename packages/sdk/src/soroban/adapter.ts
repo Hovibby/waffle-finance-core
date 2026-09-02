@@ -7,15 +7,24 @@
  *
  * Error mapping
  * ─────────────
- * Soroban simulation/submit errors are caught and re-thrown as HTLCError
- * instances with stable machine-readable codes. The original error is
- * preserved in HTLCError.cause.
+ * Soroban orchestration errors are already HTLCError instances (thrown by the
+ * orchestration layer). Other errors are caught and re-thrown as HTLCError
+ * instances with stable machine-readable codes. The original error is preserved
+ * in HTLCError.cause, and submission metadata (attempts, fee-bump history) is
+ * available in HTLCError.submissionMeta for orchestrated calls.
+ *
+ * Orchestration configuration
+ * ───────────────────────────
+ * Pass an optional `OrchestrationConfig` as the second constructor argument to
+ * override retry count, polling interval, and fee-bump cap on a per-adapter
+ * basis. These values take precedence over any defaults baked into the client.
  */
 
 import {
   SorobanHTLCClient,
   type SorobanCreateOrderInput,
   type SorobanSigner,
+  type OrchestrationConfig,
 } from "./index.js";
 import {
   HTLCError,
@@ -25,25 +34,21 @@ import {
 } from "../htlc-client.js";
 
 // ── Error classification ─────────────────────────────────────────────────────
+// The orchestration layer already throws HTLCError for all orchestrated calls.
+// This classifier handles any residual non-orchestrated errors (e.g. getOrder,
+// construction-time failures) that slip through as plain Errors.
 
 function classifySorobanError(err: unknown): HTLCError {
+  if (err instanceof HTLCError) return err;
+
   const msg = err instanceof Error ? err.message : String(err);
   const lc = msg.toLowerCase();
 
-  if (lc.includes("simulation failed")) {
+  if (lc.includes("simulation failed") || lc.includes("simulation rejected")) {
     return new HTLCError({
       code: "simulation_failed",
       message: "Soroban simulation rejected the call: " + msg,
       retryable: false,
-      cause: err,
-    });
-  }
-
-  if (lc.includes("submit failed") || lc.includes("error")) {
-    return new HTLCError({
-      code: "tx_rejected",
-      message: "Soroban transaction was rejected: " + msg,
-      retryable: lc.includes("timeout") || lc.includes("network"),
       cause: err,
     });
   }
@@ -62,6 +67,15 @@ function classifySorobanError(err: unknown): HTLCError {
       code: "timelock_not_expired",
       message: "Timelock has not yet expired: " + msg,
       retryable: false,
+      cause: err,
+    });
+  }
+
+  if (lc.includes("submit failed") || lc.includes("tx_rejected") || lc.includes("error")) {
+    return new HTLCError({
+      code: "tx_rejected",
+      message: "Soroban transaction was rejected: " + msg,
+      retryable: lc.includes("timeout") || lc.includes("network"),
       cause: err,
     });
   }
@@ -102,7 +116,11 @@ export type SorobanAdapterCreateInput = SorobanCreateOrderInput;
 export class SorobanHTLCAdapter
   implements IHTLCClient<SorobanAdapterCreateInput, SorobanSigner>
 {
-  constructor(private readonly client: SorobanHTLCClient) {}
+  constructor(
+    private readonly client: SorobanHTLCClient,
+    /** Optional per-adapter orchestration policy overrides. */
+    private readonly config?: OrchestrationConfig,
+  ) {}
 
   /**
    * Create a Soroban HTLC order.
@@ -116,14 +134,10 @@ export class SorobanHTLCAdapter
     signer: SorobanSigner
   ): Promise<HTLCCreateResult> {
     try {
-      const txHash = await this.client.createOrder(input, signer);
-      // Soroban does not return a discrete orderId from createOrder — the
-      // canonical reference is the transaction hash. We encode a reference
-      // that claimOrder/refundOrder can decode.
+      const txHash = await this.client.createOrder(input, signer, this.config);
       const orderId = encodeSorobanOrderRef(input.sender, txHash);
       return { txId: txHash, orderId };
     } catch (err) {
-      if (err instanceof HTLCError) throw err;
       throw classifySorobanError(err);
     }
   }
@@ -148,11 +162,11 @@ export class SorobanHTLCAdapter
         callerAccountId,
         BigInt(numericId),
         preimage,
-        signer
+        signer,
+        this.config,
       );
       return { txId: txHash };
     } catch (err) {
-      if (err instanceof HTLCError) throw err;
       throw classifySorobanError(err);
     }
   }
@@ -172,11 +186,11 @@ export class SorobanHTLCAdapter
       const txHash = await this.client.refundOrder(
         callerAccountId,
         BigInt(numericId),
-        signer
+        signer,
+        this.config,
       );
       return { txId: txHash };
     } catch (err) {
-      if (err instanceof HTLCError) throw err;
       throw classifySorobanError(err);
     }
   }

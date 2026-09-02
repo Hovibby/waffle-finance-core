@@ -4,6 +4,9 @@
  */
 
 import { getCurrentTimestamp } from './utils.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger().child({ component: 'gas-tracker' });
 
 /**
  * Gas price information
@@ -69,7 +72,7 @@ export class GasPriceTracker {
 
     // Initial update
     this.updateGasPrices();
-    console.log('⛽ Gas price monitoring started');
+    logger.info('Gas price monitoring started');
   }
 
   /**
@@ -80,7 +83,7 @@ export class GasPriceTracker {
       clearInterval(this.updateInterval);
       this.updateInterval = null;
     }
-    console.log('⛽ Gas price monitoring stopped');
+    logger.info('Gas price monitoring stopped');
   }
 
   /**
@@ -113,7 +116,9 @@ export class GasPriceTracker {
     
     // Apply congestion adjustments
     const congestionMultiplier = this.getCongestionMultiplier();
-    const basePrice = BigInt(gasPrice[transactionType]);
+    // Use default 'standard' price if the requested type is missing (legacy response)
+    const priceStr = gasPrice[transactionType] ?? gasPrice.standard;
+    const basePrice = BigInt(priceStr);
     const adjustedPrice = (basePrice * BigInt(Math.floor(congestionMultiplier * 1000))) / BigInt(1000);
     
     return adjustedPrice.toString();
@@ -216,9 +221,9 @@ export class GasPriceTracker {
         this.priceHistory = this.priceHistory.slice(-this.MAX_HISTORY_SIZE);
       }
 
-      console.log(`⛽ Gas price updated: ${mockGasPrice.standard} gwei`);
+      logger.debug({ gasPrice: mockGasPrice.standard }, 'Gas price updated');
     } catch (error) {
-      console.error('❌ Failed to update gas prices:', error);
+      logger.error({ err: error }, 'Failed to update gas prices');
     }
   }
 
@@ -286,11 +291,16 @@ export class GasPriceTracker {
   }
 
   /**
-   * Get congestion multiplier for gas price adjustment
+   * Get congestion multiplier for gas price adjustment.
+   *
+   * Validates the congestion level before applying it. An unrecognised level
+   * (e.g. produced by a future API change or a stale cache) logs a warning
+   * and falls back to the neutral multiplier (1.0) rather than silently
+   * under- or over-pricing gas.
    */
   private getCongestionMultiplier(): number {
     const congestion = this.congestionData;
-    
+
     switch (congestion.level) {
       case 'low':
         return 0.9;
@@ -300,8 +310,18 @@ export class GasPriceTracker {
         return 1.2;
       case 'extreme':
         return 1.5;
-      default:
+      default: {
+        // Unrecognised level — log and refuse to apply an unknown multiplier.
+        process.stderr.write(
+          JSON.stringify({
+            level: 'warn',
+            msg: '[gas-tracker] Unrecognised congestion level — falling back to neutral multiplier (1.0)',
+            congestionLevel: (congestion as { level: unknown }).level,
+            ts: new Date().toISOString(),
+          }) + '\n'
+        );
         return 1.0;
+      }
     }
   }
 

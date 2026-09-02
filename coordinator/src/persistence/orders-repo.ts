@@ -32,6 +32,37 @@ export type OrderStatus =
 export type Chain = "ethereum" | "stellar" | "solana";
 export type Direction = "eth_to_xlm" | "xlm_to_eth" | "eth_to_sol" | "sol_to_eth";
 
+/**
+ * Ingestion-health flag for the durable Soroban listener checkpoint.
+ *
+ *  - `clean`          steady state; the listener can resume straight from the
+ *                     persisted cursor.
+ *  - `pending_replay` a gap / stale cursor / restart was observed; a bounded
+ *                     replay of the missed ledger range is owed before the
+ *                     listener returns to the live event stream.
+ *  - `recovering`     a bounded replay is currently in progress.  If the
+ *                     process dies mid-replay the marker stays here so the
+ *                     next start re-runs the replay (crash-safe recovery).
+ */
+export type SorobanRecoveryMarker = "clean" | "pending_replay" | "recovering";
+
+/**
+ * A durable checkpoint for the Soroban event listener.  See
+ * migrations/010_soroban_checkpoints.sql for the storage contract.
+ */
+export interface SorobanCheckpoint {
+  /** Soroban HTLC contract this checkpoint belongs to. */
+  contractId: string;
+  /** Highest ledger sequence fully processed; safe resume point. */
+  lastSafeLedger: number;
+  /** Opaque Soroban RPC pagination cursor, or null after a reset/fresh start. */
+  effectiveCursor: string | null;
+  /** Ingestion-health flag used to drive replay/recovery. */
+  recoveryMarker: SorobanRecoveryMarker;
+  /** Unix timestamp (seconds) of the last checkpoint write. */
+  updatedAt: number;
+}
+
 export interface OrderRow {
   id: number;
   publicId: string;
@@ -60,6 +91,9 @@ export interface OrderRow {
   preimageEncVersion: number | null;
   secretRevealedTx: string | null;
   resolverAddress: string | null;
+  lastEthBlock: number | null;
+  lastSorobanLedger: number | null;
+  lastSolanaSlot: number | null;
   createdAt: number;
   updatedAt: number;
   archivedAt: number | null;
@@ -116,6 +150,9 @@ interface OrderDbRow {
   preimage_enc_version: number | null;
   secret_revealed_tx: string | null;
   resolver_address: string | null;
+  last_eth_block: number | null;
+  last_soroban_ledger: number | null;
+  last_solana_slot: number | null;
   created_at: number;
   updated_at: number;
   archived_at: number | null;
@@ -149,9 +186,12 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     preimageEncVersion: r.preimage_enc_version ?? null,
     secretRevealedTx: r.secret_revealed_tx,
     resolverAddress: r.resolver_address,
+    lastEthBlock: r.last_eth_block ?? null,
+    lastSorobanLedger: r.last_soroban_ledger ?? null,
+    lastSolanaSlot: r.last_solana_slot ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
-    archivedAt: r.archived_at ?? null
+    archivedAt: r.archived_at ?? null,
   };
 }
 
@@ -461,10 +501,64 @@ export class OrdersRepository {
     }
   }
 
-  async setStatus(publicId: string, status: OrderStatus, actor = "system"): Promise<void> {
+  /**
+   * Update the status of an order identified by `publicId`.
+   *
+   * When `expectedStatus` is provided the update is conditional: it only
+   * applies when the current DB status matches `expectedStatus`.  This
+   * enables optimistic-concurrency-style updates.
+   *
+   * After a zero-row result a narrow SELECT is performed to distinguish:
+   *   - `NOT_FOUND`    — no row with this public_id exists
+   *   - `STALE_STATUS` — row exists but its current status did not match
+   *                      `expectedStatus` (only reachable when expectedStatus
+   *                      is supplied)
+   *
+   * When `expectedStatus` is omitted the underlying SQL has no prior-status
+   * guard so a zero-row result can only mean NOT_FOUND.
+   */
+  async setStatus(
+    publicId: string,
+    status: OrderStatus,
+    actor?: string,
+    expectedStatus?: OrderStatus
+  ): Promise<void>;
+  async setStatus(publicId: string, status: OrderStatus, actor = "system", expectedStatus?: OrderStatus): Promise<void> {
     await this.transactionManager.runWithRetry("status-update", async () => {
+      // Fetch the current row first so we can record a transition event and
+      // also use it for the zero-row disambiguation below.
       const order = await this.get<OrderDbRow>(this.byPublicId, publicId);
-      await this.run(this.updateStatus, { publicId, status });
+
+      let result: StatementResult;
+      if (expectedStatus !== undefined) {
+        // Conditional UPDATE — only succeeds when the current status matches.
+        result = await this.run(
+          this.db.prepare(`
+            UPDATE orders
+            SET status = :status, updated_at = CAST(strftime('%s','now') AS INTEGER)
+            WHERE public_id = :publicId AND status = :expectedStatus
+          `),
+          { publicId, status, expectedStatus }
+        );
+      } else {
+        result = await this.run(this.updateStatus, { publicId, status });
+      }
+
+      if (result.changes === 0) {
+        if (!order) {
+          const err = new Error(`Order not found: ${publicId}`);
+          (err as any).code = "NOT_FOUND";
+          throw err;
+        }
+        // Row exists but the conditional WHERE status = :expectedStatus failed.
+        const err = new Error(
+          `Status update conflict for ${publicId}: current status "${order.status}" does not match expected "${expectedStatus}"`
+        );
+        (err as any).code = "STALE_STATUS";
+        (err as any).currentStatus = order.status;
+        throw err;
+      }
+
       if (order) {
         await this.appendTransitionEvent(order.id, "status.transitioned", {
           actor,
@@ -749,6 +843,199 @@ export class OrdersRepository {
   }
 
   /**
+   * Return the last position (block/ledger/slot) that the reconciler has
+   * confirmed it fully processed for `chain`.  Returns 0 if the reconciler
+   * has never run for this chain (no row in chain_cursors).
+   *
+   * This is the persistent counterpart to `getLastProcessedBlock()`.
+   * `getLastProcessedBlock()` derives a position from existing order data,
+   * which only advances when an order transitions — blocks with no relevant
+   * events are invisible to it.  `getChainCursor()` returns the value
+   * explicitly written by `setChainCursor()` so it reflects every scanned
+   * block, not just blocks that contained orders.
+   */
+  async getChainCursor(chain: Chain): Promise<number> {
+    const row = await this.get<{ position: number }>(
+      this.db.prepare("SELECT position FROM chain_cursors WHERE chain = ?"),
+      chain
+    );
+    return row?.position ?? 0;
+  }
+
+  /**
+   * Record that the reconciler has fully processed all events up to and
+   * including `position` for `chain`.
+   *
+   * The update is an UPSERT so callers don't have to check whether a row
+   * exists.  We only advance the cursor forward — if the incoming position
+   * is less than the stored position (e.g. a parallel reconciler ran
+   * concurrently), we leave the stored value unchanged.
+   */
+  async setChainCursor(chain: Chain, position: number): Promise<void> {
+    await this.run(
+      this.db.prepare(`
+        INSERT INTO chain_cursors (chain, position, updated_at)
+        VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER))
+        ON CONFLICT(chain) DO UPDATE
+          SET position   = MAX(chain_cursors.position, excluded.position),
+              updated_at = excluded.updated_at
+      `),
+      chain, position
+    );
+  }
+
+  /**
+   * Update the per-order high-water mark cursor (last_eth_block, last_soroban_ledger,
+   * or last_solana_slot) for a given order and chain. Advances forward only.
+   */
+  async updateOrderCursor(publicId: string, chain: Chain, position: number): Promise<void> {
+    let col: string;
+    if (chain === "ethereum") col = "last_eth_block";
+    else if (chain === "stellar") col = "last_soroban_ledger";
+    else if (chain === "solana") col = "last_solana_slot";
+    else return;
+
+    await this.run(
+      this.db.prepare(`
+        UPDATE orders
+        SET ${col} = MAX(COALESCE(${col}, 0), ?),
+            updated_at = CAST(strftime('%s','now') AS INTEGER)
+        WHERE public_id = ?
+      `),
+      position,
+      publicId
+    );
+  }
+
+  /**
+   * Return the minimum per-order cursor position across active (non-terminal)
+   * orders for `chain`, or `null` if no active orders have recorded a cursor.
+   */
+  async getMinActiveOrderCursor(chain: Chain): Promise<number | null> {
+    let col: string;
+    if (chain === "ethereum") col = "last_eth_block";
+    else if (chain === "stellar") col = "last_soroban_ledger";
+    else if (chain === "solana") col = "last_solana_slot";
+    else return null;
+
+    const row = await this.get<{ min_cursor: number | null }>(
+      this.db.prepare(`
+        SELECT MIN(${col}) AS min_cursor
+        FROM orders
+        WHERE (src_chain = ? OR dst_chain = ?)
+          AND status NOT IN ('completed', 'refunded', 'failed', 'expired')
+          AND ${col} IS NOT NULL AND ${col} > 0
+      `),
+      chain,
+      chain
+    );
+    return row?.min_cursor ?? null;
+  }
+
+  // ── Soroban listener checkpoints ──────────────────────────────────────────
+  //
+  // These three methods are the durable persistence adapter for the Soroban
+  // event listener's checkpoint/replay-recovery subsystem.  The listener owns
+  // the semantics (when to resume, when to replay); this adapter only owns
+  // storage and the forward-only invariant on `last_safe_ledger`.
+
+  /**
+   * Load the durable checkpoint for `contractId`, or `null` when the listener
+   * has never checkpointed this contract (fresh install, or the coordinator
+   * was re-pointed at a different HTLC contract).
+   */
+  async getSorobanCheckpoint(contractId: string): Promise<SorobanCheckpoint | null> {
+    const row = await this.get<{
+      contract_id: string;
+      last_safe_ledger: number;
+      effective_cursor: string | null;
+      recovery_marker: SorobanRecoveryMarker;
+      updated_at: number;
+    }>(
+      this.db.prepare(
+        `SELECT contract_id, last_safe_ledger, effective_cursor, recovery_marker, updated_at
+           FROM soroban_checkpoints
+          WHERE contract_id = ?`
+      ),
+      contractId
+    );
+    if (!row) return null;
+    return {
+      contractId: row.contract_id,
+      lastSafeLedger: Number(row.last_safe_ledger),
+      effectiveCursor: row.effective_cursor,
+      recoveryMarker: row.recovery_marker,
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  /**
+   * Persist (upsert) the Soroban listener checkpoint.
+   *
+   * `last_safe_ledger` only ever moves forward: a stale-cursor reset or a
+   * replay that re-observes older ledgers must never rewind the safe resume
+   * point.  The forward-only clamp is enforced in SQL (portable across SQLite
+   * and Postgres) so concurrent writers can never regress it either.  The
+   * cursor and recovery marker always take the incoming value.
+   */
+  async saveSorobanCheckpoint(input: {
+    contractId: string;
+    lastSafeLedger: number;
+    effectiveCursor: string | null;
+    recoveryMarker: SorobanRecoveryMarker;
+  }): Promise<void> {
+    await this.run(
+      this.db.prepare(`
+        INSERT INTO soroban_checkpoints
+            (contract_id, last_safe_ledger, effective_cursor, recovery_marker, updated_at)
+        VALUES
+            (:contractId, :lastSafeLedger, :effectiveCursor, :recoveryMarker,
+             CAST(strftime('%s','now') AS INTEGER))
+        ON CONFLICT(contract_id) DO UPDATE SET
+          last_safe_ledger = CASE
+              WHEN excluded.last_safe_ledger > soroban_checkpoints.last_safe_ledger
+                THEN excluded.last_safe_ledger
+              ELSE soroban_checkpoints.last_safe_ledger
+            END,
+          effective_cursor = excluded.effective_cursor,
+          recovery_marker  = excluded.recovery_marker,
+          updated_at       = excluded.updated_at
+      `),
+      {
+        contractId: input.contractId,
+        lastSafeLedger: input.lastSafeLedger,
+        effectiveCursor: input.effectiveCursor,
+        recoveryMarker: input.recoveryMarker,
+      }
+    );
+  }
+
+  /**
+   * Flip only the recovery marker for an existing checkpoint, leaving the
+   * ledger and cursor untouched.  Used to record that a gap / stale cursor /
+   * restart was observed (`pending_replay`) or that a bounded replay has begun
+   * (`recovering`) without disturbing the safe resume point.
+   *
+   * Returns the number of rows changed — 0 when no checkpoint exists yet for
+   * `contractId`, in which case there is nothing to recover from.
+   */
+  async markSorobanRecovery(
+    contractId: string,
+    marker: SorobanRecoveryMarker
+  ): Promise<number> {
+    const result = await this.run(
+      this.db.prepare(`
+        UPDATE soroban_checkpoints
+           SET recovery_marker = :marker,
+               updated_at      = CAST(strftime('%s','now') AS INTEGER)
+         WHERE contract_id = :contractId
+      `),
+      { contractId, marker }
+    );
+    return result.changes;
+  }
+
+  /**
    * Return orders in `src_locked` or `dst_locked` whose relevant timelock
    * has already passed (timelock < nowSeconds).  These are candidates for
    * the periodic expiry scan.
@@ -797,6 +1084,162 @@ export class OrdersRepository {
       srcOrderId: r.src_order_id,
       hashlock: r.hashlock,
       status: r.status,
+    }));
+  }
+
+  // ── Per-order ledger cursors ──────────────────────────────────────────────
+
+  async getOrderLedgerCursor(publicId: string): Promise<{
+    lastEthBlock: number | null;
+    lastSorobanLedger: number | null;
+    lastSolanaSlot: number | null;
+  } | null> {
+    const row = await this.get<{
+      last_eth_block: number | null;
+      last_soroban_ledger: number | null;
+      last_solana_slot: number | null;
+    }>(
+      this.db.prepare(`
+        SELECT last_eth_block, last_soroban_ledger, last_solana_slot
+        FROM orders WHERE public_id = ?
+      `),
+      publicId
+    );
+    if (!row) return null;
+    return {
+      lastEthBlock: row.last_eth_block ?? null,
+      lastSorobanLedger: row.last_soroban_ledger ?? null,
+      lastSolanaSlot: row.last_solana_slot ?? null,
+    };
+  }
+
+  /**
+   * Advance one or more per-order ledger cursors forward-only.
+   * Positions less than or equal to the stored value are ignored.
+   */
+  async advanceOrderLedgerCursor(
+    publicId: string,
+    update: {
+      lastEthBlock?: number;
+      lastSorobanLedger?: number;
+      lastSolanaSlot?: number;
+    }
+  ): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (update.lastEthBlock != null && update.lastEthBlock > 0) {
+      sets.push(
+        "last_eth_block = CASE WHEN last_eth_block IS NULL THEN ? ELSE MAX(last_eth_block, ?) END"
+      );
+      params.push(update.lastEthBlock, update.lastEthBlock);
+    }
+    if (update.lastSorobanLedger != null && update.lastSorobanLedger > 0) {
+      sets.push(
+        "last_soroban_ledger = CASE WHEN last_soroban_ledger IS NULL THEN ? ELSE MAX(last_soroban_ledger, ?) END"
+      );
+      params.push(update.lastSorobanLedger, update.lastSorobanLedger);
+    }
+    if (update.lastSolanaSlot != null && update.lastSolanaSlot > 0) {
+      sets.push(
+        "last_solana_slot = CASE WHEN last_solana_slot IS NULL THEN ? ELSE MAX(last_solana_slot, ?) END"
+      );
+      params.push(update.lastSolanaSlot, update.lastSolanaSlot);
+    }
+
+    if (sets.length === 0) return;
+
+    sets.push("updated_at = CAST(strftime('%s','now') AS INTEGER)");
+    params.push(publicId);
+
+    await this.run(
+      this.db.prepare(`
+        UPDATE orders SET ${sets.join(", ")}
+        WHERE public_id = ?
+      `),
+      ...params
+    );
+  }
+
+  async listOrderLedgerCursors(limit = 200): Promise<
+    Array<{
+      publicId: string;
+      status: OrderStatus;
+      lastEthBlock: number | null;
+      lastSorobanLedger: number | null;
+      lastSolanaSlot: number | null;
+      updatedAt: number;
+    }>
+  > {
+    const rows = await this.all<{
+      public_id: string;
+      status: OrderStatus;
+      last_eth_block: number | null;
+      last_soroban_ledger: number | null;
+      last_solana_slot: number | null;
+      updated_at: number;
+    }>(
+      this.db.prepare(`
+        SELECT public_id, status, last_eth_block, last_soroban_ledger, last_solana_slot, updated_at
+        FROM orders
+        WHERE archived_at IS NULL
+          AND (
+            last_eth_block IS NOT NULL
+            OR last_soroban_ledger IS NOT NULL
+            OR last_solana_slot IS NOT NULL
+          )
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `),
+      Math.min(Math.max(limit, 1), 1000)
+    );
+
+    return rows.map((r) => ({
+      publicId: r.public_id,
+      status: r.status,
+      lastEthBlock: r.last_eth_block ?? null,
+      lastSorobanLedger: r.last_soroban_ledger ?? null,
+      lastSolanaSlot: r.last_solana_slot ?? null,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  /**
+   * Return up to `limit` non-terminal, non-archived orders ordered by most
+   * recently updated.  Used by `CacheVerifier` to select a representative
+   * sample for on-chain spot-checking.
+   *
+   * Terminal statuses (completed, refunded, failed) are excluded.  `expired`
+   * is intentionally included — an expired order can still be reconciled.
+   */
+  async findNonTerminalSample(limit: number): Promise<OrderRow[]> {
+    const rows = await this.all<OrderDbRow>(
+      this.db.prepare(`
+        SELECT * FROM orders
+        WHERE status NOT IN ('completed', 'refunded', 'failed')
+          AND archived_at IS NULL
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `),
+      Math.min(Math.max(limit, 1), 1000)
+    );
+    return rows.map(rowToOrder);
+  }
+
+  async listChainCursors(): Promise<
+    Array<{ chain: Chain; position: number; updatedAt: number }>
+  > {
+    const rows = await this.all<{
+      chain: Chain;
+      position: number;
+      updated_at: number;
+    }>(
+      this.db.prepare("SELECT chain, position, updated_at FROM chain_cursors ORDER BY chain")
+    );
+    return rows.map((r) => ({
+      chain: r.chain,
+      position: Number(r.position),
+      updatedAt: Number(r.updated_at),
     }));
   }
 }

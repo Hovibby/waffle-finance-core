@@ -17,5 +17,5 @@ remappings = [
 runs = 256
 
 [invariant]
-runs   = 64
-depth  = 16
+runs   = 100
+depth  = 20

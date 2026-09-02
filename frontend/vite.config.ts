@@ -48,8 +48,11 @@ export default defineConfig(({ mode }) => {
         output: {
           manualChunks: {
             vendor: ['react', 'react-dom'],
-            ui: ['@rainbow-me/rainbowkit', 'wagmi'],
-            crypto: ['ethers'],
+            // wagmi v2 + RainbowKit v2 + viem are co-dependent and always
+            // loaded together, so bundle them in one async chunk.
+            wallet: ['wagmi', 'viem', '@wagmi/core', '@rainbow-me/rainbowkit'],
+            // React Query is shared by wagmi and any direct query consumers.
+            query: ['@tanstack/react-query'],
           },
         },
       },
@@ -65,9 +68,11 @@ export default defineConfig(({ mode }) => {
       include: [
         'react',
         'react-dom',
-        'ethers',
-        '@rainbow-me/rainbowkit',
         'wagmi',
+        'viem',
+        '@wagmi/core',
+        '@rainbow-me/rainbowkit',
+        '@tanstack/react-query',
       ],
     },
     test: {

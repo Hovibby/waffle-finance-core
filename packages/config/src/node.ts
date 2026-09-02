@@ -70,6 +70,11 @@ export function loadCoordinatorConfig(
     secretStorageKey: rawEnv.SECRET_STORAGE_KEY,
     apiKeys: rawEnv.COORDINATOR_API_KEYS ?? "",
     trustedProxies: rawEnv.COORDINATOR_TRUSTED_PROXIES ?? "",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     ethereum: {
       rpcUrl: resolveEthereumRpcUrl(isMainnet ? "mainnet" : "testnet", rawEnv),
       chainId: isMainnet ? 1 : 11_155_111,
@@ -164,6 +169,11 @@ export function loadRelayerConfig(
     nodeEnv: rawEnv.NODE_ENV ?? "development",
     enableMockMode: rawEnv.ENABLE_MOCK_MODE ?? "false",
     debug: rawEnv.DEBUG ?? "false",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     resolverAllowlist: rawEnv.RELAYER_RESOLVER_ADDRESSES,
     rpcTimeoutMs: rawEnv.RELAYER_RPC_TIMEOUT_MS ?? "30000",
     ethereum: {
@@ -187,6 +197,12 @@ export function loadRelayerConfig(
       publicKey: rawEnv.RELAYER_STELLAR_PUBLIC ?? "",
       startLedger: rawEnv.START_LEDGER_STELLAR ?? "0",
       minConfirmations: rawEnv.STELLAR_MIN_CONFIRMATIONS ?? "1",
+    },
+    solana: {
+      rpcUrl: rawEnv.SOLANA_RPC_URL ?? (isMainnet ? "https://api.mainnet-beta.solana.com" : "https://api.devnet.solana.com"),
+      privateKey: rawEnv.SOLANA_PRIVATE_KEY ?? "",
+      programId: rawEnv.SOLANA_HTLC_PROGRAM ?? rawEnv.SOLANA_HTLC_PROGRAM_TESTNET ?? rawEnv.SOLANA_HTLC_PROGRAM_MAINNET ?? "PLACEHOLDER",
+      commitment: (rawEnv.SOLANA_COMMITMENT as "processed" | "confirmed" | "finalized") ?? "confirmed",
     },
     fees: {
       feeRate: rawEnv.RELAYER_FEE_RATE ?? "50",
@@ -235,8 +251,11 @@ export function loadRelayerConfig(
       resolverRegistry:
         rawEnv[isMainnet ? "ETH_RESOLVER_REGISTRY_MAINNET" : "ETH_RESOLVER_REGISTRY_TESTNET"] ?? null,
     },
-    // Relayer does not interact with Solana directly.
-    solana: { programId: null },
+    // Relayer uses Solana for direct settlement when configured.
+    solana: {
+      programId: relayCfg.solana.programId,
+      rpcUrl: relayCfg.solana.rpcUrl,
+    },
   };
   const relayerChainResult = validateSorobanChainConfig(relayerChainInput);
 
@@ -273,6 +292,11 @@ export function loadResolverConfig(
     pollIntervalMs: rawEnv.RESOLVER_POLL_INTERVAL_MS ?? "15000",
     coordinatorUrl: rawEnv.COORDINATOR_URL ?? "http://localhost:3001",
     logLevel: rawEnv.LOG_LEVEL ?? "info",
+    featureFlags: {
+      solanaSimulationMode: rawEnv.FEATURE_SOLANA_SIMULATION_MODE ?? "false",
+      sorobanEarlySupport: rawEnv.FEATURE_SOROBAN_EARLY_SUPPORT ?? "false",
+      experimentalUiRoutes: rawEnv.FEATURE_EXPERIMENTAL_UI_ROUTES ?? "false",
+    },
     ethereum: {
       rpcUrl: resolveEthereumRpcUrl(isMainnet ? "mainnet" : "testnet", rawEnv),
       chainId: isMainnet ? 1 : 11_155_111,

@@ -214,7 +214,7 @@ export class PostgresStatement {
  * added.  Startup validation compares the database's highest recorded
  * migration against this constant and aborts if they differ.
  */
-export const CURRENT_SCHEMA_VERSION = "007_audit_log.sql";
+export const CURRENT_SCHEMA_VERSION = "011_order_ledger_cursors.sql";
 
 /**
  * Canonical SQLite migration sequence, in application order.
@@ -234,6 +234,10 @@ export const SQLITE_MIGRATIONS = [
   "005_schema_migrations.sql",
   "006_stale_cleanup.sql",
   "007_audit_log.sql",
+  "008_query_optimizations_advanced.sql",
+  "009_chain_cursors.sql",
+  "010_soroban_checkpoints.sql",
+  "011_order_ledger_cursors.sql",
 ] as const;
 
 /**
@@ -253,6 +257,10 @@ export const POSTGRES_MIGRATION_FILES = [
   "005_schema_migrations.sql",
   "006_stale_cleanup_postgres.sql",
   "007_audit_log_postgres.sql",
+  "008_query_optimizations_advanced_postgres.sql",
+  "009_chain_cursors_postgres.sql",
+  "010_soroban_checkpoints_postgres.sql",
+  "011_order_ledger_cursors_postgres.sql",
 ] as const;
 
 // ── Public helpers ────────────────────────────────────────────────────────────
@@ -459,6 +467,9 @@ function openSqliteDatabase(url: string): Database {
   const incrementalAlters: string[] = [
     "ALTER TABLE orders ADD COLUMN preimage_enc_version INTEGER DEFAULT NULL",
     "ALTER TABLE orders ADD COLUMN archived_at INTEGER",
+    "ALTER TABLE orders ADD COLUMN last_eth_block INTEGER DEFAULT NULL",
+    "ALTER TABLE orders ADD COLUMN last_soroban_ledger INTEGER DEFAULT NULL",
+    "ALTER TABLE orders ADD COLUMN last_solana_slot INTEGER DEFAULT NULL",
   ];
   for (const alter of incrementalAlters) {
     try {

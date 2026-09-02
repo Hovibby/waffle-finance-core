@@ -1,28 +1,26 @@
 /**
- * Tests for MainnetVersionBanner component.
+ * MainnetVersionBanner component tests — issue #470
  *
- * The banner is shown only in mainnet mode and provides a button to
- * switch back to testnet. No wallet providers are required.
- *
- * Coverage:
- *  - Renders nothing (null) when mode is testnet
- *  - Renders the info banner when mode is mainnet
- *  - Contains the expected heading text in mainnet mode
- *  - Contains the expected v2/testnet explanation copy
- *  - Clicking "Try v2 on testnet" calls setMode("testnet")
+ * Verifies:
+ *   - Banner is not rendered in testnet mode (default)
+ *   - Banner renders in mainnet mode with expected copy
+ *   - "Try v2 on testnet" button calls setMode('testnet')
  */
 
-import { render, screen, fireEvent } from '@testing-library/react';
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, it, expect, vi } from 'vitest';
 import MainnetVersionBanner from './MainnetVersionBanner';
 import type { NetworkModeState } from '../lib/useNetworkMode';
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 
 function makeNetworkState(overrides: Partial<NetworkModeState> = {}): NetworkModeState {
   return {
     mode: 'testnet',
     expectedEthChainIdHex: '0xaa36a7',
     expectedStellarPassphrase: 'Test SDF Network ; September 2015',
-    metamaskChainId: null,
+    metamaskChainId: '0xaa36a7',
     metamaskConnected: false,
     metamaskMatches: true,
     freighterNetworkPassphrase: null,
@@ -36,72 +34,41 @@ function makeNetworkState(overrides: Partial<NetworkModeState> = {}): NetworkMod
   };
 }
 
-beforeEach(() => {
-  vi.clearAllMocks();
-});
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Testnet mode: no banner
-// ---------------------------------------------------------------------------
-
-describe('MainnetVersionBanner — testnet mode', () => {
+describe('MainnetVersionBanner', () => {
   it('renders nothing when mode is testnet', () => {
     const { container } = render(
-      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'testnet' })} />
+      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'testnet' })} />,
     );
     expect(container.firstChild).toBeNull();
   });
-});
 
-// ---------------------------------------------------------------------------
-// Mainnet mode: banner visible
-// ---------------------------------------------------------------------------
-
-describe('MainnetVersionBanner — mainnet mode', () => {
-  it('renders the banner when mode is mainnet', () => {
-    render(<MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet' })} />);
-    expect(screen.getByText(/Mainnet: v1 single-relayer bridge active/i)).toBeInTheDocument();
-  });
-
-  it('displays information about v2 being live on testnet', () => {
-    render(<MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet' })} />);
-    // The banner body text mentions v2 decentralized stack — check with a
-    // partial string that lives in a single text node.
-    expect(screen.getByText(/v2 decentralized HTLC stack/i)).toBeInTheDocument();
-  });
-
-  it('renders the "Try v2 on testnet" button', () => {
-    render(<MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet' })} />);
+  it('renders the mainnet banner when mode is mainnet', () => {
+    render(
+      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet' })} />,
+    );
     expect(
-      screen.getByRole('button', { name: /Try v2 on testnet/i })
+      screen.getByText(/v1 single-relayer bridge active/i),
     ).toBeInTheDocument();
   });
-});
 
-// ---------------------------------------------------------------------------
-// Interaction: testnet switch button
-// ---------------------------------------------------------------------------
-
-describe('MainnetVersionBanner — testnet switch button', () => {
-  it('calls setMode("testnet") when the button is clicked', () => {
-    const setMode = vi.fn().mockResolvedValue({ ok: true });
+  it('shows v2 testnet availability copy in mainnet mode', () => {
     render(
-      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet', setMode })} />
+      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'mainnet' })} />,
     );
-
-    fireEvent.click(screen.getByRole('button', { name: /Try v2 on testnet/i }));
-
-    expect(setMode).toHaveBeenCalledOnce();
-    expect(setMode).toHaveBeenCalledWith('testnet');
+    expect(screen.getByText(/v2 decentralized HTLC stack/i)).toBeInTheDocument();
+    expect(screen.getByText(/testnet/i)).toBeInTheDocument();
   });
 
-  it('does not call setMode when already in testnet (banner is hidden)', () => {
-    const setMode = vi.fn();
-    const { container } = render(
-      <MainnetVersionBanner networkState={makeNetworkState({ mode: 'testnet', setMode })} />
+  it('"Try v2 on testnet" button calls setMode("testnet")', async () => {
+    const setMode = vi.fn().mockResolvedValue({ ok: true });
+    render(
+      <MainnetVersionBanner
+        networkState={makeNetworkState({ mode: 'mainnet', setMode })}
+      />,
     );
-    // Nothing rendered — no button to click
-    expect(container.firstChild).toBeNull();
-    expect(setMode).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: /try v2 on testnet/i }));
+    expect(setMode).toHaveBeenCalledWith('testnet');
   });
 });

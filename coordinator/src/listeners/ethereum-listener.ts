@@ -3,7 +3,13 @@ import { sepolia, mainnet } from "viem/chains";
 import type { Logger } from "pino";
 import type { CoordinatorConfig } from "../config.js";
 import type { OrderService } from "../services/order-service.js";
-import { observeListenerEventProcessing, recordListenerProgress, listenerLastBlock } from "../metrics.js";
+import {
+  observeListenerEventProcessing,
+  recordListenerProgress,
+  listenerLastBlock,
+  workflowDispatchDecisions,
+} from "../metrics.js";
+import { decideDispatch } from "../services/workflow-priority-policy.js";
 
 // ---------------------------------------------------------------------------
 // ABI event definitions (must remain unchanged)
@@ -35,6 +41,13 @@ const REORG_RESTART_LOOKBACK = 64;
 
 /** Interval (ms) at which the confirmation queue is drained proactively. */
 const DRAIN_INTERVAL_MS = 30_000;
+
+/**
+ * Maximum number of processed event keys to retain in the in-process
+ * deduplication cache.  Entries are evicted FIFO once the cap is reached.
+ * 10 000 keys ≈ 500 KB at ~50 bytes/key — negligible for a long-running service.
+ */
+const DEDUP_CACHE_MAX = 10_000;
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -76,6 +89,22 @@ export class EthereumListener {
    * Keyed by block number, used to detect reorgs between polling cycles.
    */
   private readonly confirmedBlockHashes = new Map<number, string>();
+
+  /**
+   * In-process event deduplication cache.
+   *
+   * Keys are `"${eventType}:${txHash}"` — e.g. `"OrderCreated:0xabc…"`.
+   * Once a txHash has been fully processed (confirmed + written to the DB)
+   * it is added here so that any replay (e.g. from a re-scan on restart
+   * that overlaps with already-processed blocks) is a cheap in-memory no-op
+   * rather than an unnecessary DB round-trip.
+   *
+   * The cache is bounded at DEDUP_CACHE_MAX entries; the oldest key is evicted
+   * once the cap is reached.  Only lives for the lifetime of this process —
+   * the DB's own idempotency guards remain the authoritative duplicate filter
+   * across restarts.
+   */
+  private readonly processedEventKeys = new Map<string, true>();
 
   constructor(
     private readonly cfg: CoordinatorConfig,
@@ -175,6 +204,38 @@ export class EthereumListener {
       total += events.length;
     }
     return total;
+  }
+
+  // ─── Event deduplication helpers ─────────────────────────────────────────
+
+  /**
+   * Build the dedup cache key for a processed event.
+   * Format: `"<eventType>:<txHash>"`.
+   */
+  private dedupKey(eventType: string, txHash: string): string {
+    return `${eventType}:${txHash}`;
+  }
+
+  /**
+   * Returns true if this `(eventType, txHash)` pair has already been
+   * processed in the current process lifetime.
+   */
+  isDuplicate(eventType: string, txHash: string): boolean {
+    return this.processedEventKeys.has(this.dedupKey(eventType, txHash));
+  }
+
+  /**
+   * Mark a `(eventType, txHash)` pair as processed.
+   * Evicts the oldest entry when the cache exceeds DEDUP_CACHE_MAX.
+   */
+  private markProcessed(eventType: string, txHash: string): void {
+    const key = this.dedupKey(eventType, txHash);
+    if (this.processedEventKeys.has(key)) return;
+    if (this.processedEventKeys.size >= DEDUP_CACHE_MAX) {
+      const oldest = this.processedEventKeys.keys().next().value;
+      if (oldest !== undefined) this.processedEventKeys.delete(oldest);
+    }
+    this.processedEventKeys.set(key, true);
   }
 
   // ─── Reorg detection helpers ─────────────────────────────────────────────
@@ -426,6 +487,20 @@ export class EthereumListener {
           this.storeConfirmedHash(Number(blockNumber), block.hash as string);
         }
 
+        const decision = decideDispatch({
+          path: "live",
+          mutation: "src_lock",
+          incomingSequence: Number(blockNumber),
+          existingSequence: order.srcLockBlock,
+          alreadyApplied: order.srcOrderId !== null,
+        });
+        workflowDispatchDecisions.inc({
+          path: "live",
+          mutation: "src_lock",
+          outcome: decision.reason,
+        });
+        if (!decision.shouldApply) continue;
+
         try {
           await this.orders.recordSrcLock({
             publicId: order.publicId,
@@ -454,17 +529,84 @@ export class EthereumListener {
     publicId: string,
     chainHead: number
   ): Promise<void> {
-    const blockNumber = Number(log.blockNumber as bigint);
+    // ── Required-field validation ─────────────────────────────────────────
+    // A malformed provider result can produce logs where blockNumber,
+    // transactionHash, args.orderId, or args.timelock are undefined/null.
+    // Dispatching such a log would write undefined IDs or hashlocks into
+    // the persistence layer, poisoning reconciliation.  Reject atomically
+    // before touching any state.
+    const rawBlockNumber = log.blockNumber as bigint | null | undefined;
+    const txHash = log.transactionHash as string | null | undefined;
+    const rawOrderId = log.args?.orderId as bigint | null | undefined;
+    const rawTimelock = log.args?.timelock as bigint | null | undefined;
+
+    if (
+      rawBlockNumber == null ||
+      !txHash ||
+      rawOrderId == null ||
+      rawTimelock == null
+    ) {
+      this.log.warn(
+        {
+          publicId,
+          hasBlockNumber: rawBlockNumber != null,
+          hasTxHash: Boolean(txHash),
+          hasOrderId: rawOrderId != null,
+          hasTimelock: rawTimelock != null,
+        },
+        "OrderCreated log missing required fields — rejecting without dispatch"
+      );
+      return;
+    }
+
+    // ── Safe-integer guard for block number ───────────────────────────────
+    // bigint values above Number.MAX_SAFE_INTEGER lose precision when cast to
+    // number, which can cause cursor duplication or skipped blocks.  Reject
+    // rather than silently corrupt the stored position.
+    if (rawBlockNumber > BigInt(Number.MAX_SAFE_INTEGER)) {
+      this.log.warn(
+        { publicId, txHash, blockNumber: rawBlockNumber.toString() },
+        "OrderCreated log blockNumber exceeds Number.MAX_SAFE_INTEGER — rejecting to avoid precision loss"
+      );
+      return;
+    }
+    const blockNumber = Number(rawBlockNumber);
+
+    // ── In-process deduplication ──────────────────────────────────────────
+    // If we have already processed this transaction in the current process
+    // lifetime, skip the DB write entirely.  The DB still has its own
+    // idempotency guard for cross-restart protection.
+    if (this.isDuplicate("OrderCreated", txHash)) {
+      this.log.debug({ publicId, txHash }, "OrderCreated duplicate skipped (in-process cache)");
+      return;
+    }
+
     recordListenerProgress("ethereum", blockNumber, chainHead);
+
+    const order = await this.orders.get(publicId);
+    const decision = decideDispatch({
+      path: "live",
+      mutation: "src_lock",
+      incomingSequence: blockNumber,
+      existingSequence: order?.srcLockBlock ?? null,
+      alreadyApplied: !order || order.srcOrderId !== null,
+    });
+    workflowDispatchDecisions.inc({
+      path: "live",
+      mutation: "src_lock",
+      outcome: decision.reason,
+    });
+    if (!decision.shouldApply) return;
 
     try {
       await this.orders.recordSrcLock({
         publicId,
-        orderId: (log.args.orderId as bigint).toString(),
-        txHash: log.transactionHash as string,
+        orderId: rawOrderId.toString(),
+        txHash,
         blockNumber,
-        timelock: Number(log.args.timelock as bigint)
+        timelock: Number(rawTimelock)
       });
+      this.markProcessed("OrderCreated", txHash);
       this.log.info({ publicId, blockNumber }, "confirmed OrderCreated processed");
     } catch (err) {
       this.log.warn({ err, publicId, blockNumber }, "could not record confirmed src lock");

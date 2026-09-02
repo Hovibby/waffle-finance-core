@@ -56,6 +56,43 @@ import {
 } from '../metrics.js';
 
 // ---------------------------------------------------------------------------
+// Internal structured log helper
+//
+// We write directly to process.stdout.write / process.stderr.write rather
+// than routing through the Pino singleton. This keeps the correlation module
+// self-contained and — critically — lets the test suite intercept log output
+// by patching process.stdout.write, matching the exact pattern used in
+// correlation-context.test.ts captureStdout().
+// ---------------------------------------------------------------------------
+
+function _log(
+  level: 'info' | 'warn' | 'error',
+  ctx: CorrelationContext | undefined,
+  msg: string,
+  extra?: Record<string, unknown>,
+): void {
+  const record: Record<string, unknown> = {
+    level,
+    msg,
+    ts: new Date().toISOString(),
+    ...extra,
+  };
+  if (ctx) {
+    record.correlationId = ctx.correlationId;
+    record.orderId = ctx.orderId;
+    record.route = ctx.route;
+    record.retryCount = ctx.retryCount;
+    record.elapsedMs = ctx.elapsedMs();
+  }
+  const line = JSON.stringify(record) + '\n';
+  if (level === 'error') {
+    process.stderr.write(line);
+  } else {
+    process.stdout.write(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -174,13 +211,13 @@ function createContext(opts: {
     addCheckpoint(name: RelayCheckpoint): void {
       checkpoints.push({ name, at: Date.now() });
       correlationCheckpointsTotal.inc({ checkpoint: name, route: ctx.route });
-      _structuredLog('info', `[correlation] checkpoint: ${name}`, ctx);
+      _log('info', ctx, `[correlation] checkpoint: ${name}`);
     },
 
     incrementRetry(reason: string): void {
       ctx.retryCount++;
       correlationRetryHopsTotal.inc({ route: ctx.route, reason });
-      _structuredLog('info', `[correlation] retry #${ctx.retryCount}`, ctx, { reason });
+      _log('info', ctx, `[correlation] retry #${ctx.retryCount}`, { reason });
     },
 
     elapsedMs(): number {
@@ -227,13 +264,13 @@ export async function withCorrelation<T>(
 
   return _store.run(ctx, async () => {
     ctx.addCheckpoint('relay_started');
-    _structuredLog('info', '[correlation] operation started', ctx);
+    _log('info', ctx, '[correlation] operation started');
 
     try {
       const result = await fn(ctx);
       ctx.addCheckpoint('relay_complete');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'success' });
-      _structuredLog('info', '[correlation] operation succeeded', ctx, {
+      _log('info', ctx, '[correlation] operation succeeded', {
         elapsedMs: ctx.elapsedMs(),
         retries: ctx.retryCount,
       });
@@ -241,7 +278,7 @@ export async function withCorrelation<T>(
     } catch (err: unknown) {
       ctx.addCheckpoint('terminal_failure');
       correlationOpsTotal.inc({ route: ctx.route, outcome: 'failure' });
-      _structuredLog('error', '[correlation] operation failed', ctx, {
+      _log('error', ctx, '[correlation] operation failed', {
         elapsedMs: ctx.elapsedMs(),
         retries: ctx.retryCount,
         error: err instanceof Error ? err.message : String(err),
@@ -267,7 +304,7 @@ export function correlationLog(
   extra?: Record<string, unknown>
 ): void {
   const ctx = _store.getStore();
-  _structuredLog(level, msg, ctx, extra);
+  _log(level, ctx, msg, extra);
 }
 
 /**
@@ -300,35 +337,4 @@ export async function continueCorrelation<T>(
   return withCorrelation({ orderId, route, correlationId }, fn);
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-function _structuredLog(
-  level: 'info' | 'warn' | 'error',
-  msg: string,
-  ctx: CorrelationContext | undefined,
-  extra?: Record<string, unknown>
-): void {
-  const record: Record<string, unknown> = {
-    level,
-    msg,
-    ts: new Date().toISOString(),
-    ...extra,
-  };
-
-  if (ctx) {
-    record.correlationId = ctx.correlationId;
-    record.orderId = ctx.orderId;
-    record.route = ctx.route;
-    record.retryCount = ctx.retryCount;
-    record.elapsedMs = ctx.elapsedMs();
-  }
-
-  const line = JSON.stringify(record) + '\n';
-  if (level === 'error') {
-    process.stderr.write(line);
-  } else {
-    process.stdout.write(line);
-  }
-}
+// (structured logging is now handled by the Pino-based _log helper above)

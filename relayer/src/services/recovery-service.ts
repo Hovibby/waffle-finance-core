@@ -421,10 +421,25 @@ export class RecoveryService extends EventEmitter {
 
   /**
    * Retry recovery
+   *
+   * No-ops if the recovery no longer exists or has already reached a terminal
+   * state (Completed or Cancelled). Retrying a Completed recovery could
+   * double-execute a refund; retrying a Cancelled one would re-open an
+   * intentionally closed operation.
    */
   private async retryRecovery(recoveryId: string): Promise<void> {
     const recovery = this.recoveryRequests.get(recoveryId);
-    if (!recovery || recovery.status === RecoveryStatus.Completed) {
+    if (!recovery) {
+      return;
+    }
+
+    if (
+      recovery.status === RecoveryStatus.Completed ||
+      recovery.status === RecoveryStatus.Cancelled
+    ) {
+      console.log(
+        `⏭️  orderHash=${recovery.orderHash} Skipping retry for ${recoveryId} — already ${recovery.status}`,
+      );
       return;
     }
 

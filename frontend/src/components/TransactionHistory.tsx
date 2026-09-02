@@ -3,24 +3,37 @@ import { Clock, CheckCircle, XCircle, ArrowRight, ExternalLink, RefreshCw, Undo2
 import { isTestnet } from '../config/networks';
 import RefundDialog from '../features/refund/RefundDialog';
 import { useTransactionHistoryCache, type Transaction } from '../hooks/useTransactionHistoryCache';
+import { useTransactionHistoryQuery } from '../hooks/useTransactionHistoryQuery';
 import { presentOrderStatus } from '../lib/orderStatusPresentation';
 import type { Address } from 'viem';
+import OrderExport from './OrderExport';
+import OrderImport from './OrderImport';
+
+// ── Status presentation helpers ───────────────────────────────────────────────
+
+function getStatusPresentation(status: Transaction['status']) {
+  return presentOrderStatus(status as Parameters<typeof presentOrderStatus>[0]);
+}
+
+function getStatusIcon(status: Transaction['status']) {
+  const { iconName } = getStatusPresentation(status);
+  switch (iconName) {
+    case 'check-circle': return <CheckCircle className="h-3.5 w-3.5" />;
+    case 'x-circle':     return <XCircle className="h-3.5 w-3.5" />;
+    default:             return <Clock className="h-3.5 w-3.5" />;
+  }
+}
+
+function formatTime(timestamp: number): string {
+  const d = new Date(timestamp);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) +
+    ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
 
 interface TransactionHistoryProps {
   ethAddress?: string;
   stellarAddress?: string;
 }
-
-type TransactionFilter = 'all' | 'pending' | 'completed' | 'confirmed' | 'cancelled' | 'failed' | 'refunded' | 'expired' | 'timed_out';
-
-const FILTER_OPTIONS: Array<{ key: TransactionFilter; label: string }> = [
-  { key: 'all', label: 'All' },
-  { key: 'pending', label: 'Pending' },
-  { key: 'completed', label: 'Completed' },
-  { key: 'failed', label: 'Failed' },
-  { key: 'refunded', label: 'Refunded' },
-  { key: 'timed_out', label: 'Timed out' },
-];
 
 const PRODUCTION_API_BASE_URL = 'https://oversync-k36vx.ondigitalocean.app';
 const API_BASE_URL = import.meta.env.PROD
@@ -28,7 +41,6 @@ const API_BASE_URL = import.meta.env.PROD
   : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
 
 export default function TransactionHistory({ ethAddress, stellarAddress }: TransactionHistoryProps) {
-  const [filter, setFilter] = useState<TransactionFilter>('all');
   const [refundTarget, setRefundTarget] = useState<Transaction | null>(null);
   const [manualRefundingIds, setManualRefundingIds] = useState<Set<string>>(() => new Set());
   const {
@@ -46,37 +58,8 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     apiBase: API_BASE_URL,
   });
 
-  // Use the shared status presentation layer so all status rendering goes
-  // through a single mapping rather than ad hoc switch statements. The icon
-  // is the only piece that remains local because it requires JSX.
-  const getStatusPresentation = (status: Transaction['status']) =>
-    presentOrderStatus(status);
+  const { result: { items: filteredTransactions, total }, options, setQuery } = useTransactionHistoryQuery(transactions);
 
-  const getStatusIcon = (status: Transaction['status']) => {
-    const { iconName } = getStatusPresentation(status);
-    switch (iconName) {
-      case 'check-circle': return <CheckCircle className="h-4 w-4" />;
-      case 'x-circle':     return <XCircle className="h-4 w-4" />;
-      case 'undo':         return <Undo2 className="h-4 w-4" />;
-      default:             return <Clock className="h-4 w-4" />;
-    }
-  };
-
-  const formatTime = (timestamp: number) => {
-    const now = Date.now();
-    const diff = now - timestamp;
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(minutes / 60);
-    const days = Math.floor(hours / 24);
-
-    if (days > 0) return `${days}d ago`;
-    if (hours > 0) return `${hours}h ago`;
-    return `${minutes}m ago`;
-  };
-
-  const filteredTransactions = transactions.filter(tx =>
-    filter === 'all' || tx.status === filter
-  );
   const isHistoryBusy = isLoading || isRefreshing;
 
   const getEtherscanUrl = (txHash: string): string => {
@@ -245,18 +228,29 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         </button>
       </div>
 
+      {/* Export / Import panel — collapsible, rendered above the filter tabs */}
+      <div className="mb-4 shrink-0 space-y-2">
+        <OrderExport
+          transactions={transactions}
+          apiBase={API_BASE_URL}
+          ethAddress={ethAddress}
+          stellarAddress={stellarAddress}
+        />
+        <OrderImport onMerge={updateTransactions} />
+      </div>
+
       <div className="mb-4 flex shrink-0 gap-2 overflow-x-auto pb-1">
-        {FILTER_OPTIONS.map(({ key, label }) => (
+        {['all', 'pending', 'completed', 'failed', 'refunded', 'timed_out'].map((key) => (
           <button
             key={key}
-            onClick={() => setFilter(key)}
+            onClick={() => setQuery({ status: key === 'all' ? undefined : (key as Transaction['status']) })}
             className={`whitespace-nowrap rounded-full px-4 py-2 text-sm font-semibold transition-colors ${
-              filter === key
+              (options.query.status || 'all') === key
                 ? 'brand-cta'
                 : 'border border-white/10 bg-white/[0.045] text-slate-400 hover:bg-white/[0.075] hover:text-white'
             }`}
           >
-            {label} {key !== 'all' && `(${transactions.filter(tx => tx.status === key).length})`}
+            {key === 'all' ? 'All' : key.charAt(0).toUpperCase() + key.slice(1).replace('_', ' ')} {key !== 'all' && `(${total})`}
           </button>
         ))}
       </div>

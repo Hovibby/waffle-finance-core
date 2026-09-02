@@ -1,0 +1,187 @@
+name: Frontend
+
+# Runs the frontend Vitest suite on every push to main and every PR that
+# touches the frontend, packages/sdk, or packages/config.
+#
+# Two matrix legs run in parallel (issue #470):
+#
+#   1. testnet  (VITE_MAINNET_ENABLED absent / false)
+#      — default CI leg, covers all existing and new unit tests.
+#
+#   2. mainnet  (VITE_MAINNET_ENABLED=true)
+#      — validates that wagmi v2 network resolution, contract addresses,
+#        RPC URL helpers, and the MainnetVersionBanner / NetworkMismatchBanner
+#        behave correctly when mainnet is unlocked.
+#
+# Both legs must be green before a PR can be merged.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "packages/sdk/**"
+      - "packages/config/**"
+      - ".github/workflows/frontend.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "packages/sdk/**"
+      - "packages/config/**"
+      - ".github/workflows/frontend.yml"
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: frontend-${{ github.ref }}-${{ matrix.mainnet_enabled }}
+  cancel-in-progress: true
+
+jobs:
+  vitest:
+    name: Vitest (${{ matrix.label }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Run both legs even if one fails so we always see the full picture.
+      fail-fast: false
+      matrix:
+        include:
+          - label: "testnet-only"
+            mainnet_enabled: "false"
+          - label: "mainnet-enabled"
+            mainnet_enabled: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store path
+        id: pnpm-cache
+        shell: bash
+        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build the shared packages that the frontend resolves at test time.
+      # The SDK alias in vite.config.ts points directly at TypeScript source,
+      # so only the config package (pure CJS/ESM, no build step) is needed.
+      - name: Build @wafflefinance/config
+        run: pnpm --filter @wafflefinance/config build
+
+      - name: Run Vitest (${{ matrix.label }})
+        working-directory: frontend
+        env:
+          # Vitest reads import.meta.env via Vite — pass the flag through the
+          # environment so both test files and the modules under test see it.
+          VITE_MAINNET_ENABLED: ${{ matrix.mainnet_enabled }}
+          # Suppress noisy console output from the feature-flag registry loader.
+          CI: "true"
+        run: pnpm test
+
+      # Upload a coverage artifact only on the testnet leg to avoid duplicate
+      # uploads (both legs produce identical coverage for non-mainnet code paths).
+      - name: Upload coverage artifact
+        if: matrix.mainnet_enabled == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          if-no-files-found: ignore
+
+  # ── Type-check ───────────────────────────────────────────────────────────────
+  # Run tsc --noEmit once (not matrix'd — type errors are environment-independent).
+  typecheck:
+    name: TypeScript type-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store path
+        id: pnpm-cache
+        shell: bash
+        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build @wafflefinance/config
+        run: pnpm --filter @wafflefinance/config build
+
+      - name: Type-check frontend
+        working-directory: frontend
+        run: pnpm tsc --noEmit
+
+  # ── Lint ─────────────────────────────────────────────────────────────────────
+  lint:
+    name: ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store path
+        id: pnpm-cache
+        shell: bash
+        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: pnpm lint

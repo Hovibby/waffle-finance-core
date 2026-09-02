@@ -99,6 +99,7 @@ describe("schema.sql shape vs. schema-contract.md — orders", () => {
       "dst_chain", "dst_address", "dst_asset", "dst_amount",
       "dst_order_id", "dst_lock_tx", "dst_lock_block", "dst_timelock",
       "preimage", "preimage_enc_version", "secret_revealed_tx", "resolver_address",
+      "last_eth_block", "last_soroban_ledger", "last_solana_slot",
       "created_at", "updated_at", "archived_at",
     ];
     for (const col of expected) {
@@ -193,5 +194,45 @@ describe("schema.sql shape vs. schema-contract.md — order_events, resolver_hea
     const fks = (db as any).prepare("PRAGMA foreign_key_list(order_events)").all();
     expect(fks.length).toBeGreaterThanOrEqual(1);
     expect(fks[0].table).toBe("orders");
+  });
+});
+
+describe("schema.sql shape vs. schema-contract.md — soroban_checkpoints", () => {
+  it("has the documented columns", async () => {
+    const db = await freshDb();
+    const cols = (db as any)
+      .prepare("PRAGMA table_info(soroban_checkpoints)")
+      .all()
+      .map((c: any) => c.name);
+    expect(cols).toEqual(
+      expect.arrayContaining([
+        "contract_id",
+        "last_safe_ledger",
+        "effective_cursor",
+        "recovery_marker",
+        "updated_at",
+      ])
+    );
+  });
+
+  it("uses contract_id as the primary key", async () => {
+    const db = await freshDb();
+    const pk = (db as any)
+      .prepare("PRAGMA table_info(soroban_checkpoints)")
+      .all()
+      .filter((c: any) => c.pk > 0)
+      .map((c: any) => c.name);
+    expect(pk).toEqual(["contract_id"]);
+  });
+
+  it("rejects a recovery_marker outside the documented CHECK set", async () => {
+    const db = await freshDb();
+    expect(() =>
+      (db as any)
+        .prepare(
+          "INSERT INTO soroban_checkpoints (contract_id, last_safe_ledger, recovery_marker) VALUES ('C', 1, 'bogus')"
+        )
+        .run()
+    ).toThrow();
   });
 });

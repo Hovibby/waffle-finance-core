@@ -344,6 +344,30 @@ describe("decodeHtlcEvent — malformed payloads return MalformedEventError", ()
     expect((result as MalformedEventError).reason).toBe("data_type_mismatch");
   });
 
+  it("data_type_mismatch: 'claimed' with a zero-length preimage returns MalformedEventError", () => {
+    // A zero-length Bytes value is structurally valid XDR but semantically
+    // invalid for HTLC: sha256("") can never equal a real hashlock stored
+    // on-chain, so the decoder must reject it rather than forward "0x" to
+    // downstream claim handlers.
+    const ev = makeClaimedEvent();
+    const original = scValToNative(ev.value) as unknown[];
+    // Replace data[2] (preimage) with a zero-length Buffer; keep everything else.
+    const withEmptyPreimage = [
+      original[0],          // orderId  (bigint)
+      original[1],          // caller   (string)
+      Buffer.alloc(0),      // preimage — zero-length bytes
+      original[3],          // amount   (bigint)
+      original[4],          // safety_deposit (bigint)
+    ];
+    const emptyPreimageData = nativeToScVal(withEmptyPreimage) as xdr.ScVal;
+    const result = decodeHtlcEvent(ev.topic, emptyPreimageData);
+    expect(isMalformedEvent(result)).toBe(true);
+    const err = result as MalformedEventError;
+    expect(err.reason).toBe("data_type_mismatch");
+    expect(err.kind).toBe("claimed");
+    expect(err.detail).toContain("preimage");
+  });
+
   it("data_type_mismatch: 'refunded' with non-bigint orderId returns MalformedEventError", () => {
     const ev = makeRefundedEvent();
     // Build a Vec with a single string element
