@@ -164,6 +164,17 @@ cypress/screenshots/
 __snapshots__/
 *.snap
 
+# Test snapshots
+**/__snapshots__/
+*.snap
+
+# Vitest / Jest cache
+.vitest-cache/
+.jest-cache/
+
+# TypeScript build info
+*.tsbuildinfo
+
 # Miscellaneous
 .cache/
 .parcel-cache/

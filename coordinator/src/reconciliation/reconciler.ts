@@ -1,9 +1,59 @@
+/**
+ * Reconciler — formal replay/recovery pipeline for the WaffleFinance coordinator.
+ *
+ * ## Architecture
+ *
+ * The reconciler runs on a configurable interval and on startup.  Each run
+ * executes a deterministic, provable re-sync of on-chain state against the
+ * coordinator's DB across all three chains.
+ *
+ * ### Key invariants
+ *
+ * 1. **No silent event loss** — every run starts from the cursor HWM seeded
+ *    from the DB, not a fixed constant.  Events in the scan window are
+ *    processed even after a restart.
+ *
+ * 2. **No silent mis-interpretation** — duplicate and reordered events are
+ *    identified by `EventSeenSet` and skipped before any DB write.
+ *
+ * 3. **No silent gap exceedance** — when the cursor gap exceeds the lookback
+ *    window, the reconciler emits a structured warning log, a Prometheus metric
+ *    increment, and falls back deterministically to `tip - lookback`.
+ *
+ * 4. **Idempotent recovery** — every OrderService write (recordSrcLock,
+ *    recordSecret, markStatus) is idempotent: re-running the reconciler after
+ *    a crash leaves the DB in the same state as a single successful run.
+ *
+ * 5. **Operator observability** — every decision (window size, gap severity,
+ *    conflict type, resync) is emitted as a metric and a structured log entry.
+ *
+ * ### Per-chain cursors
+ *
+ * Each chain has its own `LedgerCursor` seeded at startup from the DB.  The
+ * HWM advances to the highest block/ledger/slot processed in each run so
+ * subsequent runs start from where the previous one left off.
+ *
+ * ### Startup recovery
+ *
+ * On the first `run()` call (or after a process restart), `initCursors()`
+ * queries the DB for the highest known block per chain and seeds each cursor.
+ * This ensures the very first run covers the full missed window without any
+ * manual operator action.
+ *
+ * ### Partial RPC failure
+ *
+ * If a single chain's RPC fails, that chain is skipped for this run (the
+ * cursor does not advance) and an error metric is incremented.  The other
+ * chains are not affected.  On the next run the cursor for the failed chain
+ * will reassess the gap from the same HWM and retry.
+ */
+
 import {
   createPublicClient,
   http,
   parseAbiItem,
   type PublicClient,
-  type Log
+  type Log,
 } from "viem";
 import { sepolia, mainnet } from "viem/chains";
 import { rpc } from "@stellar/stellar-sdk";
@@ -57,10 +107,18 @@ import {
   isEventBehindOrderCursor,
 } from "./ledger-cursor.js";
 
+// ─── Status types ─────────────────────────────────────────────────────────────
+
 export interface ReconciliationStatus {
   lastRunAt: number | null;
   lastRunOk: boolean | null;
   eventsReplayed: number;
+  /** Populated after the first successful run. */
+  cursors?: {
+    ethereum: number;
+    soroban: number;
+    solana: number;
+  };
 }
 
 /**
@@ -110,52 +168,138 @@ export class Reconciler {
   private readonly sorobanServer: rpc.Server;
   private readonly solanaConn: Connection;
 
+  // Per-chain cursors — seeded from DB on first run via initCursors().
+  private ethCursor: LedgerCursor | null = null;
+  private sorobanCursor: LedgerCursor | null = null;
+  private sorobanRpcCursor: string | undefined = undefined; // Soroban's opaque page cursor
+  private solanaCursor: LedgerCursor | null = null;
+
+  // Per-run deduplication set.  Cleared at the start of each run.
+  private readonly seenSet = new EventSeenSet();
+
+  // Replay policy accumulator.  Reset at the start of each run.
+  private readonly policy = new ReplayPolicy();
+
+  // Whether cursors have been initialised from the DB.
+  private cursorsReady = false;
+
   private status: ReconciliationStatus = {
     lastRunAt: null,
     lastRunOk: null,
-    eventsReplayed: 0
+    eventsReplayed: 0,
   };
 
   constructor(
     private readonly cfg: CoordinatorConfig,
     private readonly orders: OrderService,
-    log: Logger
+    log: Logger,
   ) {
     this.log = log.child({ component: "Reconciler" });
     this.ethClient = createPublicClient({
       chain: cfg.ethereum.chainId === 1 ? mainnet : sepolia,
-      transport: http(cfg.ethereum.rpcUrl)
+      transport: http(cfg.ethereum.rpcUrl),
     });
     this.sorobanServer = new rpc.Server(cfg.soroban.rpcUrl, {
-      allowHttp: cfg.soroban.rpcUrl.startsWith("http://")
+      allowHttp: cfg.soroban.rpcUrl.startsWith("http://"),
     });
     this.solanaConn = new Connection(cfg.solana.rpcUrl, cfg.solana.commitment);
   }
+
+  // ─── Public API ──────────────────────────────────────────────────────────
 
   getStatus(): ReconciliationStatus {
     return { ...this.status };
   }
 
+  /**
+   * Execute one full reconciliation run across all configured chains.
+   *
+   * Run sequence:
+   *   1. Initialise cursors from DB (once, on first call).
+   *   2. Clear per-run dedup set and policy accumulator.
+   *   3. For each chain: assess gap, decide window, replay events, advance cursor.
+   *   4. Emit metrics from policy summary.
+   *   5. Update status and run-level metrics.
+   */
   async run(): Promise<void> {
     this.log.info("reconciliation run starting");
+
+    // Seed cursors from DB on first run (startup recovery).
+    if (!this.cursorsReady) {
+      await this.initCursors();
+    }
+
+    // Clear per-run state.
+    this.seenSet.clear();
+    this.policy.reset();
+
     let replayed = 0;
+    let runOk = true;
 
     try {
       replayed += await this.reconcileEthereum();
-      replayed += await this.reconcileSoroban();
-      replayed += await this.reconcileSolana();
-
-      this.status = { lastRunAt: Date.now(), lastRunOk: true, eventsReplayed: replayed };
-      reconciliationRuns.inc({ result: "success" });
-      reconciliationEventsReplayed.inc(replayed);
-      reconciliationLastRun.set(Date.now() / 1000);
-      this.log.info({ replayed }, "reconciliation run complete");
     } catch (err) {
-      this.status = { lastRunAt: Date.now(), lastRunOk: false, eventsReplayed: replayed };
+      this.log.error({ err, chain: "ethereum" }, "reconciler: Ethereum chain run failed");
+      reconciliationChainErrors.inc({ chain: "ethereum" });
+      runOk = false;
+    }
+
+    try {
+      replayed += await this.reconcileSoroban();
+    } catch (err) {
+      this.log.error({ err, chain: "soroban" }, "reconciler: Soroban chain run failed");
+      reconciliationChainErrors.inc({ chain: "soroban" });
+      runOk = false;
+    }
+
+    try {
+      replayed += await this.reconcileSolana();
+    } catch (err) {
+      this.log.error({ err, chain: "solana" }, "reconciler: Solana chain run failed");
+      reconciliationChainErrors.inc({ chain: "solana" });
+      runOk = false;
+    }
+
+    // Emit policy metrics.
+    this.emitPolicyMetrics();
+
+    // Emit dedup metrics.
+    const dedupStats = this.seenSet.getStats();
+    if (dedupStats.duplicates > 0) {
+      reconciliationDuplicatesSkipped.inc(dedupStats.duplicates);
+    }
+
+    // Update run-level status.
+    this.status = {
+      lastRunAt: Date.now(),
+      lastRunOk: runOk,
+      eventsReplayed: replayed,
+      cursors: {
+        ethereum: this.ethCursor?.getHwm() ?? 0,
+        soroban: this.sorobanCursor?.getHwm() ?? 0,
+        solana: this.solanaCursor?.getHwm() ?? 0,
+      },
+    };
+
+    if (runOk) {
+      reconciliationRuns.inc({ result: "success" });
+    } else {
       reconciliationRuns.inc({ result: "failure" });
       reconciliationErrors.inc();
-      this.log.error({ err }, "reconciliation run failed");
     }
+
+    reconciliationEventsReplayed.inc(replayed);
+    reconciliationLastRun.set(Date.now() / 1000);
+
+    this.log.info(
+      {
+        replayed,
+        runOk,
+        dedupStats,
+        policySummary: this.policy.getSummary(),
+      },
+      "reconciliation run complete",
+    );
   }
 
   /**
@@ -279,21 +423,20 @@ export class Reconciler {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Ethereum
-  // ---------------------------------------------------------------------------
+  // ─── Ethereum ─────────────────────────────────────────────────────────────
 
   private async reconcileEthereum(): Promise<number> {
     if (!this.cfg.ethereum.htlcEscrow) return 0;
+    if (!this.ethCursor) return 0;
 
     const address = this.cfg.ethereum.htlcEscrow;
     const latest = await this.ethClient.getBlockNumber();
     const fromBlock = await this.computeEthFromBlock(latest);
 
     const [createdLogs, claimedLogs, refundedLogs] = await Promise.all([
-      this.ethClient.getLogs({ address, event: ORDER_CREATED, fromBlock, toBlock: latest }),
-      this.ethClient.getLogs({ address, event: ORDER_CLAIMED, fromBlock, toBlock: latest }),
-      this.ethClient.getLogs({ address, event: ORDER_REFUNDED, fromBlock, toBlock: latest })
+      this.ethClient.getLogs({ address, event: ORDER_CREATED, fromBlock, toBlock }),
+      this.ethClient.getLogs({ address, event: ORDER_CLAIMED, fromBlock, toBlock }),
+      this.ethClient.getLogs({ address, event: ORDER_REFUNDED, fromBlock, toBlock }),
     ]);
 
     let replayed = 0;
@@ -310,11 +453,23 @@ export class Reconciler {
     let n = 0;
     for (const log of logs) {
       const args = (log as any).args as {
-        orderId: bigint;
-        hashlock: `0x${string}`;
-        timelock: bigint;
+        orderId?: bigint;
+        hashlock?: `0x${string}`;
+        timelock?: bigint;
       };
-      if (!args?.hashlock) continue;
+      if (!args?.hashlock || args.orderId === undefined) continue;
+
+      const logIndex = (log as any).logIndex ?? 0;
+      const txHash = log.transactionHash ?? "0x";
+      const key = ethEventKey("OrderCreated", txHash, logIndex);
+      const semKey = semanticKey("ethereum", "OrderCreated", args.hashlock);
+
+      const conflict = this.seenSet.checkAndMark("ethereum", "OrderCreated", key, semKey);
+      if (conflict) {
+        this.log.debug({ key, kind: conflict.kind }, "reconciler: ETH OrderCreated dedup skip");
+        continue;
+      }
+
       try {
         const order = await this.orders.findByHashlock(args.hashlock);
         if (!order) {
@@ -418,6 +573,15 @@ export class Reconciler {
     for (const log of logs) {
       const args = (log as any).args as { orderId: bigint; preimage: `0x${string}` };
       if (!args?.orderId || !args?.preimage) continue;
+
+      const logIndex = (log as any).logIndex ?? 0;
+      const txHash = log.transactionHash ?? "0x";
+      const key = ethEventKey("OrderClaimed", txHash, logIndex);
+      const semKey = semanticKey("ethereum", "OrderClaimed", args.orderId.toString());
+
+      const conflict = this.seenSet.checkAndMark("ethereum", "OrderClaimed", key, semKey);
+      if (conflict) continue;
+
       try {
         const order = await this.orders.findBySrcOrderId("ethereum", args.orderId.toString());
         if (!order) {
@@ -494,8 +658,17 @@ export class Reconciler {
   private async replayEthRefunded(logs: Log[]): Promise<number> {
     let n = 0;
     for (const log of logs) {
-      const args = (log as any).args as { orderId: bigint };
+      const args = (log as any).args as { orderId?: bigint };
       if (!args?.orderId) continue;
+
+      const logIndex = (log as any).logIndex ?? 0;
+      const txHash = log.transactionHash ?? "0x";
+      const key = ethEventKey("OrderRefunded", txHash, logIndex);
+      const semKey = semanticKey("ethereum", "OrderRefunded", args.orderId.toString());
+
+      const conflict = this.seenSet.checkAndMark("ethereum", "OrderRefunded", key, semKey);
+      if (conflict) continue;
+
       try {
         const order = await this.orders.findBySrcOrderId("ethereum", args.orderId.toString());
         if (!order) {
@@ -566,31 +739,54 @@ export class Reconciler {
     return n;
   }
 
-  // ---------------------------------------------------------------------------
-  // Soroban
-  // ---------------------------------------------------------------------------
+  // ─── Soroban ──────────────────────────────────────────────────────────────
 
   private async reconcileSoroban(): Promise<number> {
     if (!this.cfg.soroban.htlcContract) return 0;
+    if (!this.sorobanCursor) return 0;
 
     const contractId = this.cfg.soroban.htlcContract;
+    const latest = await this.sorobanServer.getLatestLedger();
+    const tip = latest.sequence;
+
+    const assessment = this.sorobanCursor.assess(tip);
+    const decision = buildReplayDecision("soroban", assessment);
+    this.policy.recordDecision(decision);
+
+    if (decision.windowSize === 0) {
+      this.log.debug({ chain: "soroban", hwm: assessment.hwm, tip }, "reconciler: Soroban up to date");
+      return 0;
+    }
+
+    this.log.info(
+      {
+        chain: "soroban",
+        fromBlock: decision.fromBlock,
+        toBlock: decision.toBlock,
+        windowSize: decision.windowSize,
+        gapSeverity: decision.gapSeverity,
+      },
+      "reconciler: Soroban replay window",
+    );
+
     let replayed = 0;
+    let eventIndex = 0;
 
     try {
       const latest = await this.sorobanServer.getLatestLedger();
       const startLedger = await this.computeSorobanFromLedger(latest.sequence);
 
-      let cursor: string | undefined;
+    try {
       do {
         const events = await this.sorobanServer.getEvents({
           filters: [{ type: "contract", contractIds: [contractId] }],
-          startLedger: cursor ? undefined : startLedger,
-          cursor,
-          limit: 200
+          startLedger: pageCursor ? undefined : startLedger,
+          cursor: pageCursor,
+          limit: 200,
         });
 
         for (const ev of events.events) {
-          replayed += await this.replaySorobanEvent(ev);
+          replayed += await this.replaySorobanEvent(ev, eventIndex++);
         }
 
         cursor = events.cursor ?? undefined;
@@ -599,9 +795,13 @@ export class Reconciler {
 
       await this.orders.setChainCursor("stellar", latest.sequence);
     } catch (err) {
-      this.log.warn({ err }, "reconciler: Soroban fetch failed");
+      // Stale page cursor — clear it so the next run re-scans from HWM.
+      this.sorobanRpcCursor = undefined;
+      this.log.warn({ err }, "reconciler: Soroban fetch failed — page cursor reset");
+      throw err; // Let the caller count this as a chain error.
     }
 
+    this.sorobanCursor.advance(tip);
     return replayed;
   }
 
@@ -772,12 +972,35 @@ export class Reconciler {
     return 0;
   }
 
-  // ---------------------------------------------------------------------------
-  // Solana
-  // ---------------------------------------------------------------------------
+  // ─── Solana ───────────────────────────────────────────────────────────────
 
   private async reconcileSolana(): Promise<number> {
     if (!this.cfg.solana.programId || this.cfg.solana.programId === "PLACEHOLDER") return 0;
+    if (!this.solanaCursor) return 0;
+
+    const tip = await this.solanaConn.getSlot(this.cfg.solana.commitment);
+    const assessment = this.solanaCursor.assess(tip);
+    const decision = buildReplayDecision("solana", assessment);
+    this.policy.recordDecision(decision);
+
+    if (decision.windowSize === 0) {
+      this.log.debug({ chain: "solana", hwm: assessment.hwm, tip }, "reconciler: Solana up to date");
+      return 0;
+    }
+
+    this.log.info(
+      {
+        chain: "solana",
+        fromBlock: decision.fromBlock,
+        toBlock: decision.toBlock,
+        windowSize: decision.windowSize,
+        gapSeverity: decision.gapSeverity,
+      },
+      "reconciler: Solana replay window",
+    );
+
+    const programPk = new PublicKey(this.cfg.solana.programId);
+    const minContextSlot = Math.max(0, decision.fromBlock);
 
     let replayed = 0;
     try {
@@ -787,15 +1010,17 @@ export class Reconciler {
 
       const sigs = await this.solanaConn.getSignaturesForAddress(programPk, {
         limit: 1000,
-        minContextSlot: minSlot
+        minContextSlot,
       });
 
       for (const sigInfo of sigs) {
         if (sigInfo.err) continue;
+        // Only process signatures within our window.
+        if (sigInfo.slot < decision.fromBlock || sigInfo.slot > decision.toBlock) continue;
         try {
           const tx = await this.solanaConn.getParsedTransaction(sigInfo.signature, {
             commitment: "confirmed",
-            maxSupportedTransactionVersion: 0
+            maxSupportedTransactionVersion: 0,
           });
           if (!tx?.meta?.logMessages) continue;
           replayed += await this.replaySolanaLogs(
@@ -810,9 +1035,11 @@ export class Reconciler {
 
       await this.orders.setChainCursor("solana", slot);
     } catch (err) {
-      this.log.warn({ err }, "reconciler: Solana fetch failed");
+      this.log.warn({ err }, "reconciler: Solana signatures fetch failed");
+      throw err;
     }
 
+    this.solanaCursor.advance(tip);
     return replayed;
   }
 
@@ -833,8 +1060,16 @@ export class Reconciler {
     if (!eventType) return 0;
 
     if (eventType === "OrderCreated") {
-      const { hashlock, orderId, timelock } = payload as { hashlock?: string; orderId?: string; timelock?: number };
+      const { hashlock, orderId, timelock } = payload as {
+        hashlock?: string; orderId?: string; timelock?: number;
+      };
       if (!hashlock || !orderId) return 0;
+
+      const key = solanaEventKey("OrderCreated", sig);
+      const semKey = semanticKey("solana", "OrderCreated", hashlock);
+      const conflict = this.seenSet.checkAndMark("solana", "OrderCreated", key, semKey);
+      if (conflict) return 0;
+
       try {
         const order = await this.orders.findByHashlock(hashlock);
         if (!order) {
@@ -880,6 +1115,12 @@ export class Reconciler {
     if (eventType === "OrderClaimed") {
       const { preimage, orderId } = payload as { preimage?: string; orderId?: string };
       if (!preimage || !orderId) return 0;
+
+      const key = solanaEventKey("OrderClaimed", sig);
+      const semKey = semanticKey("solana", "OrderClaimed", orderId);
+      const conflict = this.seenSet.checkAndMark("solana", "OrderClaimed", key, semKey);
+      if (conflict) return 0;
+
       try {
         const order = await this.orders.findBySrcOrderId("solana", orderId);
         if (!order) {
@@ -929,6 +1170,12 @@ export class Reconciler {
     if (eventType === "OrderRefunded") {
       const { orderId } = payload as { orderId?: string };
       if (!orderId) return 0;
+
+      const key = solanaEventKey("OrderRefunded", sig);
+      const semKey = semanticKey("solana", "OrderRefunded", orderId);
+      const conflict = this.seenSet.checkAndMark("solana", "OrderRefunded", key, semKey);
+      if (conflict) return 0;
+
       try {
         const order = await this.orders.findBySrcOrderId("solana", orderId);
         if (!order) {
