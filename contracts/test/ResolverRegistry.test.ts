@@ -745,6 +745,52 @@ describe("ResolverRegistry", () => {
         registry.connect(resolver).setSlashBeneficiary(resolver.address)
       ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
     });
+
+    it("rejects a zero pending administrator and leaves owner/pendingOwner unchanged", async () => {
+      const { owner, registry } = await deploy();
+
+      const ownerBefore = await registry.owner();
+      const pendingBefore = await registry.pendingOwner();
+
+      await expect(
+        registry.connect(owner).transferOwnership(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(registry, "InvalidAddress");
+
+      expect(await registry.owner()).to.equal(ownerBefore);
+      expect(await registry.pendingOwner()).to.equal(pendingBefore);
+    });
+
+    it("still allows a valid two-step ownership transfer to a non-zero address", async () => {
+      const [, , newOwner] = await ethers.getSigners();
+      const { owner, registry } = await deploy();
+
+      await expect(registry.connect(owner).transferOwnership(newOwner.address))
+        .to.emit(registry, "OwnershipTransferStarted")
+        .withArgs(owner.address, newOwner.address);
+
+      expect(await registry.pendingOwner()).to.equal(newOwner.address);
+
+      await registry.connect(newOwner).acceptOwnership();
+      expect(await registry.owner()).to.equal(newOwner.address);
+    });
+
+    it("rejects acceptOwnership from an account that is not the pending administrator", async () => {
+      const [, , newOwner, stranger] = await ethers.getSigners();
+      const { owner, registry } = await deploy();
+
+      await registry.connect(owner).transferOwnership(newOwner.address);
+
+      const ownerBefore = await registry.owner();
+      const pendingBefore = await registry.pendingOwner();
+
+      await expect(
+        registry.connect(stranger).acceptOwnership()
+      ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
+
+      // Neither current nor pending admin changed.
+      expect(await registry.owner()).to.equal(ownerBefore);
+      expect(await registry.pendingOwner()).to.equal(pendingBefore);
+    });
   });
 
   //  getActiveResolvers

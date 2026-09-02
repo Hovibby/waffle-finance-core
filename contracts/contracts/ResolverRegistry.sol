@@ -303,6 +303,21 @@ contract ResolverRegistry is IResolverRegistry, Ownable2Step, ReentrancyGuard {
         slashBeneficiary = newBeneficiary;
     }
 
+    /// @notice Begin a two-step transfer of the owner ("administrator") role.
+    ///
+    /// @dev Ownable2Step's base implementation does not guard against
+    ///      `newOwner == address(0)`, since it is sometimes used upstream to
+    ///      cancel a pending transfer. For this registry a zero pending
+    ///      administrator is never a valid handoff target, so it is rejected
+    ///      here before any pending-owner state is written or the
+    ///      `OwnershipTransferStarted` event is emitted. Valid two-step
+    ///      transfers to a non-zero address proceed exactly as before via
+    ///      `super.transferOwnership`.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        super.transferOwnership(newOwner);
+    }
+
     // ---------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------

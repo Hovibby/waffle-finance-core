@@ -968,6 +968,22 @@ describe("HTLCEscrow v2", () => {
       expect(await ethers.provider.getBalance(escrowAddr)).to.equal(0);
     });
 
+    it("pushes directly to a recording receiver mock, which tallies the exact amount received", async () => {
+      const [, , relayer] = await ethers.getSigners();
+      const Recorder = await ethers.getContractFactory("RecordingReceiverMock");
+      const recorder = await Recorder.deploy();
+      const recorderAddr = await recorder.getAddress();
+      const { escrow, preimage } = await setupOrder(recorderAddr);
+
+      await expect(escrow.connect(relayer).claimOrder(1, preimage)).to.not.emit(
+        escrow,
+        "PayoutDeferred"
+      );
+
+      expect(await recorder.totalReceived()).to.equal(AMOUNT);
+      expect(await escrow.pendingWithdrawals(recorderAddr)).to.equal(0);
+    });
+
     it("claim defers the amount when the beneficiary reverts on receive, then funds are recoverable", async () => {
       const [, , relayer] = await ethers.getSigners();
       const receiver = await deployReceiver();
