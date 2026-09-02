@@ -20,6 +20,9 @@ import type { AuditRepository, AuditCursor, AuditQueryOptions } from './audit-re
 import type { AuditEntry, AuditEventType } from './audit-log.js';
 import { parseAuditPayload } from './audit-log.js';
 
+/** Maximum page size the repository accepts (mirrors AuditRepository limit). */
+const MAX_PAGE_SIZE = 1000;
+
 // ─── Export options ───────────────────────────────────────────────────────────
 
 export interface ExportOptions {
@@ -100,7 +103,7 @@ export class AuditExporter {
    * console.log(`Replayed ${result.entriesProcessed} entries`);
    */
   async replay(handler: ReplayHandler, opts: ExportOptions = {}): Promise<ExportResult> {
-    const pageSize = opts.pageSize ?? 500;
+    const pageSize = Math.min(opts.pageSize ?? 500, MAX_PAGE_SIZE);
     let cursor: AuditCursor | undefined = opts.resumeCursor;
     let entriesProcessed = 0;
     let finalCursor: AuditCursor | null = null;
@@ -156,7 +159,10 @@ export class AuditExporter {
           createdAt: entry.createdAt,
           payload: parseAuditPayload(entry) ?? entry.payloadJson,
         };
-        dest.write(JSON.stringify(record) + '\n');
+        const ok = dest.write(JSON.stringify(record) + '\n');
+        if (!ok) {
+          return new Promise<void>((resolve) => dest.once('drain', resolve));
+        }
       },
       opts,
     );
