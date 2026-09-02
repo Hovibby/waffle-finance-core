@@ -140,7 +140,13 @@ const exportFiltersSchema = z.object({
   updatedBefore: z.coerce.number().int().nonnegative().optional(),
   includeArchived: z.coerce.boolean().optional(),
   limit: z.coerce.number().int().positive().max(1000).optional(),
-});
+}).refine(
+  (data) => data.createdAfter === undefined || data.createdBefore === undefined || data.createdAfter <= data.createdBefore,
+  {
+    message: "createdAfter must not be later than createdBefore",
+    path: ["createdBefore"],
+  }
+);
 
 /**
  * Validation schema for the user-facing download endpoint.
@@ -200,7 +206,13 @@ const downloadQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(1000).optional(),
   /** Optional address to scope the download to a specific wallet */
   address: z.string().optional(),
-});
+}).refine(
+  (data) => data.startDate === undefined || data.endDate === undefined || data.startDate <= data.endDate,
+  {
+    message: "startDate must not be later than endDate",
+    path: ["endDate"],
+  }
+);
 
 /**
  * Create the export router with the given export service.

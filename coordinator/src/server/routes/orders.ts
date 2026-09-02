@@ -133,13 +133,14 @@ export function ordersRoutes(orders: OrderService, log?: Logger, abuseDetector?:
     // Support both cursor-based (preferred) and offset-based (legacy) pagination
     const cursorParam = req.query.cursor as string | undefined;
     const cursor = cursorParam && cursorParam.trim() !== '' ? cursorParam : undefined;
-
-    const rawOffset = parseStrictQueryInt(req.query.offset);
-    if (rawOffset === null) {
-      res.status(400).json(validationError([], "offset must be a valid integer"));
-      return;
+    if (cursor !== undefined) {
+      const cursorNum = Number(cursor);
+      if (Number.isFinite(cursorNum) && cursorNum < 0) {
+        res.status(400).json(invalidCursorError());
+        return;
+      }
     }
-    const offset = rawOffset !== undefined ? Math.max(rawOffset, 0) : undefined;
+    const offset = req.query.offset !== undefined ? Math.max(Number(req.query.offset), 0) : undefined;
 
     try {
       // Use cursor pagination if cursor is provided, otherwise use offset (legacy default)
